@@ -1,0 +1,22 @@
+{
+  "num_frames": 568,
+  "num_success": 568,
+  "success_rate": 1.0,
+  "translation_step_mean_mm": 1.276227288127706,
+  "translation_step_std_mm": 2.7552025153146578,
+  "rotation_step_mean_deg": 11.991135933775912,
+  "rotation_step_std_deg": 33.41047070803113,
+  "reproj_mean_px": 8.71247637139333,
+  "reproj_std_px": 7.420911227149224,
+  "algorithm_name": "alg_09_cube_candidate_cluster_ransac_temporal_sanity",
+  "pkl_path": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/logs_002/recording_20260511_162011.pkl",
+  "camera_name": "r_wrist",
+  "cube_path": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cube_april_25h9_0_5_1x1x1_10mm",
+  "clahe_clip_limit": 3.0,
+  "clahe_tile_grid_size": [
+    8,
+    8
+  ],
+  "pose_plot": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_09_cube_candidate_cluster_ransac_temporal_sanity/pose_xyz_rpy.png",
+  "reproj_plot": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_09_cube_candidate_cluster_ransac_temporal_sanity/reproj_error.png"
+}

@@ -36,3 +36,7 @@ recording/
 
 debug/
 debugging/
+
+# Local recordings and device/runtime caches
+logs_002/
+src/.cache/

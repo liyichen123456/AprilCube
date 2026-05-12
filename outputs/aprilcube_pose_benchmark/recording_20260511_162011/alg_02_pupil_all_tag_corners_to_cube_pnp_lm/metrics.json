@@ -1,0 +1,22 @@
+{
+  "num_frames": 568,
+  "num_success": 531,
+  "success_rate": 0.9348591549295775,
+  "translation_step_mean_mm": 19.151557958107254,
+  "translation_step_std_mm": 65.78118329993559,
+  "rotation_step_mean_deg": 19.356233600748897,
+  "rotation_step_std_deg": 40.091208873707785,
+  "reproj_mean_px": 8.885696434874532,
+  "reproj_std_px": 7.368483041309452,
+  "algorithm_name": "alg_02_pupil_all_tag_corners_to_cube_pnp_lm",
+  "pkl_path": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/logs_002/recording_20260511_162011.pkl",
+  "camera_name": "r_wrist",
+  "cube_path": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cube_april_25h9_0_5_1x1x1_10mm",
+  "clahe_clip_limit": 3.0,
+  "clahe_tile_grid_size": [
+    8,
+    8
+  ],
+  "pose_plot": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_02_pupil_all_tag_corners_to_cube_pnp_lm/pose_xyz_rpy.png",
+  "reproj_plot": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_02_pupil_all_tag_corners_to_cube_pnp_lm/reproj_error.png"
+}

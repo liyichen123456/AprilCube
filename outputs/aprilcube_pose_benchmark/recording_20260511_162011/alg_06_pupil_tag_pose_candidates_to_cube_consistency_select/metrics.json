@@ -1,0 +1,22 @@
+{
+  "num_frames": 568,
+  "num_success": 531,
+  "success_rate": 0.9348591549295775,
+  "translation_step_mean_mm": 4.382411439234634,
+  "translation_step_std_mm": 4.64402433837596,
+  "rotation_step_mean_deg": 75.15046487224329,
+  "rotation_step_std_deg": 90.37254699669826,
+  "reproj_mean_px": 10.126876161552643,
+  "reproj_std_px": 9.321570235236901,
+  "algorithm_name": "alg_06_pupil_tag_pose_candidates_to_cube_consistency_select",
+  "pkl_path": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/logs_002/recording_20260511_162011.pkl",
+  "camera_name": "r_wrist",
+  "cube_path": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cube_april_25h9_0_5_1x1x1_10mm",
+  "clahe_clip_limit": 3.0,
+  "clahe_tile_grid_size": [
+    8,
+    8
+  ],
+  "pose_plot": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_06_pupil_tag_pose_candidates_to_cube_consistency_select/pose_xyz_rpy.png",
+  "reproj_plot": "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_06_pupil_tag_pose_candidates_to_cube_consistency_select/reproj_error.png"
+}

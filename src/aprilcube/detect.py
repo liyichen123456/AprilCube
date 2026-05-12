@@ -1354,9 +1354,9 @@ class CubePoseEstimator:
                                          self.camera_matrix, self.dist_coeffs)
             pts2d = pts2d.reshape(-1, 2).astype(int)
             o = tuple(pts2d[0])
-            cv2.arrowedLine(vis, o, tuple(pts2d[1]), (0, 0, 255), 6, tipLength=0.15)
-            cv2.arrowedLine(vis, o, tuple(pts2d[2]), (0, 255, 0), 6, tipLength=0.15)
-            cv2.arrowedLine(vis, o, tuple(pts2d[3]), (255, 0, 0), 6, tipLength=0.15)
+            cv2.arrowedLine(vis, o, tuple(pts2d[1]), (0, 0, 255), 2, tipLength=0.15)
+            cv2.arrowedLine(vis, o, tuple(pts2d[2]), (0, 255, 0), 2, tipLength=0.15)
+            cv2.arrowedLine(vis, o, tuple(pts2d[3]), (255, 0, 0), 2, tipLength=0.15)
 
             # Draw box wireframe
             projected, _ = cv2.projectPoints(
@@ -1365,7 +1365,7 @@ class CubePoseEstimator:
             )
             pts = projected.reshape(-1, 2).astype(int)
             for i, j in self.box_edges:
-                cv2.line(vis, tuple(pts[i]), tuple(pts[j]), (0, 255, 0), 4)
+                cv2.line(vis, tuple(pts[i]), tuple(pts[j]), (0, 165, 255), 2)
 
         # Overlay info text
         h = vis.shape[0]
@@ -1510,13 +1510,26 @@ class CubePoseEstimator:
             line_width=1.0,
         )
 
+        object_axes_length = float(getattr(
+            self,
+            "_viser_object_frame_axes_length",
+            float(max(self.config.box_dims)) / 1000.0 * 0.6,
+        ))
+        object_axes_radius = float(getattr(self, "_viser_object_frame_axes_radius", 0.002))
+        object_origin_radius = float(getattr(self, "_viser_object_frame_origin_radius", 0.0))
+        show_mesh = bool(getattr(self, "_viser_show_mesh", True))
+        show_object_axes = bool(getattr(self, "_viser_show_object_axes", True))
+
         # Object frame (created once, updated in _viser_loop via properties)
         self._viser_object_frame = server.scene.add_frame(
-            "/object", axes_length=0.0, origin_radius=0.0,
+            "/object",
+            axes_length=object_axes_length,
+            axes_radius=object_axes_radius,
+            origin_radius=object_origin_radius,
         )
 
         # Textured mesh
-        if self.model_dir is not None:
+        if show_mesh and self.model_dir is not None:
             from pathlib import Path
             obj_path = Path(self.model_dir) / "mujoco" / "cube.obj"
             if obj_path.exists():
@@ -1525,11 +1538,12 @@ class CubePoseEstimator:
                 server.scene.add_mesh_trimesh("/object/mesh", mesh)
 
         # Object axes
-        axis_len = float(max(self.config.box_dims)) / 1000.0 * 0.6
-        server.scene.add_frame(
-            "/object/axes", axes_length=axis_len, axes_radius=0.002,
-            origin_radius=0.0,
-        )
+        if show_object_axes:
+            axis_len = float(max(self.config.box_dims)) / 1000.0 * 0.6
+            server.scene.add_frame(
+                "/object/axes", axes_length=axis_len, axes_radius=0.002,
+                origin_radius=0.0,
+            )
 
         # GUI sidebar
         server.gui.set_panel_label("AprilCube")
