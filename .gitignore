@@ -33,6 +33,7 @@ models/*/stl
 
 assets/extrinsic
 recording/
+recordings/
 
 debug/
 debugging/

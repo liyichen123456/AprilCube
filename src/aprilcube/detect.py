@@ -214,11 +214,35 @@ def _sharpen(gray: np.ndarray) -> np.ndarray:
 
 
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_adaptive_clahe_variants: tuple[tuple[float, tuple[int, int]], ...] = (
+    (1.0, (8, 8)),
+    (1.5, (8, 8)),
+    (2.5, (8, 8)),
+    (3.0, (8, 8)),
+    (4.0, (8, 8)),
+    (2.0, (4, 4)),
+    (3.0, (4, 4)),
+    (2.0, (12, 12)),
+    (3.0, (12, 12)),
+)
 
 
 def _preprocess(gray: np.ndarray) -> np.ndarray:
     """CLAHE contrast normalization for robust marker detection."""
     return _clahe.apply(gray)
+
+
+def _preprocess_clahe(
+    gray: np.ndarray,
+    clip_limit: float,
+    tile_grid_size: tuple[int, int],
+) -> np.ndarray:
+    """Run CLAHE with explicit parameters for adaptive marker recovery."""
+    clahe = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=tuple(int(v) for v in tile_grid_size),
+    )
+    return clahe.apply(gray)
 
 
 def _quad_quality(corners: np.ndarray, min_area: float = 100.0) -> float:
@@ -1077,17 +1101,121 @@ class CubePoseEstimator:
             self._fps_t = time.time()
         return result
 
-    def process_frame(self, image: np.ndarray,
-                      timestamp: float | None = None) -> dict:
-        """Process a single frame and return pose result.
+    def _detect_tags_on_enhanced(self, enhanced: np.ndarray) -> tuple[
+        list[tuple[int, np.ndarray]],
+        list,
+    ]:
+        try:
+            corners_list, ids, rejected = self.detector.detectMarkers(enhanced)
+        except cv2.error:
+            corners_list, ids, rejected = (), None, ()
 
-        Args:
-            image: BGR or grayscale frame.
-            timestamp: Monotonic time in seconds for this frame.
-                       If None, uses ``time.monotonic()``.
+        detections: list[tuple[int, np.ndarray]] = []
+        if ids is not None:
+            for i in range(len(ids)):
+                detections.append((int(ids[i][0]), corners_list[i].reshape(4, 2)))
+        return detections, [] if rejected is None else list(rejected)
+
+    def detect_tags(
+        self,
+        image: np.ndarray,
+        *,
+        adaptive_clahe: bool = False,
+        clahe_variants: tuple[tuple[float, tuple[int, int]], ...] | None = None,
+    ) -> dict:
+        """Detect all decoded tags in an image once for sharing across cubes.
+
+        ``adaptive_clahe=False`` preserves the original fixed-CLAHE behavior.
+        When enabled, additional CLAHE contrast settings are tried and decoded
+        tag corners are merged by tag id. This improves per-frame recovery on
+        over/under-exposed fisheye views without running PnP multiple times.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        enhanced = _preprocess(gray)
+        detections, rejected = self._detect_tags_on_enhanced(enhanced)
+        best_by_id: dict[int, tuple[float, np.ndarray]] = {
+            tag_id: (_quad_quality(corners), np.asarray(corners, dtype=np.float64).reshape(4, 2))
+            for tag_id, corners in detections
+        }
+        attempts: list[dict] = [
+            {
+                "clip_limit": 2.0,
+                "tile_grid_size": (8, 8),
+                "decoded": len(detections),
+                "new_ids": [int(tag_id) for tag_id, _ in detections],
+                "base": True,
+            }
+        ]
+
+        if adaptive_clahe:
+            variants = clahe_variants or _adaptive_clahe_variants
+            for clip_limit, tile_grid_size in variants:
+                if float(clip_limit) == 2.0 and tuple(tile_grid_size) == (8, 8):
+                    continue
+                candidate_enhanced = _preprocess_clahe(gray, clip_limit, tile_grid_size)
+                candidate_detections, candidate_rejected = self._detect_tags_on_enhanced(
+                    candidate_enhanced
+                )
+                rejected.extend(candidate_rejected)
+
+                new_ids: list[int] = []
+                for tag_id, corners in candidate_detections:
+                    corners = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+                    quality = _quad_quality(corners)
+                    prev = best_by_id.get(tag_id)
+                    if prev is None:
+                        best_by_id[tag_id] = (quality, corners)
+                        new_ids.append(int(tag_id))
+                    # Keep the first decoded corners for an id. Later CLAHE
+                    # variants are only allowed to add missing ids; replacing
+                    # an existing id can move otherwise-good corners enough to
+                    # break PnP on printed/fisheye imagery.
+
+                attempts.append(
+                    {
+                        "clip_limit": float(clip_limit),
+                        "tile_grid_size": tuple(int(v) for v in tile_grid_size),
+                        "decoded": len(candidate_detections),
+                        "new_ids": new_ids,
+                        "base": False,
+                    }
+                )
+
+        detections = [
+            (tag_id, corners)
+            for tag_id, (_quality, corners) in sorted(best_by_id.items())
+        ]
+
+        return {
+            "gray": gray,
+            "enhanced": enhanced,
+            "detections": detections,
+            "rejected": list(rejected or []),
+            "adaptive_clahe": bool(adaptive_clahe),
+            "adaptive_attempts": attempts,
+        }
+
+    def process_detections(
+        self,
+        image: np.ndarray,
+        tag_detections: list[tuple[int, np.ndarray]],
+        *,
+        rejected_quads: list | tuple | None = None,
+        gray: np.ndarray | None = None,
+        enhanced: np.ndarray | None = None,
+        timestamp: float | None = None,
+    ) -> dict:
+        """Estimate this cube's pose from shared decoded tag detections.
+
+        This preserves ``process_frame()`` behavior while allowing callers that
+        manage multiple cubes to run expensive marker detection once per frame.
         """
         if timestamp is None:
             timestamp = time.monotonic()
+        if gray is None:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        if enhanced is None:
+            enhanced = _preprocess(gray)
 
         result = {
             "success": False, "rvec": None, "tvec": None, "T": None,
@@ -1096,25 +1224,15 @@ class CubePoseEstimator:
             "visible_faces": set(), "predicted": False,
         }
 
-        # Detect
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        enhanced = _preprocess(gray)
-        try:
-            corners_list, ids, rejected = self.detector.detectMarkers(enhanced)
-        except cv2.error:
-            corners_list, ids, rejected = (), None, ()
-
-        # Collect valid detections from primary pass
+        # Collect detections that belong to this cube instance.
         detections: list[tuple[int, np.ndarray]] = []
         seen_ids: set[int] = set()
-        if ids is not None:
-            for i in range(len(ids)):
-                tag_id = int(ids[i][0])
-                if tag_id in self.valid_ids:
-                    detections.append((tag_id, corners_list[i].reshape(4, 2)))
-                    seen_ids.add(tag_id)
+        for tag_id, corners_2d in tag_detections:
+            if tag_id in self.valid_ids and tag_id not in seen_ids:
+                detections.append((tag_id, np.asarray(corners_2d, dtype=np.float64).reshape(4, 2)))
+                seen_ids.add(tag_id)
 
-        # Fallback: sharpen + relaxed detector only when primary finds nothing
+        # Fallback: sharpen + relaxed detector only when primary finds nothing.
         fb_rejected: tuple = ()
         if len(detections) == 0 and self.prev_rvec is not None:
             sharp = _sharpen(enhanced)
@@ -1141,7 +1259,7 @@ class CubePoseEstimator:
         # Recover rejected candidates using predicted pose geometry.
         # Rejected quads failed bit-decoding (e.g. from blur) but may still
         # correspond to real tags. Match them against projected tag positions.
-        all_rejected = list(rejected or []) + list(fb_rejected or [])
+        all_rejected = list(rejected_quads or []) + list(fb_rejected or [])
         if all_rejected and self.prev_rvec is not None:
             detections = self._recover_rejected(
                 detections, seen_ids, all_rejected,
@@ -1331,6 +1449,25 @@ class CubePoseEstimator:
         result["reproj_error"] = reproj_err
         result["n_inliers"] = n_inlier_count
         return self._store_latest(result, image)
+
+    def process_frame(self, image: np.ndarray,
+                      timestamp: float | None = None) -> dict:
+        """Process a single frame and return pose result.
+
+        Args:
+            image: BGR or grayscale frame.
+            timestamp: Monotonic time in seconds for this frame.
+                       If None, uses ``time.monotonic()``.
+        """
+        shared = self.detect_tags(image)
+        return self.process_detections(
+            image,
+            shared["detections"],
+            rejected_quads=shared["rejected"],
+            gray=shared["gray"],
+            enhanced=shared["enhanced"],
+            timestamp=timestamp,
+        )
 
     def draw_result(self, image: np.ndarray, result: dict) -> np.ndarray:
         """Draw detected markers, axes, and wireframe."""

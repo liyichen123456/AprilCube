@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -51,13 +52,13 @@ def load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
 # ============================================================
 
 CAMERA_TO_PORT: dict[str, str] = {
-    "cam0": "3-9:1.0",
+    "cam0": "3-10.1:1.0",
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0618_181728.yaml",
-    "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_210450.yaml",
-
+    # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_210450.yaml",
+    "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
 }
 
 ACTIVE_CAMERA_NAMES: list[str] = ["cam0"]
@@ -67,13 +68,15 @@ FOURCC = "MJPG"
 WINDOW_PREFIX = "CV2 Native AprilCube"
 PRINT_EVERY_N_FRAMES = 5
 UNDISTORT_BEFORE_DETECTION = True
-FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG = 140.0
+FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG = 120.0
 PINHOLE_UNDISTORT_ALPHA = 0.0
+RECORD_OUTPUT_DIR = THIS_FILE.parent.parent / "recordings"
+ADAPTIVE_CLAHE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
     THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_0_5_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_6_11_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_12_17_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_6_11_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_12_17_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_18_23_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_24_29_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_30_35_1x1x1_10mm",
@@ -321,9 +324,147 @@ def draw_text_panel(img: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
+def count_adaptive_new_tag_ids(shared_tags: dict[str, Any]) -> int:
+    attempts = shared_tags.get("adaptive_attempts", [])
+    new_ids: set[int] = set()
+    for attempt in attempts:
+        if attempt.get("base", False):
+            continue
+        for tag_id in attempt.get("new_ids", []):
+            new_ids.add(int(tag_id))
+    return len(new_ids)
+
+
+class RawFramePklRecorder:
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = Path(output_dir).expanduser()
+        self.path: Path | None = None
+        self._metadata: dict[str, Any] | None = None
+        self._frames: list[dict[str, Any]] = []
+        self.started_wall_time: str | None = None
+        self.started_monotonic: float | None = None
+
+    @property
+    def is_recording(self) -> bool:
+        return self._metadata is not None
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._frames)
+
+    @property
+    def buffered_bytes(self) -> int:
+        return int(sum(frame["image_bgr"].nbytes for frame in self._frames))
+
+    def start(self, metadata: dict[str, Any]) -> None:
+        if self.is_recording:
+            print(f"[INFO] Recording already active: {self.path}")
+            return
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.path = self.output_dir / f"008_raw_frames_{stamp}.pkl"
+        self.started_wall_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.started_monotonic = time.perf_counter()
+        self._frames = []
+        self._metadata = dict(metadata)
+        print(f"[INFO] Started raw-frame memory buffering: {self.path}")
+
+    def write(
+        self,
+        *,
+        camera_name: str,
+        loop_frame_idx: int,
+        image_bgr: np.ndarray | None,
+        capture_timestamp: float | None,
+    ) -> None:
+        if not self.is_recording or image_bgr is None:
+            return
+
+        self._frames.append(
+            {
+                "type": "frame",
+                "camera_name": camera_name,
+                "loop_frame_idx": int(loop_frame_idx),
+                "capture_timestamp": None
+                if capture_timestamp is None
+                else float(capture_timestamp),
+                "write_monotonic": float(time.perf_counter()),
+                "shape": tuple(int(v) for v in image_bgr.shape),
+                "dtype": str(image_bgr.dtype),
+                "image_bgr": image_bgr,
+            }
+        )
+
+    def _print_save_progress(self, done: int, total: int) -> None:
+        width = 36
+        ratio = 1.0 if total <= 0 else done / total
+        filled = int(round(width * ratio))
+        bar = "#" * filled + "-" * (width - filled)
+        sys.stdout.write(f"\r[INFO] Saving PKL [{bar}] {done}/{total} frames")
+        sys.stdout.flush()
+        if done >= total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def stop(self, reason: str = "user_stop") -> None:
+        if not self.is_recording:
+            print("[INFO] Recording is not active.")
+            return
+
+        path = self.path
+        assert path is not None
+        assert self._metadata is not None
+
+        total_frames = self.frame_count
+        buffered_gb = self.buffered_bytes / (1024**3)
+        elapsed = (
+            time.perf_counter() - self.started_monotonic
+            if self.started_monotonic is not None
+            else 0.0
+        )
+        print(
+            f"[INFO] Stopped raw-frame buffering: frames={total_frames} "
+            f"buffered={buffered_gb:.2f} GiB duration={elapsed:.2f}s"
+        )
+        print(f"[INFO] Writing PKL: {path}")
+
+        with path.open("wb") as f:
+            pickle.dump(
+                {
+                    "type": "header",
+                    "format": "aprilcube_raw_frame_stream_v1",
+                    "created_wall_time": self.started_wall_time,
+                    "metadata": self._metadata,
+                },
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            self._print_save_progress(0, total_frames)
+            for idx, frame_record in enumerate(self._frames, start=1):
+                pickle.dump(frame_record, f, protocol=pickle.HIGHEST_PROTOCOL)
+                if idx == total_frames or idx % 10 == 0:
+                    self._print_save_progress(idx, total_frames)
+            pickle.dump(
+                {
+                    "type": "footer",
+                    "reason": reason,
+                    "frame_count": int(total_frames),
+                    "stopped_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+        self._frames = []
+        self._metadata = None
+        self.started_monotonic = None
+        print(f"[INFO] Saved raw-frame PKL recording: {path} frames={total_frames}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Naively detect multiple AprilCube cfgs using CV2 camera input and native aprilcube.process_frame()."
+        description="Detect multiple AprilCube cfgs using one shared AprilTag detection pass per CV2 frame."
     )
     parser.add_argument(
         "--cameras",
@@ -351,6 +492,12 @@ def main() -> None:
         "--no-undistort",
         action="store_true",
         help="Do not undistort images before native AprilCube detection.",
+    )
+    parser.add_argument(
+        "--record-dir",
+        type=str,
+        default=str(RECORD_OUTPUT_DIR),
+        help="Directory for raw-frame PKL recordings triggered by s/p.",
     )
     args = parser.parse_args()
 
@@ -458,6 +605,7 @@ def main() -> None:
         fps=FPS,
         fourcc=FOURCC,
     )
+    recorder = RawFramePklRecorder(Path(args.record_dir))
 
     try:
         opened = camera_manager.open_all_cameras()
@@ -467,8 +615,40 @@ def main() -> None:
 
         opened_names = camera_manager.get_active_camera_names()
         print(f"[INFO] Opened CV2 cameras: {opened_names}")
-        print("[INFO] Native detection path: detector.process_frame(frame)")
-        print("[INFO] Press 'q' or ESC to quit.")
+        print(
+            "[INFO] Native detection path: shared detect_tags(frame) "
+            "+ per-cube process_detections()."
+        )
+        print(f"[INFO] Adaptive CLAHE tag recovery: {ADAPTIVE_CLAHE_DETECTION}")
+        print("[INFO] Press 's' to start raw-frame PKL recording, 'p' to stop, 'q' or ESC to quit.")
+
+        recording_metadata = {
+            "script": str(THIS_FILE),
+            "recorded_image": "origin_frame_raw_bgr",
+            "camera_to_port": {name: CAMERA_TO_PORT[name] for name in active_camera_names},
+            "intrinsics_yaml": {
+                name: CAMERA_TO_INTRINSICS_YAML[name] for name in active_camera_names
+            },
+            "opened_cameras": list(opened_names),
+            "capture_size": tuple(int(v) for v in capture_size),
+            "detect_img_size": tuple(int(v) for v in detect_img_size),
+            "fps": int(FPS),
+            "fourcc": str(FOURCC),
+            "undistort_before_detection": bool(use_undistort),
+            "fisheye_rectified_horizontal_fov_deg": float(
+                FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG
+            ),
+            "cube_paths": [str(path) for path in cube_paths],
+        }
+
+        def handle_key(key: int) -> bool:
+            if key == 27 or key == ord("q"):
+                return False
+            if key == ord("s"):
+                recorder.start(recording_metadata)
+            elif key == ord("p"):
+                recorder.stop("user_stop")
+            return True
 
         frame_idx = 0
         last_no_frame_print_time = 0.0
@@ -484,12 +664,18 @@ def main() -> None:
                     print("[INFO] No frames received yet.")
                     last_no_frame_print_time = now
                 key = cv2.waitKey(1)
-                if key == 27 or key == ord("q"):
+                if not handle_key(key):
                     break
                 continue
 
             for camera_name, frame in frames.items():
                 origin_frame = _origin_frames.get(camera_name)
+                recorder.write(
+                    camera_name=camera_name,
+                    loop_frame_idx=frame_idx,
+                    image_bgr=origin_frame,
+                    capture_timestamp=_timestamps.get(camera_name),
+                )
                 if origin_frame is not None and frame_idx % PRINT_EVERY_N_FRAMES == 0:
                     origin_h, origin_w = origin_frame.shape[:2]
                     detect_h, detect_w = frame.shape[:2]
@@ -508,6 +694,12 @@ def main() -> None:
 
                 vis = make_tag_detection_vis_image(detect_frame)
                 fps_text = camera_manager.get_latest_fps(camera_name)
+                shared_timestamp = time.monotonic()
+                shared_tags = detector_entries[0]["detector"].detect_tags(
+                    detect_frame,
+                    adaptive_clahe=ADAPTIVE_CLAHE_DETECTION,
+                )
+                adaptive_new_tags = count_adaptive_new_tag_ids(shared_tags)
                 status_lines = [
                     f"[{camera_name}] native_aprilcube cubes={len(detector_entries)} "
                     f"detect_size={detect_img_size} vis_size={vis_img_size} capture_size={capture_size} "
@@ -515,11 +707,30 @@ def main() -> None:
                     f"[{camera_name}] native_aprilcube cubes={len(detector_entries)} "
                     f"detect_size={detect_img_size} vis_size={vis_img_size} capture_size={capture_size}"
                 ]
+                status_lines.append(
+                    f"tags_decoded={len(shared_tags['detections'])} "
+                    f"adaptive_clahe={ADAPTIVE_CLAHE_DETECTION} "
+                    f"clahe_extra_tags={adaptive_new_tags}"
+                )
+                if recorder.is_recording:
+                    buffered_gb = recorder.buffered_bytes / (1024**3)
+                    status_lines.append(
+                        f"REC buffering frames={recorder.frame_count} mem={buffered_gb:.2f}GiB"
+                    )
+                else:
+                    status_lines.append("REC off: press s to start, p to stop")
 
                 for entry in detector_entries:
                     cube_name = entry["cube_name"]
                     detector = entry["detector"]
-                    result = detector.process_frame(detect_frame)
+                    result = detector.process_detections(
+                        detect_frame,
+                        shared_tags["detections"],
+                        rejected_quads=shared_tags["rejected"],
+                        gray=shared_tags["gray"],
+                        enhanced=shared_tags["enhanced"],
+                        timestamp=shared_timestamp,
+                    )
 
                     try:
                         vis = detector.draw_result(vis, result)
@@ -535,18 +746,20 @@ def main() -> None:
                     if frame_idx % PRINT_EVERY_N_FRAMES == 0:
                         print(line)
 
-                status_lines.append("press q or ESC to quit")
+                status_lines.append("press s start rec, p stop rec, q or ESC quit")
                 vis = draw_text_panel(vis, status_lines)
                 vis = cv2.resize(vis, vis_img_size, interpolation=cv2.INTER_AREA)
                 cv2.imshow(f"{WINDOW_PREFIX}: {camera_name}", vis)
 
             key = cv2.waitKey(1)
-            if key == 27 or key == ord("q"):
+            if not handle_key(key):
                 break
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.")
     finally:
+        if recorder.is_recording:
+            recorder.stop("shutdown")
         camera_manager.release_all()
         cv2.destroyAllWindows()
 

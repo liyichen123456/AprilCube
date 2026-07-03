@@ -56,12 +56,14 @@ def load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
 # ============================================================
 
 CAMERA_TO_PORT: dict[str, str] = {
-    "cam0": "3-9:1.0",
+    "cam0": "3-10.1:1.0",
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0618_181728.yaml",  1.1鱼眼
-    "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_210450.yaml",
+    # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_210450.yaml",
+    "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
+
 }
 
 ACTIVE_CAMERA_NAMES: list[str] = ["cam0"]
