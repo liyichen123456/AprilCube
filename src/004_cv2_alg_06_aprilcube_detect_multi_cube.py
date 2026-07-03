@@ -48,7 +48,7 @@ def load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
 # ============================================================
 
 CAMERA_TO_PORT: dict[str, str] = {
-    "cam0": "4-9.4.4.1:1.0",
+    "cam0": "3-9:1.0",
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
