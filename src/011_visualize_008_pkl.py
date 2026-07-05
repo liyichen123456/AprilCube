@@ -665,6 +665,117 @@ def pose_markdown(pose_frame: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def cube_scene_node_name(cube_name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in cube_name)
+    return f"/world_thumb_web_camera/{safe}"
+
+
+def create_3d_scene_handles(
+    server: viser.ViserServer,
+    estimator: ReplayPoseEstimator,
+) -> dict[str, dict[str, Any]]:
+    server.scene.world_axes.visible = False
+    server.scene.add_frame(
+        "/world_thumb_web_camera",
+        axes_length=0.06,
+        axes_radius=0.002,
+        origin_radius=0.004,
+    )
+
+    grid_lines = []
+    grid_half = 0.20
+    grid_step = 0.05
+    n = int(round(grid_half / grid_step))
+    for i in range(-n, n + 1):
+        x = i * grid_step
+        z = i * grid_step
+        grid_lines.append([[x, 0.0, -grid_half], [x, 0.0, grid_half]])
+        grid_lines.append([[-grid_half, 0.0, z], [grid_half, 0.0, z]])
+    server.scene.add_line_segments(
+        "/world_thumb_web_camera/xz_grid_y0",
+        points=np.asarray(grid_lines, dtype=np.float32),
+        colors=(80, 80, 80),
+        line_width=1.0,
+        visible=False,
+    )
+
+    palette = [
+        (255, 150, 40),
+        (80, 180, 255),
+        (120, 220, 120),
+        (220, 120, 255),
+        (255, 220, 80),
+        (180, 180, 180),
+    ]
+    handles: dict[str, dict[str, Any]] = {}
+    color_idx = 0
+    for camera_name in estimator.active_camera_names:
+        for entry in estimator.detector_entries_by_camera.get(camera_name, []):
+            cube_name = entry["cube_name"]
+            detector = entry["detector"]
+            node = cube_scene_node_name(cube_name)
+            dims_m = tuple(float(v) / 1000.0 for v in detector.config.box_dims)
+            color = palette[color_idx % len(palette)]
+            color_idx += 1
+            frame_handle = server.scene.add_frame(
+                node,
+                axes_length=max(dims_m) * 0.8,
+                axes_radius=max(dims_m) * 0.035,
+                origin_radius=0.0,
+                visible=False,
+            )
+            box_handle = server.scene.add_box(
+                f"{node}/box",
+                dimensions=dims_m,
+                color=color,
+                opacity=0.35,
+                side="double",
+                visible=False,
+            )
+            handles[cube_name] = {
+                "frame": frame_handle,
+                "box": box_handle,
+                "base_color": color,
+            }
+    return handles
+
+
+def update_3d_scene(
+    scene_handles: dict[str, dict[str, Any]],
+    pose_frame: dict[str, Any],
+) -> None:
+    seen: set[str] = set()
+    for cube in pose_frame.get("cube_results", []):
+        cube_name = str(cube.get("cube_name", ""))
+        result = cube.get("result", {})
+        handles = scene_handles.get(cube_name)
+        if handles is None:
+            continue
+        seen.add(cube_name)
+        success = bool(result.get("success", False))
+        for key in ("frame", "box"):
+            handles[key].visible = success
+        if not success:
+            continue
+
+        rvec = np.asarray(result["rvec"], dtype=np.float64).reshape(3, 1)
+        tvec_m = np.asarray(result["tvec"], dtype=np.float64).reshape(3) / 1000.0
+        wxyz = rvec_to_quat(rvec)
+        handles["frame"].position = tvec_m
+        handles["frame"].wxyz = wxyz
+        handles["box"].color = (
+            (255, 0, 0)
+            if bool(result.get("temporal_filled", False))
+            else handles["base_color"]
+        )
+
+    for cube_name, handles in scene_handles.items():
+        if cube_name in seen:
+            continue
+        for key in ("frame", "box"):
+            handles[key].visible = False
+
+
 def precompute_pose_cache(
     pkl_path: Path,
     frame_offsets: list[int],
@@ -1072,14 +1183,31 @@ def main() -> None:
     )
 
     server = viser.ViserServer(host=args.host, port=int(args.port))
-    server.scene.world_axes.visible = False
+    scene_handles = create_3d_scene_handles(server, estimator)
+    update_3d_scene(scene_handles, pose_cache[0])
 
     with server.gui.add_folder("TagPose Visualization"):
+        server.gui.add_markdown(
+            "3D scene uses the thumb_web camera as world coordinates. Cube boxes update with the Frame slider."
+        )
         pose_image_handle = server.gui.add_image(
             first_pose_rgb,
             label="008 pose estimation",
             format="jpeg",
             jpeg_quality=int(args.jpeg_quality),
+        )
+        frame_slider = server.gui.add_slider(
+            "Frame",
+            min=0,
+            max=total_frames - 1,
+            step=1,
+            initial_value=0,
+        )
+        auto_play_checkbox = server.gui.add_checkbox("Auto play", initial_value=False)
+        status_text = server.gui.add_text(
+            "Status",
+            initial_value=record_summary(first_record, 0, total_frames),
+            disabled=True,
         )
         pose_text = server.gui.add_markdown(pose_markdown(pose_cache[0]))
 
@@ -1099,22 +1227,7 @@ def main() -> None:
             jpeg_quality=int(args.jpeg_quality),
         )
 
-    with server.gui.add_folder("Replay Control"):
-        server.gui.add_markdown(
-            "Drag `Frame`; raw frames and 008 TagPose overlays are shown in separate sidebar folders."
-        )
-        frame_slider = server.gui.add_slider(
-            "Frame",
-            min=0,
-            max=total_frames - 1,
-            step=1,
-            initial_value=0,
-        )
-        status_text = server.gui.add_text(
-            "Status",
-            initial_value=record_summary(first_record, 0, total_frames),
-            disabled=True,
-        )
+    with server.gui.add_folder("Replay Metadata"):
         server.gui.add_text("PKL", initial_value=str(pkl_path), disabled=True)
         if isinstance(metadata, dict):
             server.gui.add_markdown(
@@ -1131,11 +1244,20 @@ def main() -> None:
     print(f"[INFO] Viser: http://{args.host}:{int(args.port)}")
     print(
         "[INFO] Use the sidebar folders: TagPose Visualization, "
-        "Undistorted Debug Image, Raw Image, Replay Control."
+        "Undistorted Debug Image, Raw Image, Replay Metadata."
     )
 
     current_idx = -1
+    last_auto_play_step = time.monotonic()
     while True:
+        if bool(auto_play_checkbox.value):
+            now = time.monotonic()
+            if now - last_auto_play_step >= 0.1:
+                frame_slider.value = (int(frame_slider.value) + 1) % total_frames
+                last_auto_play_step = now
+        else:
+            last_auto_play_step = time.monotonic()
+
         slider_idx = int(frame_slider.value)
         if slider_idx != current_idx:
             try:
@@ -1156,6 +1278,7 @@ def main() -> None:
                 raw_image_handle.image = bgr_to_rgb_for_viser(record["image_bgr"], int(args.max_width))
                 status_text.value = record_summary(record, slider_idx, total_frames)
                 pose_text.content = pose_markdown(pose_cache[slider_idx])
+                update_3d_scene(scene_handles, pose_cache[slider_idx])
                 current_idx = slider_idx
             except Exception as exc:
                 status_text.value = f"Failed to load frame {slider_idx}: {type(exc).__name__}: {exc}"

@@ -1,0 +1,42 @@
+{
+  "dict": "apriltag_36h11",
+  "grid": "1x1x1",
+  "tag_ids": [
+    36,
+    37,
+    38,
+    39,
+    40,
+    41
+  ],
+  "faces": {
+    "+X": [
+      36
+    ],
+    "-X": [
+      37
+    ],
+    "+Y": [
+      38
+    ],
+    "-Y": [
+      39
+    ],
+    "+Z": [
+      40
+    ],
+    "-Z": [
+      41
+    ]
+  },
+  "tag_size_mm": 20.0,
+  "cell_size_mm": 2.5,
+  "margin_cells": 1,
+  "border_cells": 1,
+  "marker_pixels": 8,
+  "box_dims": [
+    25.0,
+    25.0,
+    25.0
+  ]
+}
