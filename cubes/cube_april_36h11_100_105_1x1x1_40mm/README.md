@@ -43,6 +43,11 @@
 
 ```json
 {
+  "schema_version": 1,
+  "target": {
+    "type": "cuboid",
+    "grid": "1x1x1"
+  },
   "dict": "apriltag_36h11",
   "grid": "1x1x1",
   "tag_ids": [
@@ -89,5 +94,5 @@
 ## Regenerate
 
 ```bash
-python generate_cube.py --grid 1x1x1 --dict apriltag_36h11 --tag-size 40 --margin-cell 1 --border-cell 1 -o cube_april_36h11_100_105_1x1x1_40mm
+aprilcube generate --grid 1x1x1 --dict apriltag_36h11 --tag-size 40 --margin-cell 1 --border-cell 1 -o cube_april_36h11_100_105_1x1x1_40mm
 ```

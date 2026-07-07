@@ -62,12 +62,12 @@ INIT_TAG_SIZE_M = 0.1
 INIT_REQUIRED_SAMPLES_PER_CAMERA = 10
 
 CUBE_CFG_DIRS: list[Path] = [
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_0_5_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_6_11_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_12_17_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_18_23_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_24_29_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_30_35_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
 ]
 
 ENABLE_FILTER = True

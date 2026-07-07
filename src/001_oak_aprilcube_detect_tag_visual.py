@@ -17,7 +17,7 @@ from pupil_apriltags import Detector
 
 THIS_FILE = Path(__file__).resolve()
 THIRDPARTY_DIR = THIS_FILE.parent.parent.parent
-APRILCUBE_SRC_DIR = THIRDPARTY_DIR / "aprilcube" / "cube_april_25h9_0_5_1x1x1_10mm"
+APRILCUBE_SRC_DIR = THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm"
 PROJECT_ROOT = THIRDPARTY_DIR.parent
 
 RECORDER_UTILS_DIR = PROJECT_ROOT / "scripts" / "utils"

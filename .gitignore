@@ -40,4 +40,7 @@ debugging/
 
 # Local recordings and device/runtime caches
 logs_002/
+Log/
+log/
+install/
 src/.cache/

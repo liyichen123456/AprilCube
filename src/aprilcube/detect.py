@@ -20,6 +20,9 @@ import numpy as np
 from aprilcube.generate import CubeConfig, DICT_MAP, FACE_DEFS
 
 
+SINGLE_TAG_CFG_MAX_REPROJ_PX = 25.0
+
+
 # ---------------------------------------------------------------------------
 # Load cube config from JSON
 # ---------------------------------------------------------------------------
@@ -213,6 +216,24 @@ def _sharpen(gray: np.ndarray) -> np.ndarray:
     return cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
 
 
+def _gamma_correct(gray: np.ndarray, gamma: float) -> np.ndarray:
+    gamma = max(float(gamma), 1e-6)
+    table = ((np.arange(256, dtype=np.float32) / 255.0) ** gamma * 255.0)
+    return cv2.LUT(gray, np.clip(table, 0, 255).astype(np.uint8))
+
+
+def _linear_contrast(gray: np.ndarray, alpha: float, beta: float) -> np.ndarray:
+    return cv2.convertScaleAbs(gray, alpha=float(alpha), beta=float(beta))
+
+
+def _percentile_stretch(gray: np.ndarray, low: float = 1.0, high: float = 99.0) -> np.ndarray:
+    lo, hi = np.percentile(gray, [float(low), float(high)])
+    if hi <= lo + 1e-6:
+        return gray.copy()
+    stretched = (gray.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(stretched, 0, 255).astype(np.uint8)
+
+
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 _adaptive_clahe_variants: tuple[tuple[float, tuple[int, int]], ...] = (
     (1.0, (8, 8)),
@@ -224,6 +245,28 @@ _adaptive_clahe_variants: tuple[tuple[float, tuple[int, int]], ...] = (
     (3.0, (4, 4)),
     (2.0, (12, 12)),
     (3.0, (12, 12)),
+)
+_adaptive_image_enhancement_variants: tuple[dict, ...] = (
+    {"name": "clahe clip=1.0 tile=(8,8)", "clahe": (1.0, (8, 8))},
+    {"name": "clahe clip=1.5 tile=(8,8)", "clahe": (1.5, (8, 8))},
+    {"name": "clahe clip=2.5 tile=(8,8)", "clahe": (2.5, (8, 8))},
+    {"name": "clahe clip=3.0 tile=(8,8)", "clahe": (3.0, (8, 8))},
+    {"name": "clahe clip=4.0 tile=(8,8)", "clahe": (4.0, (8, 8))},
+    {"name": "clahe clip=2.0 tile=(4,4)", "clahe": (2.0, (4, 4))},
+    {"name": "clahe clip=3.0 tile=(4,4)", "clahe": (3.0, (4, 4))},
+    {"name": "clahe clip=2.0 tile=(12,12)", "clahe": (2.0, (12, 12))},
+    {"name": "clahe clip=3.0 tile=(12,12)", "clahe": (3.0, (12, 12))},
+    {"name": "sharpen+clahe", "sharpen": True, "clahe": (2.0, (8, 8))},
+    {"name": "sharpen+clahe strong", "sharpen": True, "clahe": (3.0, (8, 8))},
+    {"name": "gamma brighten+clahe", "gamma": 0.7, "clahe": (2.0, (8, 8))},
+    {"name": "gamma darken+clahe", "gamma": 1.4, "clahe": (2.0, (8, 8))},
+    {"name": "contrast up+clahe", "alpha": 1.35, "beta": 0.0, "clahe": (2.0, (8, 8))},
+    {"name": "contrast bright+clahe", "alpha": 1.25, "beta": 18.0, "clahe": (2.0, (8, 8))},
+    {"name": "contrast dark+clahe", "alpha": 1.35, "beta": -18.0, "clahe": (2.0, (8, 8))},
+    {"name": "stretch+clahe", "stretch": (1.0, 99.0), "clahe": (2.0, (8, 8))},
+    {"name": "stretch+sharpen+clahe", "stretch": (1.0, 99.0), "sharpen": True, "clahe": (2.0, (8, 8))},
+    {"name": "sharpen+relaxed", "sharpen": True, "detector": "fallback"},
+    {"name": "stretch+sharpen+relaxed", "stretch": (1.0, 99.0), "sharpen": True, "detector": "fallback"},
 )
 
 
@@ -243,6 +286,27 @@ def _preprocess_clahe(
         tileGridSize=tuple(int(v) for v in tile_grid_size),
     )
     return clahe.apply(gray)
+
+
+def _preprocess_enhancement_variant(gray: np.ndarray, variant: dict) -> np.ndarray:
+    enhanced = gray.copy()
+    if "stretch" in variant:
+        low, high = variant["stretch"]
+        enhanced = _percentile_stretch(enhanced, low, high)
+    if "alpha" in variant or "beta" in variant:
+        enhanced = _linear_contrast(
+            enhanced,
+            float(variant.get("alpha", 1.0)),
+            float(variant.get("beta", 0.0)),
+        )
+    if "gamma" in variant:
+        enhanced = _gamma_correct(enhanced, float(variant["gamma"]))
+    if variant.get("sharpen", False):
+        enhanced = _sharpen(enhanced)
+    if "clahe" in variant:
+        clip_limit, tile_grid_size = variant["clahe"]
+        enhanced = _preprocess_clahe(enhanced, clip_limit, tile_grid_size)
+    return enhanced
 
 
 def _quad_quality(corners: np.ndarray, min_area: float = 100.0) -> float:
@@ -377,6 +441,144 @@ def estimate_pose(
     reproj_err = float(np.mean(np.linalg.norm(image_points - projected, axis=1)))
 
     return success, rvec, tvec, reproj_err, inliers
+
+
+def _rigid_transform_3d(src_points: np.ndarray, dst_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return R, t such that dst ~= R @ src + t."""
+    src = np.asarray(src_points, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst_points, dtype=np.float64).reshape(-1, 3)
+    src_center = src.mean(axis=0)
+    dst_center = dst.mean(axis=0)
+    h = (src - src_center).T @ (dst - dst_center)
+    u, _s, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1.0
+        r = vt.T @ u.T
+    t = dst_center - r @ src_center
+    return r, t.reshape(3, 1)
+
+
+def _face_name_for_tag(face_id_sets: dict[str, set[int]], tag_id: int) -> str | None:
+    for face_name, id_set in face_id_sets.items():
+        if int(tag_id) in id_set:
+            return face_name
+    return None
+
+
+def _face_normal(face_name: str | None) -> np.ndarray | None:
+    if face_name is None:
+        return None
+    for fd in FACE_DEFS:
+        if fd[0] == face_name:
+            normal = np.zeros(3, dtype=np.float64)
+            normal[fd[1]] = fd[2]
+            return normal
+    return None
+
+
+def estimate_single_tag_cube_pose(
+    detections: list[tuple[int, np.ndarray]],
+    tag_corner_map: dict[int, np.ndarray],
+    face_id_sets: dict[str, set[int]],
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    prev_rvec: np.ndarray | None = None,
+    prev_tvec: np.ndarray | None = None,
+) -> tuple[bool, np.ndarray | None, np.ndarray | None, float, np.ndarray | None, dict]:
+    """Estimate cube pose from one decoded tag and cfg tag-to-cube geometry."""
+    candidates: list[tuple[float, np.ndarray, np.ndarray, float, int, str | None]] = []
+    for tag_id, corners_2d in detections:
+        obj_corners = tag_corner_map.get(int(tag_id))
+        if obj_corners is None:
+            continue
+        obj_corners = np.asarray(obj_corners, dtype=np.float64).reshape(4, 3)
+        corners_2d = np.asarray(corners_2d, dtype=np.float64).reshape(4, 2)
+        edge_len = float(np.mean([
+            np.linalg.norm(obj_corners[(i + 1) % 4] - obj_corners[i])
+            for i in range(4)
+        ]))
+        if edge_len <= 1e-9:
+            continue
+
+        # OpenCV IPPE_SQUARE expects TL, TR, BR, BL on a square centered at origin.
+        tag_local_corners = np.array([
+            [-edge_len / 2.0, edge_len / 2.0, 0.0],
+            [edge_len / 2.0, edge_len / 2.0, 0.0],
+            [edge_len / 2.0, -edge_len / 2.0, 0.0],
+            [-edge_len / 2.0, -edge_len / 2.0, 0.0],
+        ], dtype=np.float64)
+
+        try:
+            retval, tag_rvecs, tag_tvecs, _errs = cv2.solvePnPGeneric(
+                tag_local_corners,
+                corners_2d,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE,
+            )
+        except cv2.error:
+            retval, tag_rvecs, tag_tvecs = 0, (), ()
+        if not retval:
+            continue
+
+        r_cube_tag, t_cube_tag = _rigid_transform_3d(tag_local_corners, obj_corners)
+        T_cube_tag = np.eye(4, dtype=np.float64)
+        T_cube_tag[:3, :3] = r_cube_tag
+        T_cube_tag[:3, 3] = t_cube_tag.reshape(3)
+        T_tag_cube = np.linalg.inv(T_cube_tag)
+
+        face_name = _face_name_for_tag(face_id_sets, int(tag_id))
+        normal_obj = _face_normal(face_name)
+
+        for tag_rvec, tag_tvec in zip(tag_rvecs, tag_tvecs):
+            r_cam_tag, _ = cv2.Rodrigues(tag_rvec)
+            T_cam_tag = np.eye(4, dtype=np.float64)
+            T_cam_tag[:3, :3] = r_cam_tag
+            T_cam_tag[:3, 3] = np.asarray(tag_tvec, dtype=np.float64).reshape(3)
+            T_cam_cube = T_cam_tag @ T_tag_cube
+
+            r_cam_cube = T_cam_cube[:3, :3]
+            t_cam_cube = T_cam_cube[:3, 3].reshape(3, 1)
+            if float(t_cam_cube[2, 0]) <= 0.0:
+                continue
+            if normal_obj is not None:
+                normal_cam = r_cam_cube @ normal_obj
+                if float(normal_cam[2]) > 0.0:
+                    continue
+
+            rvec_cube, _ = cv2.Rodrigues(r_cam_cube)
+            projected, _ = cv2.projectPoints(
+                obj_corners,
+                rvec_cube,
+                t_cam_cube,
+                camera_matrix,
+                dist_coeffs,
+            )
+            reproj_err = float(np.mean(np.linalg.norm(
+                corners_2d - projected.reshape(-1, 2),
+                axis=1,
+            )))
+            score = reproj_err
+            if prev_rvec is not None and prev_tvec is not None:
+                trans_delta = float(np.linalg.norm(t_cam_cube.reshape(3) - np.asarray(prev_tvec).reshape(3)))
+                r_prev, _ = cv2.Rodrigues(np.asarray(prev_rvec, dtype=np.float64).reshape(3, 1))
+                angle = np.arccos(np.clip((np.trace(r_prev.T @ r_cam_cube) - 1.0) / 2.0, -1.0, 1.0))
+                score += min(trans_delta / 20.0, 20.0) + min(np.degrees(angle) / 10.0, 20.0)
+            candidates.append((score, rvec_cube, t_cam_cube, reproj_err, int(tag_id), face_name))
+
+    if not candidates:
+        return False, None, None, float("inf"), None, {}
+
+    candidates.sort(key=lambda item: item[0])
+    _score, rvec, tvec, reproj_err, tag_id, face_name = candidates[0]
+    inliers = np.arange(4, dtype=np.int32).reshape(-1, 1)
+    meta = {
+        "single_tag_id": int(tag_id),
+        "single_tag_face": face_name,
+        "single_tag_candidate_count": len(candidates),
+    }
+    return True, rvec, tvec, reproj_err, inliers, meta
 
 
 # ---------------------------------------------------------------------------
@@ -1101,12 +1303,18 @@ class CubePoseEstimator:
             self._fps_t = time.time()
         return result
 
-    def _detect_tags_on_enhanced(self, enhanced: np.ndarray) -> tuple[
+    def _detect_tags_on_enhanced(
+        self,
+        enhanced: np.ndarray,
+        *,
+        relaxed: bool = False,
+    ) -> tuple[
         list[tuple[int, np.ndarray]],
         list,
     ]:
         try:
-            corners_list, ids, rejected = self.detector.detectMarkers(enhanced)
+            detector = self.fallback_detector if relaxed else self.detector
+            corners_list, ids, rejected = detector.detectMarkers(enhanced)
         except cv2.error:
             corners_list, ids, rejected = (), None, ()
 
@@ -1122,6 +1330,7 @@ class CubePoseEstimator:
         *,
         adaptive_clahe: bool = False,
         clahe_variants: tuple[tuple[float, tuple[int, int]], ...] | None = None,
+        enhancement_variants: tuple[dict, ...] | None = None,
     ) -> dict:
         """Detect all decoded tags in an image once for sharing across cubes.
 
@@ -1148,13 +1357,31 @@ class CubePoseEstimator:
         ]
 
         if adaptive_clahe:
-            variants = clahe_variants or _adaptive_clahe_variants
-            for clip_limit, tile_grid_size in variants:
-                if float(clip_limit) == 2.0 and tuple(tile_grid_size) == (8, 8):
+            if enhancement_variants is not None:
+                variants = tuple(enhancement_variants)
+            else:
+                variants = tuple(
+                    {
+                        "name": f"clahe clip={float(clip_limit):.1f} tile={tuple(tile_grid_size)}",
+                        "clahe": (float(clip_limit), tuple(tile_grid_size)),
+                    }
+                    for clip_limit, tile_grid_size in (clahe_variants or _adaptive_clahe_variants)
+                )
+
+            for variant in variants:
+                clahe_cfg = variant.get("clahe", None)
+                if (
+                    len(variant) == 2
+                    and "name" in variant
+                    and clahe_cfg is not None
+                    and float(clahe_cfg[0]) == 2.0
+                    and tuple(clahe_cfg[1]) == (8, 8)
+                ):
                     continue
-                candidate_enhanced = _preprocess_clahe(gray, clip_limit, tile_grid_size)
+                candidate_enhanced = _preprocess_enhancement_variant(gray, variant)
                 candidate_detections, candidate_rejected = self._detect_tags_on_enhanced(
-                    candidate_enhanced
+                    candidate_enhanced,
+                    relaxed=str(variant.get("detector", "")).lower() == "fallback",
                 )
                 rejected.extend(candidate_rejected)
 
@@ -1173,8 +1400,21 @@ class CubePoseEstimator:
 
                 attempts.append(
                     {
-                        "clip_limit": float(clip_limit),
-                        "tile_grid_size": tuple(int(v) for v in tile_grid_size),
+                        "name": str(variant.get("name", "enhancement")),
+                        "clip_limit": (
+                            float(clahe_cfg[0]) if clahe_cfg is not None else None
+                        ),
+                        "tile_grid_size": (
+                            tuple(int(v) for v in clahe_cfg[1])
+                            if clahe_cfg is not None
+                            else None
+                        ),
+                        "gamma": variant.get("gamma", None),
+                        "alpha": variant.get("alpha", None),
+                        "beta": variant.get("beta", None),
+                        "stretch": variant.get("stretch", None),
+                        "sharpen": bool(variant.get("sharpen", False)),
+                        "detector": str(variant.get("detector", "primary")),
                         "decoded": len(candidate_detections),
                         "new_ids": new_ids,
                         "base": False,
@@ -1319,18 +1559,64 @@ class CubePoseEstimator:
             if pred is not None:
                 pnp_rv_guess, pnp_tv_guess = pred
 
+        single_tag_cfg_pose = False
+        single_tag_meta: dict = {}
+
+        def apply_single_tag_cfg_pose(force: bool = False) -> bool:
+            nonlocal success, rvec, tvec, reproj_err, inliers
+            nonlocal single_tag_cfg_pose, single_tag_meta
+            if used_flow or not detections:
+                return False
+            (
+                single_success,
+                single_rvec,
+                single_tvec,
+                single_reproj_err,
+                single_inliers,
+                candidate_meta,
+            ) = estimate_single_tag_cube_pose(
+                detections,
+                self.tag_corner_map,
+                self.face_id_sets,
+                self.camera_matrix,
+                self.dist_coeffs,
+                pnp_rv_guess,
+                pnp_tv_guess,
+            )
+            if not single_success:
+                return False
+            if not force and len(detections) != 1 and single_reproj_err >= reproj_err:
+                return False
+            success = True
+            rvec = single_rvec
+            tvec = single_tvec
+            reproj_err = single_reproj_err
+            inliers = single_inliers
+            single_tag_cfg_pose = True
+            single_tag_meta = candidate_meta
+            face_name = candidate_meta.get("single_tag_face", None)
+            if face_name:
+                result["visible_faces"] = {str(face_name)}
+            return True
+
         # Solve PnP
         success, rvec, tvec, reproj_err, inliers = estimate_pose(
             object_points, image_points,
             self.camera_matrix, self.dist_coeffs,
             pnp_rv_guess, pnp_tv_guess,
         )
+        if (
+            (len(detections) == 1 or not success or reproj_err > 3.0)
+            and not used_flow
+            and detections
+        ):
+            apply_single_tag_cfg_pose(force=(len(detections) == 1 or not success))
 
         # Per-tag reprojection outlier rejection: if a tag's mean corner
         # reprojection error is much higher than the median, drop it and
         # re-solve.  This catches false-positive detections that passed
         # the quad-quality gate but don't match the cube geometry.
-        if success and not used_flow and len(detections) >= 3:
+        if success and not single_tag_cfg_pose and not used_flow and len(detections) >= 3:
             projected, _ = cv2.projectPoints(
                 object_points, rvec, tvec,
                 self.camera_matrix, self.dist_coeffs,
@@ -1373,8 +1659,13 @@ class CubePoseEstimator:
         max_reproj = 3.0
         if used_flow:
             max_reproj = 5.0
+        if single_tag_cfg_pose:
+            max_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX
         if not success or reproj_err > max_reproj:
-            return self._store_latest(self._try_predict(timestamp, result), image)
+            if apply_single_tag_cfg_pose(force=True):
+                max_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX
+            if not success or reproj_err > max_reproj:
+                return self._store_latest(self._try_predict(timestamp, result), image)
 
         # Reject flipped PnP solutions: verify that every detected face's
         # outward normal points toward the camera (negative z in camera frame).
@@ -1387,6 +1678,11 @@ class CubePoseEstimator:
                     normal_cam = R_est @ normal_obj
                     # Outward normal should face camera (z < 0 in camera frame)
                     if normal_cam[2] > 0:
+                        if not single_tag_cfg_pose and apply_single_tag_cfg_pose(force=True):
+                            R_est, _ = cv2.Rodrigues(rvec)
+                            normal_cam = R_est @ normal_obj
+                            if normal_cam[2] <= 0:
+                                continue
                         return self._store_latest(
                             self._try_predict(timestamp, result), image)
                     break
@@ -1411,7 +1707,8 @@ class CubePoseEstimator:
                     self._try_predict(timestamp, result), image)
         else:
             # Re-initialization after dropout — require reasonable reproj error
-            if reproj_err > 2.5:
+            max_init_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX if single_tag_cfg_pose else 2.5
+            if reproj_err > max_init_reproj:
                 return self._store_latest(
                     self._try_predict(timestamp, result), image)
 
@@ -1421,6 +1718,8 @@ class CubePoseEstimator:
         kf_reproj = reproj_err
         if used_flow:
             kf_reproj = reproj_err * 3.0
+        elif single_tag_cfg_pose:
+            kf_reproj = reproj_err * 1.5
         kf_n_tags = max(len(detections), 1)
         if self.pose_filter:
             rvec, tvec = self.pose_filter.update(
@@ -1448,6 +1747,9 @@ class CubePoseEstimator:
         result["T"] = T
         result["reproj_error"] = reproj_err
         result["n_inliers"] = n_inlier_count
+        if single_tag_cfg_pose:
+            result["single_tag_cfg_pose"] = True
+            result.update(single_tag_meta)
         return self._store_latest(result, image)
 
     def process_frame(self, image: np.ndarray,
@@ -1481,6 +1783,38 @@ class CubePoseEstimator:
 
         if result["success"]:
             rvec, tvec = result["rvec"], result["tvec"]
+
+            if result.get("single_tag_cfg_pose", False):
+                tag_id = result.get("single_tag_id", None)
+                if tag_id in self.tag_corner_map:
+                    tag_corners = self.tag_corner_map[int(tag_id)]
+                    tag_center = tag_corners.mean(axis=0)
+                    x_axis = tag_corners[1] - tag_corners[0]
+                    y_axis = tag_corners[3] - tag_corners[0]
+                    x_axis /= max(np.linalg.norm(x_axis), 1e-9)
+                    y_axis /= max(np.linalg.norm(y_axis), 1e-9)
+                    z_axis = np.cross(x_axis, y_axis)
+                    z_axis /= max(np.linalg.norm(z_axis), 1e-9)
+                    tag_axis_len = float(self.config.tag_size_mm * 0.45)
+                    tag_axes_3d = np.float64([
+                        tag_center,
+                        tag_center + x_axis * tag_axis_len,
+                        tag_center + y_axis * tag_axis_len,
+                        tag_center + z_axis * tag_axis_len,
+                    ])
+                    tag_pts2d, _ = cv2.projectPoints(
+                        tag_axes_3d,
+                        rvec,
+                        tvec,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                    )
+                    tag_pts2d = tag_pts2d.reshape(-1, 2).astype(int)
+                    tag_o = tuple(tag_pts2d[0])
+                    cv2.circle(vis, tag_o, 5, (255, 0, 255), -1)
+                    cv2.arrowedLine(vis, tag_o, tuple(tag_pts2d[1]), (0, 0, 255), 2, tipLength=0.2)
+                    cv2.arrowedLine(vis, tag_o, tuple(tag_pts2d[2]), (0, 255, 0), 2, tipLength=0.2)
+                    cv2.arrowedLine(vis, tag_o, tuple(tag_pts2d[3]), (255, 0, 0), 2, tipLength=0.2)
 
             # Draw coordinate axes at cube center (manual to avoid OpenCV warnings)
             axis_len = float(max(self.config.box_dims) / 2)
@@ -1517,6 +1851,10 @@ class CubePoseEstimator:
         if result["success"]:
             t = result["tvec"].flatten() / 1000.0  # mm -> meters
             lines.append(f"T: [{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}] m")
+            if result.get("single_tag_cfg_pose", False):
+                tag_id = result.get("single_tag_id", "?")
+                face = result.get("single_tag_face", "?")
+                lines.append(f"single-tag cfg pose: id={tag_id} face={face}")
         for i, line in enumerate(lines):
             y = h - 10 - (len(lines) - 1 - i) * 25
             cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,

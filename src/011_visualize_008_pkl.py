@@ -20,8 +20,31 @@ VISER_HOST = "0.0.0.0"
 VISER_PORT = 8091
 DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect_multi_cube.py"
 POSE_CACHE_FORMAT = "aprilcube_008_pose_cache_v1"
+IMAGE_RECOVERY_VERSION = 2
+SINGLE_TAG_CONTINUITY_GATE_ENABLED = True
+SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG = 45.0
+SINGLE_TAG_CONTINUITY_MIN_FACE_OBSERVATIONS = 2
+SINGLE_TAG_CONTINUITY_MAX_OBSERVATION_GAP = 8
+SINGLE_TAG_CONTINUITY_VERSION = 2
+TEMPORAL_OUTLIER_GATE_ENABLED = True
+TEMPORAL_OUTLIER_MAX_NEIGHBOR_GAP_FRAMES = 6
+TEMPORAL_OUTLIER_NEIGHBOR_MAX_ROTATION_DEG = 35.0
+TEMPORAL_OUTLIER_NEIGHBOR_MAX_TRANSLATION_MM = 35.0
+TEMPORAL_OUTLIER_MIN_ROTATION_JUMP_DEG = 90.0
+TEMPORAL_OUTLIER_MIN_TRANSLATION_JUMP_MM = 70.0
+TEMPORAL_OUTLIER_VERSION = 1
 TEMPORAL_FILL_MAX_GAP_FRAMES = 30
-TEMPORAL_FILL_VERSION = 1
+TEMPORAL_FILL_MAX_ROTATION_DEG = 45.0
+TEMPORAL_FILL_VERSION = 5
+TEMPORAL_SMOOTHING_ENABLED = True
+TEMPORAL_SMOOTHING_WINDOW_RADIUS = 2
+TEMPORAL_SMOOTHING_SIGMA_FRAMES = 1.2
+TEMPORAL_SMOOTHING_MAX_ROTATION_DEG = 15.0
+TEMPORAL_SMOOTHING_VERSION = 4
+TEMPORAL_ROTATION_JUMP_LIMIT_ENABLED = True
+TEMPORAL_ROTATION_JUMP_MAX_DEG = 20.0
+TEMPORAL_ROTATION_JUMP_HOLD_DEG = 60.0
+TEMPORAL_ROTATION_JUMP_LIMIT_VERSION = 2
 
 
 def load_demo008_module() -> Any:
@@ -177,9 +200,15 @@ def result_copy_for_replay(result: dict[str, Any]) -> dict[str, Any]:
         "tag_ids",
         "visible_faces",
         "predicted",
+        "single_tag_cfg_pose",
+        "single_tag_id",
+        "single_tag_face",
+        "single_tag_candidate_count",
         "temporal_filled",
         "temporal_fill_source",
         "temporal_fill_alpha",
+        "temporal_smoothed",
+        "temporal_smoothing_source_count",
     ):
         value = result.get(key, None)
         if key == "detections":
@@ -237,9 +266,28 @@ def rvec_to_quat(rvec: np.ndarray) -> np.ndarray:
     )
 
 
-def quat_to_rvec(quat: np.ndarray) -> np.ndarray:
+def normalize_quat(quat: np.ndarray) -> np.ndarray:
     q = np.asarray(quat, dtype=np.float64).reshape(4)
-    q = q / max(float(np.linalg.norm(q)), 1e-12)
+    return q / max(float(np.linalg.norm(q)), 1e-12)
+
+
+def align_quat_to_reference(quat: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    q = normalize_quat(quat)
+    ref = normalize_quat(reference)
+    if float(np.dot(ref, q)) < 0.0:
+        return -q
+    return q
+
+
+def quat_short_arc_angle_deg(q0: np.ndarray, q1: np.ndarray) -> float:
+    q0n = normalize_quat(q0)
+    q1n = align_quat_to_reference(q1, q0n)
+    dot = abs(float(np.dot(q0n, q1n)))
+    return float(np.degrees(2.0 * np.arccos(np.clip(dot, -1.0, 1.0))))
+
+
+def quat_to_rvec(quat: np.ndarray) -> np.ndarray:
+    q = normalize_quat(quat)
     if q[0] < 0:
         q = -q
     sin_half = float(np.linalg.norm(q[1:]))
@@ -251,10 +299,8 @@ def quat_to_rvec(quat: np.ndarray) -> np.ndarray:
 
 
 def slerp_quat(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
-    q0 = np.asarray(q0, dtype=np.float64).reshape(4)
-    q1 = np.asarray(q1, dtype=np.float64).reshape(4)
-    q0 = q0 / max(float(np.linalg.norm(q0)), 1e-12)
-    q1 = q1 / max(float(np.linalg.norm(q1)), 1e-12)
+    q0 = normalize_quat(q0)
+    q1 = normalize_quat(q1)
     dot = float(np.dot(q0, q1))
     if dot < 0.0:
         q1 = -q1
@@ -269,6 +315,20 @@ def slerp_quat(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
     s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
     s1 = sin_theta / sin_theta_0
     return s0 * q0 + s1 * q1
+
+
+def limit_quat_rotation(
+    source: np.ndarray,
+    target: np.ndarray,
+    max_rotation_deg: float,
+) -> tuple[np.ndarray, float, bool]:
+    source_q = normalize_quat(source)
+    target_q = align_quat_to_reference(target, source_q)
+    angle_deg = quat_short_arc_angle_deg(source_q, target_q)
+    if angle_deg <= max_rotation_deg:
+        return target_q, angle_deg, False
+    alpha = max(float(max_rotation_deg), 0.0) / max(angle_deg, 1e-12)
+    return normalize_quat(slerp_quat(source_q, target_q, alpha)), angle_deg, True
 
 
 def pose_transform_from_rvec_tvec(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
@@ -485,13 +545,30 @@ class ReplayPoseEstimator:
 
         from aprilcube import detect as detect_mod
 
-        variants = getattr(detect_mod, "_adaptive_clahe_variants", ())
-        for clip_limit, tile_grid_size in variants:
+        variants = getattr(
+            detect_mod,
+            "_adaptive_image_enhancement_variants",
+            (),
+        )
+        if not variants:
+            variants = tuple(
+                {
+                    "name": f"adaptive clip={float(clip_limit):.1f} tile={tuple(tile_grid_size)}",
+                    "clahe": (float(clip_limit), tuple(tile_grid_size)),
+                }
+                for clip_limit, tile_grid_size in getattr(
+                    detect_mod,
+                    "_adaptive_clahe_variants",
+                    (),
+                )
+            )
+
+        for variant in variants:
             restore_detector_tracking_state(detector, state_before)
             candidate_tags = detector.detect_tags(
                 detect_frame,
                 adaptive_clahe=True,
-                clahe_variants=((float(clip_limit), tuple(tile_grid_size)),),
+                enhancement_variants=(dict(variant),),
             )
             candidate_result = detector.process_detections(
                 detect_frame,
@@ -505,16 +582,84 @@ class ReplayPoseEstimator:
                 return (
                     candidate_result,
                     candidate_tags,
-                    f"adaptive clip={float(clip_limit):.1f} tile={tuple(tile_grid_size)}",
+                    str(variant.get("name", "adaptive enhancement")),
                 )
 
         restore_detector_tracking_state(detector, base_state_after)
-        return base_result, base_tags, "base_failed_adaptive_rejected"
+        return base_result, base_tags, "base_failed_enhancement_rejected"
+
+    @staticmethod
+    def detector_input_mode_for_pose_frame(pose_frame: dict[str, Any]) -> str:
+        for cube in pose_frame.get("cube_results", []):
+            result = cube.get("result", {})
+            mode = str(result.get("clahe_recovery_mode", "base"))
+            if result.get("success", False) and mode != "temporal_fill":
+                return mode
+        for cube in pose_frame.get("cube_results", []):
+            result = cube.get("result", {})
+            mode = str(result.get("clahe_recovery_mode", "base"))
+            if mode != "temporal_fill":
+                return mode
+        return "base"
+
+    @staticmethod
+    def detector_input_gray_for_mode(gray: np.ndarray, mode: str) -> np.ndarray:
+        from aprilcube import detect as detect_mod
+
+        if mode in ("base", "shared_base", "base_failed_enhancement_rejected", "temporal_fill"):
+            return detect_mod._preprocess(gray)
+
+        variants = getattr(detect_mod, "_adaptive_image_enhancement_variants", ())
+        for variant in variants:
+            if str(variant.get("name", "")) == mode:
+                return detect_mod._preprocess_enhancement_variant(gray, dict(variant))
+
+        return detect_mod._preprocess(gray)
+
+    def draw_detector_input_frame(self, record: dict[str, Any], pose_frame: dict[str, Any]) -> np.ndarray:
+        camera_name = pose_frame["camera_name"]
+        detect_frame = self.prepare_detect_frame(record["image_bgr"], camera_name)
+        gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY) if len(detect_frame.shape) == 3 else detect_frame
+        mode = self.detector_input_mode_for_pose_frame(pose_frame)
+        enhanced = self.detector_input_gray_for_mode(gray, mode)
+        vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        mode_text = f"Detector input: {mode}"
+        if mode == "temporal_fill":
+            mode_text += " (pose came from temporal fill; showing base detector input)"
+        cv2.putText(
+            vis,
+            mode_text,
+            (20, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return vis
 
     def draw_pose_frame(self, record: dict[str, Any], pose_frame: dict[str, Any]) -> np.ndarray:
         camera_name = pose_frame["camera_name"]
         detect_frame = self.prepare_detect_frame(record["image_bgr"], camera_name)
         vis = self.demo008.make_tag_detection_vis_image(detect_frame)
+        return self.draw_pose_over_base_frame(vis, camera_name, pose_frame)
+
+    def draw_detector_input_pose_frame(
+        self,
+        record: dict[str, Any],
+        pose_frame: dict[str, Any],
+    ) -> np.ndarray:
+        camera_name = pose_frame["camera_name"]
+        vis = self.draw_detector_input_frame(record, pose_frame)
+        return self.draw_pose_over_base_frame(vis, camera_name, pose_frame)
+
+    def draw_pose_over_base_frame(
+        self,
+        base_frame: np.ndarray,
+        camera_name: str,
+        pose_frame: dict[str, Any],
+    ) -> np.ndarray:
+        vis = base_frame.copy()
         for cube in pose_frame["cube_results"]:
             detector = self.detector_by_camera_cube[(camera_name, cube["cube_name"])]
             vis = detector.draw_result(vis, cube["result"])
@@ -656,11 +801,23 @@ def pose_markdown(pose_frame: dict[str, Any]) -> str:
                 f", temporal_fill={source.get('before_frame', '?')}"
                 f"->{source.get('after_frame', '?')}"
             )
+        temporal_smooth = ""
+        if result.get("temporal_smoothed", False):
+            temporal_smooth = (
+                f", smooth_n={int(result.get('temporal_smoothing_source_count', 0))}"
+            )
+        single_tag_cfg = ""
+        if result.get("single_tag_cfg_pose", False):
+            single_tag_cfg = (
+                f", single_tag_cfg_pose=id{result.get('single_tag_id', '?')}"
+                f"/{result.get('single_tag_face', '?')}"
+            )
         lines.append(
             f"- `{cube_name}`: t=({tvec[0]:.1f}, {tvec[1]:.1f}, {tvec[2]:.1f}) mm, "
             f"reproj={float(result.get('reproj_error', float('inf'))):.2f}px, "
             f"tags={int(result.get('n_tags', 0))}, faces={faces}{predicted}, "
-            f"mode={result.get('clahe_recovery_mode', 'unknown')}{temporal_fill}"
+            f"mode={result.get('clahe_recovery_mode', 'unknown')}"
+            f"{single_tag_cfg}{temporal_fill}{temporal_smooth}"
         )
     return "\n".join(lines)
 
@@ -826,7 +983,14 @@ def interpolate_pose_result(
 
     q0 = rvec_to_quat(before_result["rvec"])
     q1 = rvec_to_quat(after_result["rvec"])
-    rvec = quat_to_rvec(slerp_quat(q0, q1, alpha))
+    anchor_rotation_deg = quat_short_arc_angle_deg(q0, q1)
+    q_interp = slerp_quat(q0, q1, alpha)
+    rotation_mode = (
+        "slerp_large_anchor_rotation"
+        if anchor_rotation_deg > TEMPORAL_FILL_MAX_ROTATION_DEG
+        else "slerp_short_arc"
+    )
+    rvec = quat_to_rvec(q_interp)
 
     before_faces = set(before_result.get("visible_faces", set()) or [])
     after_faces = set(after_result.get("visible_faces", set()) or [])
@@ -851,6 +1015,8 @@ def interpolate_pose_result(
             "after_frame": int(after_idx),
         },
         "temporal_fill_alpha": float(alpha),
+        "temporal_fill_rotation_deg": float(anchor_rotation_deg),
+        "temporal_fill_rotation_mode": rotation_mode,
         "decoded_tags_this_cube_pass": 0,
         "clahe_recovery_mode": "temporal_fill",
     }
@@ -869,7 +1035,11 @@ def rebuild_pose_frame_status_lines(
         f"adaptive_clahe={pose_frame.get('adaptive_clahe', False)} "
         f"decoded_tags={pose_frame.get('decoded_tag_count', 0)} "
         f"clahe_extra_tags={pose_frame.get('adaptive_new_tags', 0)} "
-        f"temporal_filled={pose_frame.get('temporal_filled_count', 0)}"
+        f"continuity_rejected={pose_frame.get('continuity_rejected_count', 0)} "
+        f"temporal_outlier_rejected={pose_frame.get('temporal_outlier_rejected_count', 0)} "
+        f"temporal_filled={pose_frame.get('temporal_filled_count', 0)} "
+        f"rotation_limited={pose_frame.get('temporal_rotation_jump_limited_count', 0)} "
+        f"smoothing={pose_frame.get('temporal_smoothing_enabled', False)}"
     )
     lines = [header]
     for cube in cube_results:
@@ -881,6 +1051,321 @@ def rebuild_pose_frame_status_lines(
             )
         )
     pose_frame["status_lines"] = lines
+
+
+def is_postprocess_temporal_result(result: dict[str, Any]) -> bool:
+    return (
+        bool(result.get("temporal_filled", False))
+        or result.get("clahe_recovery_mode") == "temporal_fill"
+    )
+
+
+def reject_pose_result_for_temporal_fill(
+    result: dict[str, Any],
+    reason: str,
+    *,
+    previous_face: str | None = None,
+    rotation_jump_deg: float | None = None,
+    previous_frame: int | None = None,
+    next_frame: int | None = None,
+    next_rotation_jump_deg: float | None = None,
+    previous_translation_jump_mm: float | None = None,
+    next_translation_jump_mm: float | None = None,
+) -> dict[str, Any]:
+    rejected = copy.deepcopy(result)
+    rejected["success"] = False
+    rejected["rvec"] = None
+    rejected["tvec"] = None
+    rejected["T"] = None
+    rejected["reproj_error"] = float("inf")
+    rejected["continuity_rejected"] = True
+    rejected["continuity_reject_reason"] = reason
+    if previous_face is not None:
+        rejected["continuity_previous_face"] = previous_face
+    if rotation_jump_deg is not None:
+        rejected["continuity_rotation_jump_deg"] = float(rotation_jump_deg)
+    if previous_frame is not None:
+        rejected["continuity_previous_frame"] = int(previous_frame)
+    if next_frame is not None:
+        rejected["continuity_next_frame"] = int(next_frame)
+    if next_rotation_jump_deg is not None:
+        rejected["continuity_next_rotation_jump_deg"] = float(next_rotation_jump_deg)
+    if previous_translation_jump_mm is not None:
+        rejected["continuity_previous_translation_jump_mm"] = float(previous_translation_jump_mm)
+    if next_translation_jump_mm is not None:
+        rejected["continuity_next_translation_jump_mm"] = float(next_translation_jump_mm)
+    return rejected
+
+
+def single_face_name(result: dict[str, Any]) -> str | None:
+    faces = sorted(list(result.get("visible_faces", set()) or []))
+    if len(faces) != 1:
+        return None
+    return str(faces[0])
+
+
+def reset_temporal_postprocess_outputs(
+    pose_cache: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    reset = copy.deepcopy(pose_cache)
+    reset_count = 0
+    for pose_frame in reset:
+        pose_frame["temporal_filled_count"] = 0
+        pose_frame["continuity_rejected_count"] = 0
+        pose_frame["temporal_outlier_rejected_count"] = 0
+        pose_frame["temporal_rotation_jump_limited_count"] = 0
+        for cube in pose_frame.get("cube_results", []):
+            result = cube.get("result", {})
+            for key in (
+                "temporal_smoothed",
+                "temporal_smoothing_source_count",
+                "temporal_smoothing_window_radius",
+                "temporal_smoothing_rotation_delta_deg",
+                "temporal_smoothing_rotation_limited",
+                "temporal_rotation_jump_limited",
+                "temporal_rotation_jump_held",
+                "temporal_rotation_jump_original_delta_deg",
+                "temporal_rotation_jump_max_deg",
+                "temporal_rotation_jump_hold_deg",
+            ):
+                result.pop(key, None)
+            if is_postprocess_temporal_result(result):
+                cube["result"] = reject_pose_result_for_temporal_fill(
+                    result,
+                    "reset_previous_temporal_fill",
+                )
+                reset_count += 1
+    return reset, reset_count
+
+
+def gate_single_tag_pose_cache(
+    pose_cache: list[dict[str, Any]],
+    estimator: ReplayPoseEstimator,
+    *,
+    max_rotation_deg: float = SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG,
+) -> tuple[list[dict[str, Any]], int]:
+    if not SINGLE_TAG_CONTINUITY_GATE_ENABLED:
+        return pose_cache, 0
+
+    gated = copy.deepcopy(pose_cache)
+    rejected_count = 0
+
+    for camera_name in estimator.active_camera_names:
+        cube_names = [
+            entry["cube_name"]
+            for entry in estimator.detector_entries_by_camera.get(camera_name, [])
+        ]
+        frame_indices = [
+            idx
+            for idx, pose_frame in enumerate(gated)
+            if pose_frame.get("camera_name") == camera_name
+        ]
+        for cube_name in cube_names:
+            single_face_observations: list[tuple[int, str, dict[str, Any]]] = []
+            for idx in frame_indices:
+                pose_frame = gated[idx]
+                cube = cube_result_by_name(pose_frame).get(cube_name)
+                if cube is None:
+                    continue
+                result = cube.get("result", {})
+                n_tags = int(result.get("n_tags", 0) or 0)
+                face = single_face_name(result)
+                if (
+                    bool(result.get("success", False))
+                    and not bool(result.get("predicted", False))
+                    and not is_postprocess_temporal_result(result)
+                    and n_tags == 1
+                    and face is not None
+                ):
+                    single_face_observations.append((idx, face, result))
+
+            trusted_single_tag_indices: set[int] = set()
+            current_run: list[tuple[int, str, dict[str, Any]]] = []
+
+            def commit_run(run: list[tuple[int, str, dict[str, Any]]]) -> None:
+                if len(run) < int(SINGLE_TAG_CONTINUITY_MIN_FACE_OBSERVATIONS):
+                    return
+                trusted_single_tag_indices.update(idx for idx, _face, _result in run)
+
+            for observation in single_face_observations:
+                idx, face, result = observation
+                if not current_run:
+                    current_run = [observation]
+                    continue
+                prev_idx, prev_face, _prev_result = current_run[-1]
+                if (
+                    face == prev_face
+                    and idx - prev_idx <= int(SINGLE_TAG_CONTINUITY_MAX_OBSERVATION_GAP)
+                ):
+                    current_run.append(observation)
+                    continue
+                commit_run(current_run)
+                current_run = [observation]
+            commit_run(current_run)
+
+            last_trusted_by_face: dict[str, dict[str, Any]] = {}
+            for idx in frame_indices:
+                pose_frame = gated[idx]
+                cube = cube_result_by_name(pose_frame).get(cube_name)
+                if cube is None:
+                    continue
+                result = cube.get("result", {})
+                if not bool(result.get("success", False)):
+                    continue
+                if bool(result.get("predicted", False)):
+                    continue
+                if is_postprocess_temporal_result(result):
+                    continue
+
+                n_tags = int(result.get("n_tags", 0) or 0)
+                face = single_face_name(result)
+                reject_reason: str | None = None
+                rotation_jump_deg: float | None = None
+                previous_face: str | None = None
+
+                if n_tags <= 0:
+                    reject_reason = "no_decoded_tag_success_pose"
+                elif n_tags == 1:
+                    if idx not in trusted_single_tag_indices:
+                        reject_reason = "single_tag_isolated_face_observation"
+                    elif face is not None and face in last_trusted_by_face:
+                        previous_face = face
+                        rotation_jump_deg = quat_short_arc_angle_deg(
+                            rvec_to_quat(last_trusted_by_face[face]["rvec"]),
+                            rvec_to_quat(result["rvec"]),
+                        )
+                        if rotation_jump_deg > max_rotation_deg:
+                            reject_reason = "single_tag_same_face_rotation_jump"
+
+                if reject_reason is not None:
+                    cube["result"] = reject_pose_result_for_temporal_fill(
+                        result,
+                        reject_reason,
+                        previous_face=previous_face,
+                        rotation_jump_deg=rotation_jump_deg,
+                    )
+                    pose_frame["continuity_rejected_count"] = int(
+                        pose_frame.get("continuity_rejected_count", 0)
+                    ) + 1
+                    rejected_count += 1
+                    continue
+
+                if n_tags > 0 and face is not None:
+                    last_trusted_by_face[face] = result
+
+    for pose_frame in gated:
+        pose_frame["single_tag_continuity_gate_enabled"] = bool(
+            SINGLE_TAG_CONTINUITY_GATE_ENABLED
+        )
+        rebuild_pose_frame_status_lines(estimator, pose_frame)
+
+    return gated, rejected_count
+
+
+def pose_translation_jump_mm(a: dict[str, Any], b: dict[str, Any]) -> float:
+    at = np.asarray(a["tvec"], dtype=np.float64).reshape(3)
+    bt = np.asarray(b["tvec"], dtype=np.float64).reshape(3)
+    return float(np.linalg.norm(at - bt))
+
+
+def pose_rotation_jump_deg(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return quat_short_arc_angle_deg(rvec_to_quat(a["rvec"]), rvec_to_quat(b["rvec"]))
+
+
+def gate_temporal_outlier_pose_cache(
+    pose_cache: list[dict[str, Any]],
+    estimator: ReplayPoseEstimator,
+) -> tuple[list[dict[str, Any]], int]:
+    if not TEMPORAL_OUTLIER_GATE_ENABLED:
+        return pose_cache, 0
+
+    gated = copy.deepcopy(pose_cache)
+    rejected_count = 0
+
+    for camera_name in estimator.active_camera_names:
+        cube_names = [
+            entry["cube_name"]
+            for entry in estimator.detector_entries_by_camera.get(camera_name, [])
+        ]
+        frame_indices = [
+            idx
+            for idx, pose_frame in enumerate(gated)
+            if pose_frame.get("camera_name") == camera_name
+        ]
+        for cube_name in cube_names:
+            anchors: list[tuple[int, dict[str, Any]]] = []
+            for idx in frame_indices:
+                cube = cube_result_by_name(gated[idx]).get(cube_name)
+                if cube is None:
+                    continue
+                result = cube.get("result", {})
+                if is_temporal_anchor(result):
+                    anchors.append((idx, result))
+
+            if len(anchors) < 3:
+                continue
+
+            for anchor_pos in range(1, len(anchors) - 1):
+                prev_idx, prev_result = anchors[anchor_pos - 1]
+                idx, result = anchors[anchor_pos]
+                next_idx, next_result = anchors[anchor_pos + 1]
+                if idx - prev_idx > TEMPORAL_OUTLIER_MAX_NEIGHBOR_GAP_FRAMES:
+                    continue
+                if next_idx - idx > TEMPORAL_OUTLIER_MAX_NEIGHBOR_GAP_FRAMES:
+                    continue
+
+                neighbor_rotation_deg = pose_rotation_jump_deg(prev_result, next_result)
+                neighbor_translation_mm = pose_translation_jump_mm(prev_result, next_result)
+                if neighbor_rotation_deg > TEMPORAL_OUTLIER_NEIGHBOR_MAX_ROTATION_DEG:
+                    continue
+                if neighbor_translation_mm > TEMPORAL_OUTLIER_NEIGHBOR_MAX_TRANSLATION_MM:
+                    continue
+
+                prev_rotation_deg = pose_rotation_jump_deg(prev_result, result)
+                next_rotation_deg = pose_rotation_jump_deg(result, next_result)
+                prev_translation_mm = pose_translation_jump_mm(prev_result, result)
+                next_translation_mm = pose_translation_jump_mm(result, next_result)
+                rotation_flip = (
+                    prev_rotation_deg >= TEMPORAL_OUTLIER_MIN_ROTATION_JUMP_DEG
+                    and next_rotation_deg >= TEMPORAL_OUTLIER_MIN_ROTATION_JUMP_DEG
+                )
+                translation_spike = (
+                    prev_translation_mm >= TEMPORAL_OUTLIER_MIN_TRANSLATION_JUMP_MM
+                    and next_translation_mm >= TEMPORAL_OUTLIER_MIN_TRANSLATION_JUMP_MM
+                )
+                if not (rotation_flip or translation_spike):
+                    continue
+
+                pose_frame = gated[idx]
+                cube = cube_result_by_name(pose_frame).get(cube_name)
+                if cube is None:
+                    continue
+                cube["result"] = reject_pose_result_for_temporal_fill(
+                    result,
+                    "temporal_pose_outlier_between_consistent_neighbors",
+                    previous_frame=prev_idx,
+                    next_frame=next_idx,
+                    rotation_jump_deg=prev_rotation_deg,
+                    next_rotation_jump_deg=next_rotation_deg,
+                    previous_translation_jump_mm=prev_translation_mm,
+                    next_translation_jump_mm=next_translation_mm,
+                )
+                cube["result"]["temporal_outlier_rejected"] = True
+                cube["result"]["temporal_outlier_neighbor_rotation_deg"] = float(neighbor_rotation_deg)
+                cube["result"]["temporal_outlier_neighbor_translation_mm"] = float(neighbor_translation_mm)
+                pose_frame["continuity_rejected_count"] = int(
+                    pose_frame.get("continuity_rejected_count", 0)
+                ) + 1
+                pose_frame["temporal_outlier_rejected_count"] = int(
+                    pose_frame.get("temporal_outlier_rejected_count", 0)
+                ) + 1
+                rejected_count += 1
+
+    for pose_frame in gated:
+        pose_frame["temporal_outlier_gate_enabled"] = bool(TEMPORAL_OUTLIER_GATE_ENABLED)
+        rebuild_pose_frame_status_lines(estimator, pose_frame)
+
+    return gated, rejected_count
 
 
 def complete_pose_cache_temporally(
@@ -933,6 +1418,12 @@ def complete_pose_cache_temporally(
                         after_result,
                         target_idx,
                     )
+                    old_result = {} if cube is None else cube.get("result", {})
+                    if bool(old_result.get("continuity_rejected", False)):
+                        filled_result["temporal_fill_replaced_rejection"] = old_result.get(
+                            "continuity_reject_reason",
+                            "continuity_rejected",
+                        )
                     if cube is None:
                         pose_frame.setdefault("cube_results", []).append(
                             {"cube_name": cube_name, "result": filled_result}
@@ -950,6 +1441,233 @@ def complete_pose_cache_temporally(
         rebuild_pose_frame_status_lines(estimator, pose_frame)
 
     return completed, filled_count
+
+
+def pose_result_smoothing_weight(result: dict[str, Any], frame_distance: int) -> float:
+    sigma = max(float(TEMPORAL_SMOOTHING_SIGMA_FRAMES), 1e-6)
+    time_weight = float(np.exp(-0.5 * (float(frame_distance) / sigma) ** 2))
+    if bool(result.get("predicted", False)):
+        quality_weight = 0.35
+    elif bool(result.get("temporal_filled", False)):
+        quality_weight = 0.65
+    else:
+        quality_weight = 1.0
+
+    reproj = result.get("reproj_error", None)
+    if reproj is not None and np.isfinite(float(reproj)):
+        quality_weight *= 1.0 / (1.0 + max(float(reproj), 0.0) / 5.0)
+    return time_weight * quality_weight
+
+
+def weighted_average_quats(
+    quats: list[np.ndarray],
+    weights: list[float],
+    reference: np.ndarray | None = None,
+) -> np.ndarray:
+    if not quats:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    ref = (
+        normalize_quat(reference)
+        if reference is not None
+        else normalize_quat(quats[len(quats) // 2])
+    )
+    accum = np.zeros(4, dtype=np.float64)
+    for quat, weight in zip(quats, weights):
+        q = align_quat_to_reference(quat, ref)
+        accum += float(weight) * q
+    return accum / max(float(np.linalg.norm(accum)), 1e-12)
+
+
+def smooth_pose_cache_temporally(
+    pose_cache: list[dict[str, Any]],
+    estimator: ReplayPoseEstimator,
+    *,
+    window_radius: int = TEMPORAL_SMOOTHING_WINDOW_RADIUS,
+) -> tuple[list[dict[str, Any]], int]:
+    if window_radius <= 0:
+        return pose_cache, 0
+
+    source = pose_cache
+    smoothed = copy.deepcopy(pose_cache)
+    smoothed_count = 0
+
+    for camera_name in estimator.active_camera_names:
+        cube_names = [
+            entry["cube_name"]
+            for entry in estimator.detector_entries_by_camera.get(camera_name, [])
+        ]
+        frame_indices = [
+            idx
+            for idx, pose_frame in enumerate(source)
+            if pose_frame.get("camera_name") == camera_name
+        ]
+        for cube_name in cube_names:
+            for target_idx in frame_indices:
+                cube = cube_result_by_name(smoothed[target_idx]).get(cube_name)
+                if cube is None:
+                    continue
+                source_cube = cube_result_by_name(source[target_idx]).get(cube_name)
+                source_result = {} if source_cube is None else source_cube.get("result", {})
+                if not bool(source_result.get("success", False)):
+                    continue
+
+                samples: list[tuple[int, dict[str, Any], float]] = []
+                for neighbor_idx in frame_indices:
+                    distance = abs(neighbor_idx - target_idx)
+                    if distance > window_radius:
+                        continue
+                    neighbor_cube = cube_result_by_name(source[neighbor_idx]).get(cube_name)
+                    if neighbor_cube is None:
+                        continue
+                    neighbor_result = neighbor_cube.get("result", {})
+                    if not bool(neighbor_result.get("success", False)):
+                        continue
+                    weight = pose_result_smoothing_weight(neighbor_result, distance)
+                    if weight <= 0.0:
+                        continue
+                    samples.append((neighbor_idx, neighbor_result, weight))
+
+                if len(samples) <= 1:
+                    continue
+
+                weights = np.asarray([sample[2] for sample in samples], dtype=np.float64)
+                weights = weights / max(float(np.sum(weights)), 1e-12)
+                t_stack = np.stack(
+                    [
+                        np.asarray(sample[1]["tvec"], dtype=np.float64).reshape(3)
+                        for sample in samples
+                    ],
+                    axis=0,
+                )
+                tvec = np.sum(t_stack * weights[:, None], axis=0).reshape(3, 1)
+                q_target = rvec_to_quat(source_result["rvec"])
+                q_avg = weighted_average_quats(
+                    [rvec_to_quat(sample[1]["rvec"]) for sample in samples],
+                    [float(w) for w in weights],
+                    reference=q_target,
+                )
+                q_limited, rotation_delta_deg, rotation_limited = limit_quat_rotation(
+                    q_target,
+                    q_avg,
+                    TEMPORAL_SMOOTHING_MAX_ROTATION_DEG,
+                )
+                rvec = quat_to_rvec(q_limited)
+
+                target_result = cube.get("result", {})
+                target_result["tvec"] = tvec
+                target_result["rvec"] = rvec
+                target_result["T"] = pose_transform_from_rvec_tvec(rvec, tvec)
+                target_result["temporal_smoothed"] = True
+                target_result["temporal_smoothing_source_count"] = int(len(samples))
+                target_result["temporal_smoothing_window_radius"] = int(window_radius)
+                target_result["temporal_smoothing_rotation_delta_deg"] = float(rotation_delta_deg)
+                target_result["temporal_smoothing_rotation_limited"] = bool(rotation_limited)
+                smoothed_count += 1
+
+    for pose_frame in smoothed:
+        pose_frame["temporal_smoothing_enabled"] = bool(TEMPORAL_SMOOTHING_ENABLED)
+        pose_frame["temporal_smoothing_window_radius"] = int(window_radius)
+        rebuild_pose_frame_status_lines(estimator, pose_frame)
+
+    return smoothed, smoothed_count
+
+
+def limit_pose_cache_rotation_jumps(
+    pose_cache: list[dict[str, Any]],
+    estimator: ReplayPoseEstimator,
+    *,
+    max_rotation_deg: float = TEMPORAL_ROTATION_JUMP_MAX_DEG,
+    hold_rotation_deg: float = TEMPORAL_ROTATION_JUMP_HOLD_DEG,
+) -> tuple[list[dict[str, Any]], int]:
+    if not TEMPORAL_ROTATION_JUMP_LIMIT_ENABLED:
+        return pose_cache, 0
+
+    limited = copy.deepcopy(pose_cache)
+    limited_count = 0
+
+    for camera_name in estimator.active_camera_names:
+        cube_names = [
+            entry["cube_name"]
+            for entry in estimator.detector_entries_by_camera.get(camera_name, [])
+        ]
+        frame_indices = [
+            idx
+            for idx, pose_frame in enumerate(limited)
+            if pose_frame.get("camera_name") == camera_name
+        ]
+        for cube_name in cube_names:
+            previous_quat: np.ndarray | None = None
+            for idx in frame_indices:
+                pose_frame = limited[idx]
+                cube = cube_result_by_name(pose_frame).get(cube_name)
+                if cube is None:
+                    continue
+                result = cube.get("result", {})
+                if not bool(result.get("success", False)):
+                    previous_quat = None
+                    continue
+                current_quat = rvec_to_quat(result["rvec"])
+                if previous_quat is None:
+                    previous_quat = current_quat
+                    continue
+                limited_quat, rotation_delta_deg, was_limited = limit_quat_rotation(
+                    previous_quat,
+                    current_quat,
+                    max_rotation_deg,
+                )
+                if was_limited:
+                    if rotation_delta_deg > hold_rotation_deg:
+                        output_quat = previous_quat
+                        result["temporal_rotation_jump_held"] = True
+                    else:
+                        output_quat = limited_quat
+                    rvec = quat_to_rvec(output_quat)
+                    tvec = np.asarray(result["tvec"], dtype=np.float64).reshape(3, 1)
+                    result["rvec"] = rvec
+                    result["T"] = pose_transform_from_rvec_tvec(rvec, tvec)
+                    result["temporal_rotation_jump_limited"] = True
+                    result["temporal_rotation_jump_original_delta_deg"] = float(rotation_delta_deg)
+                    result["temporal_rotation_jump_max_deg"] = float(max_rotation_deg)
+                    result["temporal_rotation_jump_hold_deg"] = float(hold_rotation_deg)
+                    pose_frame["temporal_rotation_jump_limited_count"] = int(
+                        pose_frame.get("temporal_rotation_jump_limited_count", 0)
+                    ) + 1
+                    limited_count += 1
+                    previous_quat = output_quat
+                else:
+                    previous_quat = current_quat
+
+    for pose_frame in limited:
+        pose_frame["temporal_rotation_jump_limit_enabled"] = bool(
+            TEMPORAL_ROTATION_JUMP_LIMIT_ENABLED
+        )
+        pose_frame["temporal_rotation_jump_max_deg"] = float(max_rotation_deg)
+        pose_frame["temporal_rotation_jump_hold_deg"] = float(hold_rotation_deg)
+        rebuild_pose_frame_status_lines(estimator, pose_frame)
+
+    return limited, limited_count
+
+
+def complete_and_smooth_pose_cache(
+    pose_cache: list[dict[str, Any]],
+    estimator: ReplayPoseEstimator,
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    reset_pose_cache, reset_count = reset_temporal_postprocess_outputs(pose_cache)
+    gated_pose_cache, rejected_count = gate_single_tag_pose_cache(
+        reset_pose_cache,
+        estimator,
+    )
+    outlier_gated_pose_cache, outlier_rejected_count = gate_temporal_outlier_pose_cache(
+        gated_pose_cache,
+        estimator,
+    )
+    rejected_count += outlier_rejected_count
+    completed, filled_count = complete_pose_cache_temporally(outlier_gated_pose_cache, estimator)
+    if not TEMPORAL_SMOOTHING_ENABLED:
+        return completed, filled_count, 0, rejected_count, reset_count
+    smoothed, smoothed_count = smooth_pose_cache_temporally(completed, estimator)
+    limited, limited_count = limit_pose_cache_rotation_jumps(smoothed, estimator)
+    return limited, filled_count, smoothed_count + limited_count, rejected_count, reset_count
 
 
 def make_pose_cache_key(
@@ -975,12 +1693,45 @@ def make_pose_cache_key(
         },
         "use_undistort": bool(use_undistort),
         "adaptive_clahe": bool(adaptive_clahe),
+        "image_recovery_version": int(IMAGE_RECOVERY_VERSION),
         "shared_tag_detection": bool(shared_tag_detection),
         "enable_filter": bool(enable_filter),
         "fast": bool(fast),
+        "single_tag_continuity_gate_enabled": bool(SINGLE_TAG_CONTINUITY_GATE_ENABLED),
+        "single_tag_continuity_max_rotation_deg": float(
+            SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG
+        ),
+        "single_tag_continuity_version": int(SINGLE_TAG_CONTINUITY_VERSION),
+        "temporal_outlier_gate_enabled": bool(TEMPORAL_OUTLIER_GATE_ENABLED),
+        "temporal_outlier_max_neighbor_gap_frames": int(
+            TEMPORAL_OUTLIER_MAX_NEIGHBOR_GAP_FRAMES
+        ),
+        "temporal_outlier_neighbor_max_rotation_deg": float(
+            TEMPORAL_OUTLIER_NEIGHBOR_MAX_ROTATION_DEG
+        ),
+        "temporal_outlier_neighbor_max_translation_mm": float(
+            TEMPORAL_OUTLIER_NEIGHBOR_MAX_TRANSLATION_MM
+        ),
+        "temporal_outlier_min_rotation_jump_deg": float(
+            TEMPORAL_OUTLIER_MIN_ROTATION_JUMP_DEG
+        ),
+        "temporal_outlier_min_translation_jump_mm": float(
+            TEMPORAL_OUTLIER_MIN_TRANSLATION_JUMP_MM
+        ),
+        "temporal_outlier_version": int(TEMPORAL_OUTLIER_VERSION),
         "temporal_fill_enabled": True,
         "temporal_fill_max_gap_frames": int(TEMPORAL_FILL_MAX_GAP_FRAMES),
+        "temporal_fill_max_rotation_deg": float(TEMPORAL_FILL_MAX_ROTATION_DEG),
         "temporal_fill_version": int(TEMPORAL_FILL_VERSION),
+        "temporal_smoothing_enabled": bool(TEMPORAL_SMOOTHING_ENABLED),
+        "temporal_smoothing_window_radius": int(TEMPORAL_SMOOTHING_WINDOW_RADIUS),
+        "temporal_smoothing_sigma_frames": float(TEMPORAL_SMOOTHING_SIGMA_FRAMES),
+        "temporal_smoothing_max_rotation_deg": float(TEMPORAL_SMOOTHING_MAX_ROTATION_DEG),
+        "temporal_smoothing_version": int(TEMPORAL_SMOOTHING_VERSION),
+        "temporal_rotation_jump_limit_enabled": bool(TEMPORAL_ROTATION_JUMP_LIMIT_ENABLED),
+        "temporal_rotation_jump_max_deg": float(TEMPORAL_ROTATION_JUMP_MAX_DEG),
+        "temporal_rotation_jump_hold_deg": float(TEMPORAL_ROTATION_JUMP_HOLD_DEG),
+        "temporal_rotation_jump_limit_version": int(TEMPORAL_ROTATION_JUMP_LIMIT_VERSION),
         "fisheye_rectified_horizontal_fov_deg": float(
             getattr(demo008, "FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG", 0.0)
         ),
@@ -1000,9 +1751,29 @@ def load_cached_pose_cache(
     compatible_without_temporal = False
     if not exact_match and isinstance(record_key, dict):
         temporal_keys = {
+            "single_tag_continuity_gate_enabled",
+            "single_tag_continuity_max_rotation_deg",
+            "single_tag_continuity_version",
+            "temporal_outlier_gate_enabled",
+            "temporal_outlier_max_neighbor_gap_frames",
+            "temporal_outlier_neighbor_max_rotation_deg",
+            "temporal_outlier_neighbor_max_translation_mm",
+            "temporal_outlier_min_rotation_jump_deg",
+            "temporal_outlier_min_translation_jump_mm",
+            "temporal_outlier_version",
             "temporal_fill_enabled",
             "temporal_fill_max_gap_frames",
+            "temporal_fill_max_rotation_deg",
             "temporal_fill_version",
+            "temporal_smoothing_enabled",
+            "temporal_smoothing_window_radius",
+            "temporal_smoothing_sigma_frames",
+            "temporal_smoothing_max_rotation_deg",
+            "temporal_smoothing_version",
+            "temporal_rotation_jump_limit_enabled",
+            "temporal_rotation_jump_max_deg",
+            "temporal_rotation_jump_hold_deg",
+            "temporal_rotation_jump_limit_version",
         }
         stripped_record_key = {
             key: value for key, value in record_key.items() if key not in temporal_keys
@@ -1081,7 +1852,15 @@ def main() -> None:
     parser.add_argument(
         "--no-filter",
         action="store_true",
-        help="Disable 008 temporal pose filter during sequential replay.",
+        help="Disable 008 runtime temporal pose filter during sequential replay.",
+    )
+    parser.add_argument(
+        "--with-filter",
+        action="store_true",
+        help=(
+            "Enable the 008 runtime temporal pose filter during replay. "
+            "The offline viewer disables it by default and applies its own postprocess."
+        ),
     )
     parser.add_argument(
         "--no-undistort",
@@ -1105,15 +1884,44 @@ def main() -> None:
 
     total_frames = len(frame_offsets)
     metadata = header.get("metadata", {}) if isinstance(header, dict) else {}
+    first_record = load_frame_at_offset(pkl_path, frame_offsets[0])
+    first_record_camera_name = str(first_record.get("camera_name", ""))
     print(f"[INFO] Indexed frames: {total_frames}")
     if footer is not None:
         print(f"[INFO] Footer frame_count={footer.get('frame_count')} reason={footer.get('reason')}")
 
-    active_camera_names = (
-        [x.strip() for x in args.cameras.split(",") if x.strip()]
-        if args.cameras
-        else list(demo008.ACTIVE_CAMERA_NAMES)
-    )
+    if args.cameras:
+        active_camera_names = [x.strip() for x in args.cameras.split(",") if x.strip()]
+    else:
+        active_camera_names = list(demo008.ACTIVE_CAMERA_NAMES)
+        if (
+            first_record_camera_name
+            and len(active_camera_names) == 1
+            and first_record_camera_name != active_camera_names[0]
+        ):
+            config_camera_name = active_camera_names[0]
+            active_camera_names = [first_record_camera_name]
+            demo008.CAMERA_TO_INTRINSICS_YAML[first_record_camera_name] = (
+                demo008.CAMERA_TO_INTRINSICS_YAML[config_camera_name]
+            )
+            print(
+                "[INFO] Historical PKL camera alias: "
+                f"recorded camera '{first_record_camera_name}' uses current 008 "
+                f"config '{config_camera_name}'."
+            )
+    missing_camera_configs = [
+        name for name in active_camera_names if name not in demo008.CAMERA_TO_INTRINSICS_YAML
+    ]
+    if missing_camera_configs and len(demo008.ACTIVE_CAMERA_NAMES) == 1:
+        config_camera_name = demo008.ACTIVE_CAMERA_NAMES[0]
+        for camera_name in missing_camera_configs:
+            demo008.CAMERA_TO_INTRINSICS_YAML[camera_name] = (
+                demo008.CAMERA_TO_INTRINSICS_YAML[config_camera_name]
+            )
+        print(
+            "[INFO] Historical PKL camera alias: "
+            f"{missing_camera_configs} use current 008 config '{config_camera_name}'."
+        )
     cube_paths = (
         [demo008.validate_cube_path(Path(x.strip())) for x in args.cube_dirs.split(",") if x.strip()]
         if args.cube_dirs
@@ -1121,7 +1929,7 @@ def main() -> None:
     )
     use_undistort = bool(demo008.UNDISTORT_BEFORE_DETECTION) and not args.no_undistort
     adaptive_clahe = bool(getattr(demo008, "ADAPTIVE_CLAHE_DETECTION", False))
-    enable_filter = not args.no_filter
+    enable_filter = bool(args.with_filter) and not args.no_filter
     fast = not args.slow
     estimator = ReplayPoseEstimator(
         demo008,
@@ -1154,28 +1962,54 @@ def main() -> None:
     if cached_pose is not None:
         pose_cache, cache_exact_match = cached_pose
         if cache_exact_match:
-            print(f"[INFO] Loaded cached temporal-completed pose estimation from PKL: frames={len(pose_cache)}")
+            print(f"[INFO] Loaded cached temporal-completed smoothed pose estimation from PKL: frames={len(pose_cache)}")
         else:
-            pose_cache, filled_count = complete_pose_cache_temporally(pose_cache, estimator)
+            (
+                pose_cache,
+                filled_count,
+                smoothed_count,
+                rejected_count,
+                reset_count,
+            ) = complete_and_smooth_pose_cache(
+                pose_cache,
+                estimator,
+            )
             pose_cache_needs_append = True
             print(
-                "[INFO] Loaded cached pose estimation from PKL and applied temporal completion: "
-                f"frames={len(pose_cache)} filled={filled_count}"
+                "[INFO] Loaded cached pose estimation from PKL and applied "
+                "single-tag gate + temporal completion+smoothing: "
+                f"frames={len(pose_cache)} reset={reset_count} "
+                f"rejected={rejected_count} filled={filled_count} smoothed={smoothed_count}"
             )
     else:
         pose_cache = precompute_pose_cache(pkl_path, frame_offsets, metadata, estimator)
-        pose_cache, filled_count = complete_pose_cache_temporally(pose_cache, estimator)
+        (
+            pose_cache,
+            filled_count,
+            smoothed_count,
+            rejected_count,
+            reset_count,
+        ) = complete_and_smooth_pose_cache(
+            pose_cache,
+            estimator,
+        )
         pose_cache_needs_append = True
-        print(f"[INFO] Applied temporal completion: filled={filled_count}")
+        print(
+            "[INFO] Applied single-tag gate + temporal completion+smoothing: "
+            f"reset={reset_count} rejected={rejected_count} "
+            f"filled={filled_count} smoothed={smoothed_count}"
+        )
 
     if pose_cache_needs_append:
         append_pose_cache_to_pkl(pkl_path, pose_cache_key, pose_cache)
-        print(f"[INFO] Appended temporal-completed pose estimation to PKL: frames={len(pose_cache)}")
+        print(f"[INFO] Appended temporal-completed smoothed pose estimation to PKL: frames={len(pose_cache)}")
 
-    first_record = load_frame_at_offset(pkl_path, frame_offsets[0])
     first_raw_rgb = bgr_to_rgb_for_viser(first_record["image_bgr"], int(args.max_width))
-    first_pose_bgr = estimator.draw_pose_frame(first_record, pose_cache[0])
-    first_pose_rgb = bgr_to_rgb_for_viser(first_pose_bgr, int(args.max_width))
+    first_detector_tagpose_bgr = estimator.draw_detector_input_pose_frame(first_record, pose_cache[0])
+    first_detector_tagpose_rgb = bgr_to_rgb_for_viser(
+        first_detector_tagpose_bgr,
+        int(args.max_width),
+    )
     first_undistorted_debug_bgr = estimator.draw_undistorted_debug_frame(first_record, pose_cache[0])
     first_undistorted_debug_rgb = bgr_to_rgb_for_viser(
         first_undistorted_debug_bgr,
@@ -1186,13 +2020,10 @@ def main() -> None:
     scene_handles = create_3d_scene_handles(server, estimator)
     update_3d_scene(scene_handles, pose_cache[0])
 
-    with server.gui.add_folder("TagPose Visualization"):
-        server.gui.add_markdown(
-            "3D scene uses the thumb_web camera as world coordinates. Cube boxes update with the Frame slider."
-        )
-        pose_image_handle = server.gui.add_image(
-            first_pose_rgb,
-            label="008 pose estimation",
+    with server.gui.add_folder("Detector Input TagPose"):
+        detector_tagpose_handle = server.gui.add_image(
+            first_detector_tagpose_rgb,
+            label="",
             format="jpeg",
             jpeg_quality=int(args.jpeg_quality),
         )
@@ -1243,7 +2074,7 @@ def main() -> None:
 
     print(f"[INFO] Viser: http://{args.host}:{int(args.port)}")
     print(
-        "[INFO] Use the sidebar folders: TagPose Visualization, "
+        "[INFO] Use the sidebar folders: Detector Input TagPose, "
         "Undistorted Debug Image, Raw Image, Replay Metadata."
     )
 
@@ -1262,9 +2093,12 @@ def main() -> None:
         if slider_idx != current_idx:
             try:
                 record = load_frame_at_offset(pkl_path, frame_offsets[slider_idx])
-                pose_bgr = estimator.draw_pose_frame(record, pose_cache[slider_idx])
-                pose_image_handle.image = bgr_to_rgb_for_viser(
-                    pose_bgr,
+                detector_tagpose_bgr = estimator.draw_detector_input_pose_frame(
+                    record,
+                    pose_cache[slider_idx],
+                )
+                detector_tagpose_handle.image = bgr_to_rgb_for_viser(
+                    detector_tagpose_bgr,
                     int(args.max_width),
                 )
                 undistorted_debug_bgr = estimator.draw_undistorted_debug_frame(

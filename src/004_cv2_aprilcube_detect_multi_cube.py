@@ -67,12 +67,12 @@ TAG_AXIS_LENGTH_SCALE = 0.8
 UNDISTORT_BEFORE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_0_5_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_6_11_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_12_17_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_18_23_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_24_29_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_30_35_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
 ]
 
 CALIB_BY_CAMERA = {name: load_intrinsics_yaml(path) for name, path in CAMERA_TO_INTRINSICS_YAML.items()}

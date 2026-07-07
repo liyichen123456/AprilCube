@@ -52,16 +52,26 @@ def load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
 # ============================================================
 
 CAMERA_TO_PORT: dict[str, str] = {
-    "cam0": "3-5.4.3.4.4:1.0",
+    # "cam0": "4-9:1.0",
+    "cam1": "3-5.4.3.4.4:1.0",
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0618_181728.yaml",
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_210450.yaml",
-    "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
+    # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
+
+    # fisheye middle finger yaml
+    # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_charuco_2592x1944_0705_180038.yaml",
+
+    # pinehole middle finger yaml
+    # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cv2_apriltag_grid_1920x1080_0706_182725.yaml",
+
+    # pinehole middle finger yaml 0707 0145 update
+    "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_1_1920x1200_0707_013313.yaml",
 }
 
-ACTIVE_CAMERA_NAMES: list[str] = ["cam0"]
+ACTIVE_CAMERA_NAMES: list[str] = ["cam1"]
 
 FPS = 120
 FOURCC = "MJPG"
@@ -74,12 +84,13 @@ RECORD_OUTPUT_DIR = THIS_FILE.parent.parent / "recordings"
 ADAPTIVE_CLAHE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_0_5_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_6_11_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_12_17_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_18_23_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_24_29_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cube_april_36h11_30_35_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",  # test
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
 ]
 
 ENABLE_FILTER = True
@@ -302,6 +313,11 @@ def result_to_text(camera_name: str, cube_name: str, result: dict[str, Any] | No
 
     if result.get("predicted", False):
         text += " predicted"
+    if result.get("single_tag_cfg_pose", False):
+        text += (
+            f" single_tag_cfg_pose"
+            f"(id={result.get('single_tag_id', '?')},face={result.get('single_tag_face', '?')})"
+        )
 
     return text
 
