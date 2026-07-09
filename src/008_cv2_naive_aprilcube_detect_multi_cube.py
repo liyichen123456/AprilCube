@@ -53,7 +53,9 @@ def load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
 
 CAMERA_TO_PORT: dict[str, str] = {
     # "cam0": "4-9:1.0",
-    "cam1": "3-5.4.3.4.4:1.0",
+    # "cam1": "3-5.4.3.4.4:1.0",
+    # "cam1": "3-5.4.3.4.2:1.0",  # pinehole middle finger yaml 0707 0145 update
+    "cam1": "3-5.4.3.4.2:1.0",  # IR 3MP f3.6mm
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
@@ -68,7 +70,11 @@ CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cv2_apriltag_grid_1920x1080_0706_182725.yaml",
 
     # pinehole middle finger yaml 0707 0145 update
-    "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_1_1920x1200_0707_013313.yaml",
+    # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_1_1920x1200_0707_013313.yaml",
+
+    # IR 3MP f3.6mm
+    "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_offline_eval_0708_150154_0708_150928/"
+            "intrinsics_None_charuco_2592x1944_0708_150154_offline_filtered.yaml",
 }
 
 ACTIVE_CAMERA_NAMES: list[str] = ["cam1"]
@@ -77,6 +83,7 @@ FPS = 120
 FOURCC = "MJPG"
 WINDOW_PREFIX = "CV2 Native AprilCube"
 PRINT_EVERY_N_FRAMES = 5
+TIMING_PRINT_EVERY_N_FRAMES = 30
 UNDISTORT_BEFORE_DETECTION = True
 FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG = 120.0
 PINHOLE_UNDISTORT_ALPHA = 0.0
@@ -84,10 +91,10 @@ RECORD_OUTPUT_DIR = THIS_FILE.parent.parent / "recordings"
 ADAPTIVE_CLAHE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
-    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",  # test
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
@@ -669,6 +676,7 @@ def main() -> None:
         frame_idx = 0
         last_no_frame_print_time = 0.0
         while True:
+            loop_t0 = time.perf_counter()
             frame_idx += 1
             frames, _origin_frames, _timestamps = camera_manager.get_frames(
                 camera_names=opened_names,
@@ -685,12 +693,19 @@ def main() -> None:
                 continue
 
             for camera_name, frame in frames.items():
+                camera_t0 = time.perf_counter()
                 origin_frame = _origin_frames.get(camera_name)
+                capture_ts = _timestamps.get(camera_name)
+                capture_age_ms = (
+                    (camera_t0 - capture_ts) * 1000.0
+                    if capture_ts is not None
+                    else None
+                )
                 recorder.write(
                     camera_name=camera_name,
                     loop_frame_idx=frame_idx,
                     image_bgr=origin_frame,
-                    capture_timestamp=_timestamps.get(camera_name),
+                    capture_timestamp=capture_ts,
                 )
                 if origin_frame is not None and frame_idx % PRINT_EVERY_N_FRAMES == 0:
                     origin_h, origin_w = origin_frame.shape[:2]
@@ -702,19 +717,26 @@ def main() -> None:
 
                 detector_entries = detector_entries_by_camera[camera_name]
                 detect_frame = frame
+                undistort_ms = 0.0
                 if use_undistort:
+                    undistort_t0 = time.perf_counter()
                     detect_frame = undistort_frame(
                         frame,
                         undistort_maps_by_camera[camera_name],
                     )
+                    undistort_ms = (time.perf_counter() - undistort_t0) * 1000.0
 
-                vis = make_tag_detection_vis_image(detect_frame)
                 fps_text = camera_manager.get_latest_fps(camera_name)
                 shared_timestamp = time.monotonic()
+                detect_t0 = time.perf_counter()
                 shared_tags = detector_entries[0]["detector"].detect_tags(
                     detect_frame,
                     adaptive_clahe=ADAPTIVE_CLAHE_DETECTION,
                 )
+                detect_ms = (time.perf_counter() - detect_t0) * 1000.0
+                # Reuse the already-computed enhanced image instead of running
+                # the tag preprocessing path a second time just for display.
+                vis = cv2.cvtColor(shared_tags["enhanced"], cv2.COLOR_GRAY2BGR)
                 adaptive_new_tags = count_adaptive_new_tag_ids(shared_tags)
                 status_lines = [
                     f"[{camera_name}] native_aprilcube cubes={len(detector_entries)} "
@@ -736,6 +758,7 @@ def main() -> None:
                 else:
                     status_lines.append("REC off: press s to start, p to stop")
 
+                process_draw_t0 = time.perf_counter()
                 for entry in detector_entries:
                     cube_name = entry["cube_name"]
                     detector = entry["detector"]
@@ -761,11 +784,31 @@ def main() -> None:
 
                     if frame_idx % PRINT_EVERY_N_FRAMES == 0:
                         print(line)
+                process_draw_ms = (time.perf_counter() - process_draw_t0) * 1000.0
 
+                visualize_t0 = time.perf_counter()
                 status_lines.append("press s start rec, p stop rec, q or ESC quit")
                 vis = draw_text_panel(vis, status_lines)
                 vis = cv2.resize(vis, vis_img_size, interpolation=cv2.INTER_AREA)
                 cv2.imshow(f"{WINDOW_PREFIX}: {camera_name}", vis)
+                visualize_ms = (time.perf_counter() - visualize_t0) * 1000.0
+
+                if frame_idx % TIMING_PRINT_EVERY_N_FRAMES == 0:
+                    total_ms = (time.perf_counter() - camera_t0) * 1000.0
+                    loop_ms = (time.perf_counter() - loop_t0) * 1000.0
+                    capture_age_text = (
+                        f"{capture_age_ms:.1f}ms"
+                        if capture_age_ms is not None
+                        else "unknown"
+                    )
+                    print(
+                        f"[TIMING] [{camera_name}] capture_age={capture_age_text} "
+                        f"undistort={undistort_ms:.1f}ms "
+                        f"detect_tags={detect_ms:.1f}ms "
+                        f"process_draw={process_draw_ms:.1f}ms "
+                        f"visualize={visualize_ms:.1f}ms "
+                        f"camera_total={total_ms:.1f}ms loop_total={loop_ms:.1f}ms"
+                    )
 
             key = cv2.waitKey(1)
             if not handle_key(key):
