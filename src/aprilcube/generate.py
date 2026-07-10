@@ -79,6 +79,7 @@ class CubeConfig:
     dict_name: str
     tag_ids: list[int]
     tag_size_mm: float    # 0 if computed from cell_size
+    tag_pattern_mirrored: bool = True  # True matches the generated 3MF texture orientation.
     margin_cells: int = 1    # cells between adjacent tags
     border_cells: int = 1    # cells of outer border per face edge
     cell_size_mm: float = 0.0  # 0 = derive from tag_size
@@ -1958,6 +1959,7 @@ def generate_voxel_target(
             "cuboids": source_cuboids,
         },
         "dict": dict_name,
+        "tag_pattern_mirrored": True,
         "grid": f"{extent[0]}x{extent[1]}x{extent[2]}",
         "tag_ids": tag_ids,
         "markers": config_markers,
@@ -2169,6 +2171,7 @@ def main():
             "grid": grid_str,
         },
         "dict": dict_name,
+        "tag_pattern_mirrored": True,
         "grid": grid_str,
         "tag_ids": tag_ids,
         "faces": face_tag_map,
