@@ -8,6 +8,7 @@ import argparse
 import pickle
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +56,7 @@ CAMERA_TO_PORT: dict[str, str] = {
     # "cam0": "4-9:1.0",
     # "cam1": "3-5.4.3.4.4:1.0",
     # "cam1": "3-5.4.3.4.2:1.0",  # pinehole middle finger yaml 0707 0145 update
-    "cam1": "3-5.4.3.4.2:1.0",  # IR 3MP f3.6mm
+    "cam1": "3-9:1.0",  # IR 3MP f3.6mm
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
@@ -85,16 +86,18 @@ WINDOW_PREFIX = "CV2 Native AprilCube"
 PRINT_EVERY_N_FRAMES = 5
 TIMING_PRINT_EVERY_N_FRAMES = 30
 UNDISTORT_BEFORE_DETECTION = True
-FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG = 120.0
+FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG: float | None = None  # None = derive from fisheye YAML fx.
 PINHOLE_UNDISTORT_ALPHA = 0.0
 RECORD_OUTPUT_DIR = THIS_FILE.parent.parent / "recordings"
 ADAPTIVE_CLAHE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",  # test
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_15mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",  # test
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_15mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_15mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
@@ -102,6 +105,28 @@ CUBE_CFG_DIRS: list[Path] = [
 
 ENABLE_FILTER = True
 FAST_DETECTOR = True
+ASSETS_DIR = THIS_FILE.parent.parent / "assets"
+DRAW_OBJ_OVERLAY = True
+OBJ_OVERLAY_MAX_EDGES = 2500
+CUBE_CFG_NAME_TO_OBJ_NAME: dict[str, str] = {
+    "cube_april_36h11_0_5_1x1x1_15mm": "middle",
+    "cube_april_36h11_6_11_1x1x1_15mm": "index",
+    "cube_april_36h11_12_17_1x1x1_15mm": "thumb",
+}
+OBJ_OVERLAY_COLORS: dict[str, tuple[int, int, int]] = {
+    "index": (0, 165, 255),
+    "middle": (255, 180, 80),
+    "thumb": (120, 220, 120),
+}
+
+
+@dataclass(frozen=True)
+class ObjOverlay:
+    name: str
+    path: Path
+    vertices_mm: np.ndarray
+    edges: np.ndarray
+    color_bgr: tuple[int, int, int]
 
 
 def camera_matrix_to_intrinsic_dict(k: np.ndarray) -> dict[str, float]:
@@ -162,6 +187,27 @@ def make_centered_pinhole_camera_matrix(
     )
 
 
+def horizontal_fov_from_camera_matrix(
+    camera_matrix: np.ndarray,
+    image_size: tuple[int, int],
+) -> float:
+    width, _height = image_size
+    fx = float(camera_matrix[0, 0])
+    if fx <= 0.0:
+        raise ValueError(f"camera_matrix fx must be positive, got {fx}.")
+    return float(np.degrees(2.0 * np.arctan(width / (2.0 * fx))))
+
+
+def resolved_fisheye_rectified_horizontal_fov_deg(
+    calib: dict[str, Any],
+    image_size: tuple[int, int],
+) -> float:
+    if FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG is not None:
+        return float(FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG)
+    camera_matrix = np.asarray(calib["K"], dtype=np.float64).reshape(3, 3)
+    return horizontal_fov_from_camera_matrix(camera_matrix, image_size)
+
+
 def compute_detection_camera_matrix(
     calib: dict[str, Any],
     image_size: tuple[int, int],
@@ -180,9 +226,13 @@ def compute_detection_camera_matrix(
     if is_fisheye_calib(calib):
         if dist_coeffs.size != 4:
             raise ValueError(f"OpenCV fisheye calibration expects 4 coeffs, got {dist_coeffs.size}.")
+        horizontal_fov_deg = resolved_fisheye_rectified_horizontal_fov_deg(
+            calib,
+            image_size,
+        )
         return make_centered_pinhole_camera_matrix(
             image_size,
-            FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG,
+            horizontal_fov_deg,
         )
 
     new_camera_matrix, _roi = cv2.getOptimalNewCameraMatrix(
@@ -298,7 +348,28 @@ def result_to_text(camera_name: str, cube_name: str, result: dict[str, Any] | No
         return f"{prefix} no result"
     if not result.get("success", False):
         n_tags = int(result.get("n_tags", 0))
-        return f"{prefix} cube not detected tags={n_tags}"
+        reason = str(result.get("failure_reason", "unknown"))
+        tag_ids = result.get("tag_ids", [])
+        faces = result.get("visible_faces", None)
+        text = f"{prefix} cube not detected tags={n_tags}"
+        if tag_ids:
+            text += f" ids={list(tag_ids)}"
+        if faces:
+            text += f" faces={sorted(list(faces))}"
+        text += f" reason={reason}"
+        if "tag_corner_rotation_fallback_reject" in result:
+            text += (
+                f" rot_try={result.get('tag_corner_rotation_fallback_reject')}"
+                f" best_reproj={float(result.get('tag_corner_rotation_fallback_best_reproj', float('inf'))):.2f}"
+            )
+        per_tag_err = result.get("per_tag_reproj_error", None)
+        if per_tag_err:
+            compact_err = {
+                int(tag_id): round(float(err), 1)
+                for tag_id, err in dict(per_tag_err).items()
+            }
+            text += f" tag_err={compact_err}"
+        return text
 
     tvec = np.asarray(result["tvec"], dtype=np.float64).reshape(-1)
     text = f"{prefix} t=({tvec[0]:.1f},{tvec[1]:.1f},{tvec[2]:.1f})"
@@ -321,10 +392,23 @@ def result_to_text(camera_name: str, cube_name: str, result: dict[str, Any] | No
     if result.get("predicted", False):
         text += " predicted"
     if result.get("single_tag_cfg_pose", False):
+        rot_deg = int(result.get("single_tag_corner_rotation_deg", 0))
         text += (
             f" single_tag_cfg_pose"
-            f"(id={result.get('single_tag_id', '?')},face={result.get('single_tag_face', '?')})"
+            f"(id={result.get('single_tag_id', '?')},"
+            f"face={result.get('single_tag_face', '?')},rot={rot_deg})"
         )
+    if result.get("tag_corner_rotation_fallback", False):
+        text += f" corner_rot={result.get('tag_corner_rotations_deg', {})}"
+    if result.get("face_assignment_fallback", False):
+        text += f" face_assign={result.get('tag_face_assignment', {})}"
+    per_tag_err = result.get("per_tag_reproj_error", None)
+    if per_tag_err:
+        compact_err = {
+            int(tag_id): round(float(err), 1)
+            for tag_id, err in dict(per_tag_err).items()
+        }
+        text += f" tag_err={compact_err}"
 
     return text
 
@@ -345,6 +429,111 @@ def draw_text_panel(img: np.ndarray, lines: list[str]) -> np.ndarray:
         )
         y += 24
     return out
+
+
+def cube_cfg_name_from_path(cube_path: Path) -> str:
+    return cube_path.name if cube_path.is_dir() else cube_path.parent.name
+
+
+def load_obj_overlay(
+    obj_name: str,
+    *,
+    max_edges: int = OBJ_OVERLAY_MAX_EDGES,
+) -> ObjOverlay:
+    import trimesh
+
+    obj_path = ASSETS_DIR / f"{obj_name}.obj"
+    if not obj_path.is_file():
+        raise FileNotFoundError(f"OBJ overlay file not found: {obj_path}")
+
+    loaded = trimesh.load(obj_path, process=False)
+    if isinstance(loaded, trimesh.Scene):
+        mesh = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+    else:
+        mesh = loaded
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    edges = np.asarray(mesh.edges_unique, dtype=np.int32)
+    if edges.size == 0 and len(getattr(mesh, "faces", [])) > 0:
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        edges = np.vstack(
+            [
+                faces[:, [0, 1]],
+                faces[:, [1, 2]],
+                faces[:, [2, 0]],
+            ]
+        )
+        edges = np.unique(np.sort(edges, axis=1), axis=0)
+
+    if max_edges > 0 and len(edges) > max_edges:
+        keep = np.linspace(0, len(edges) - 1, max_edges, dtype=np.int64)
+        edges = edges[keep]
+
+    used_vertex_ids = np.unique(edges.reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int32)
+    remap[used_vertex_ids] = np.arange(len(used_vertex_ids), dtype=np.int32)
+    vertices = vertices[used_vertex_ids]
+    edges = remap[edges]
+
+    return ObjOverlay(
+        name=obj_name,
+        path=obj_path,
+        vertices_mm=vertices,
+        edges=edges,
+        color_bgr=OBJ_OVERLAY_COLORS.get(obj_name, (180, 180, 180)),
+    )
+
+
+def draw_obj_overlay(
+    image: np.ndarray,
+    result: dict[str, Any],
+    detector: Any,
+    overlay: ObjOverlay | None,
+) -> np.ndarray:
+    if overlay is None or not result.get("success", False):
+        return image
+    if result.get("rvec", None) is None or result.get("tvec", None) is None:
+        return image
+
+    rvec = np.asarray(result["rvec"], dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(result["tvec"], dtype=np.float64).reshape(3, 1)
+    vertices = np.asarray(overlay.vertices_mm, dtype=np.float64).reshape(-1, 3)
+
+    rot_mat, _ = cv2.Rodrigues(rvec)
+    vertices_cam = vertices @ rot_mat.T + tvec.reshape(1, 3)
+    projected, _ = cv2.projectPoints(
+        vertices,
+        rvec,
+        tvec,
+        detector.camera_matrix,
+        detector.dist_coeffs,
+    )
+    pts = projected.reshape(-1, 2)
+    h, w = image.shape[:2]
+    margin = 200
+
+    for i, j in overlay.edges:
+        if vertices_cam[i, 2] <= 1.0 or vertices_cam[j, 2] <= 1.0:
+            continue
+        p0 = pts[i]
+        p1 = pts[j]
+        if (
+            max(p0[0], p1[0]) < -margin
+            or min(p0[0], p1[0]) > w + margin
+            or max(p0[1], p1[1]) < -margin
+            or min(p0[1], p1[1]) > h + margin
+        ):
+            continue
+        cv2.line(
+            image,
+            (int(round(p0[0])), int(round(p0[1]))),
+            (int(round(p1[0])), int(round(p1[1]))),
+            overlay.color_bgr,
+            1,
+            cv2.LINE_AA,
+        )
+
+    return image
 
 
 def count_adaptive_new_tag_ids(shared_tags: dict[str, Any]) -> int:
@@ -593,6 +782,20 @@ def main() -> None:
             f"fx={detect_k[0, 0]:.3f} fy={detect_k[1, 1]:.3f} "
             f"cx={detect_k[0, 2]:.3f} cy={detect_k[1, 2]:.3f}"
         )
+        if use_undistort and is_fisheye_calib(calib):
+            hfov_source = (
+                "yaml_fx"
+                if FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG is None
+                else "FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG"
+            )
+            hfov_deg = resolved_fisheye_rectified_horizontal_fov_deg(
+                calib,
+                detect_img_size,
+            )
+            print(
+                f"[INFO] [{camera_name}] fisheye_rectified_hfov="
+                f"{hfov_deg:.3f}deg source={hfov_source}"
+            )
     print(
         f"[INFO] capture_size={capture_size} "
         f"detect_img_size={detect_img_size} vis_img_size={vis_img_size}"
@@ -601,9 +804,31 @@ def main() -> None:
     detector_entries_by_camera: dict[str, list[dict[str, Any]]] = {
         name: [] for name in active_camera_names
     }
+    obj_overlay_by_name: dict[str, ObjOverlay] = {}
+    if DRAW_OBJ_OVERLAY:
+        for obj_name in sorted(set(CUBE_CFG_NAME_TO_OBJ_NAME.values())):
+            try:
+                obj_overlay_by_name[obj_name] = load_obj_overlay(obj_name)
+                overlay = obj_overlay_by_name[obj_name]
+                print(
+                    f"[INFO] Loaded OBJ overlay: {obj_name} "
+                    f"path={overlay.path} vertices={len(overlay.vertices_mm)} edges={len(overlay.edges)}"
+                )
+            except Exception as exc:
+                print(
+                    f"[WARNING] Failed to load OBJ overlay '{obj_name}': "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     for cube_path in cube_paths:
-        cube_name = cube_path.name if cube_path.is_dir() else cube_path.parent.name
+        cube_name = cube_cfg_name_from_path(cube_path)
+        obj_name = CUBE_CFG_NAME_TO_OBJ_NAME.get(cube_name, "")
+        obj_overlay = obj_overlay_by_name.get(obj_name)
+        if DRAW_OBJ_OVERLAY:
+            if obj_overlay is None:
+                print(f"[INFO] Cube cfg has no OBJ overlay: {cube_name}")
+            else:
+                print(f"[INFO] Cube cfg -> OBJ overlay: {cube_name} -> {obj_name}")
         for camera_name in active_camera_names:
             detector = create_detector_for_camera(
                 cube_path,
@@ -617,6 +842,8 @@ def main() -> None:
             detector_entries_by_camera[camera_name].append(
                 {
                     "cube_name": cube_name,
+                    "obj_name": obj_name,
+                    "obj_overlay": obj_overlay,
                     "detector": detector,
                 }
             )
@@ -658,9 +885,19 @@ def main() -> None:
             "fps": int(FPS),
             "fourcc": str(FOURCC),
             "undistort_before_detection": bool(use_undistort),
-            "fisheye_rectified_horizontal_fov_deg": float(
-                FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG
+            "fisheye_rectified_horizontal_fov_deg_setting": (
+                None
+                if FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG is None
+                else float(FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG)
             ),
+            "fisheye_rectified_horizontal_fov_deg_by_camera": {
+                name: resolved_fisheye_rectified_horizontal_fov_deg(
+                    calib_by_camera[name],
+                    detect_img_size,
+                )
+                for name in active_camera_names
+                if use_undistort and is_fisheye_calib(calib_by_camera[name])
+            },
             "cube_paths": [str(path) for path in cube_paths],
         }
 
@@ -761,6 +998,7 @@ def main() -> None:
                 process_draw_t0 = time.perf_counter()
                 for entry in detector_entries:
                     cube_name = entry["cube_name"]
+                    obj_overlay = entry.get("obj_overlay", None)
                     detector = entry["detector"]
                     result = detector.process_detections(
                         detect_frame,
@@ -773,6 +1011,7 @@ def main() -> None:
 
                     try:
                         vis = detector.draw_result(vis, result)
+                        vis = draw_obj_overlay(vis, result, detector, obj_overlay)
                     except Exception as exc:
                         print(
                             f"[WARNING] draw_result failed for {camera_name}/{cube_name}: "

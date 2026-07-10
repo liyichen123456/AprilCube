@@ -1,0 +1,154 @@
+{
+  "coordinate_frame": "cube_frame",
+  "description": "Vertices are transformed so the center of the embedded 18.75 mm cube is the OBJ origin. Axis directions are model-specific and remain parallel to cube edges.",
+  "cube_edge_mm": 18.75,
+  "models": {
+    "index": {
+      "source_obj": "assets/index.obj",
+      "cube_frame_obj": "assets/index_cube_frame.obj",
+      "old_cube_center_mm": [
+        932.258728,
+        1014.566314,
+        1158.213257
+      ],
+      "translation_old_to_cube_frame_mm": [
+        -932.258728,
+        -1014.566314,
+        -1158.213257
+      ],
+      "old_to_cube_frame_formula": "p_cube = Rz(+180deg) @ previous_index_rotation @ (p_old - old_cube_center_mm)",
+      "rotation_old_to_cube_frame": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          -1,
+          0,
+          0
+        ],
+        [
+          0,
+          -1,
+          0
+        ]
+      ],
+      "pre_rotation_translation_mm": [
+        -932.258728,
+        -1014.566314,
+        -1158.213257
+      ],
+      "affine_translation_old_to_cube_frame_mm": [
+        -1158.213257,
+        932.258728,
+        1014.566314
+      ],
+      "euler_old_to_cube_frame": {
+        "type": "intrinsic_moving_axis",
+        "sequence": [
+          "y",
+          "x'"
+        ],
+        "degrees": [
+          -90.0,
+          90.0
+        ]
+      },
+      "additional_rotation_applied": {
+        "axis": "z",
+        "degrees": 180.0,
+        "relative_to": "previous index cube-frame"
+      }
+    },
+    "middle": {
+      "source_obj": "assets/middle.obj",
+      "cube_frame_obj": "assets/middle_cube_frame.obj",
+      "old_cube_center_mm": [
+        967.613708,
+        950.116303,
+        1130.976318
+      ],
+      "translation_old_to_cube_frame_mm": [
+        -967.613708,
+        -950.116303,
+        -1130.976318
+      ],
+      "old_to_cube_frame_formula": "p_cube = Rx(180deg) @ (p_old - old_cube_center_mm)",
+      "rotation_old_to_cube_frame": [
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          -1,
+          0
+        ],
+        [
+          0,
+          0,
+          -1
+        ]
+      ],
+      "pre_rotation_translation_mm": [
+        -967.613708,
+        -950.116303,
+        -1130.976318
+      ],
+      "affine_translation_old_to_cube_frame_mm": [
+        -967.613708,
+        950.116303,
+        1130.976318
+      ]
+    },
+    "thumb": {
+      "source_obj": "assets/thumb.obj",
+      "cube_frame_obj": "assets/thumb_cube_frame.obj",
+      "old_cube_center_mm": [
+        976.488739,
+        1007.066254,
+        1159.371033
+      ],
+      "translation_old_to_cube_frame_mm": [
+        -976.488739,
+        -1007.066254,
+        -1159.371033
+      ],
+      "old_to_cube_frame_formula": "p_cube = Ry(+90deg) @ previous_thumb_rotation @ (p_old - old_cube_center_mm)",
+      "rotation_old_to_cube_frame": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ],
+      "pre_rotation_translation_mm": [
+        -976.488739,
+        -1007.066254,
+        -1159.371033
+      ],
+      "affine_translation_old_to_cube_frame_mm": [
+        -1159.371033,
+        -976.488739,
+        -1007.066254
+      ],
+      "additional_rotation_applied": {
+        "axis": "y",
+        "degrees": 90.0,
+        "relative_to": "previous thumb cube-frame"
+      }
+    }
+  }
+}
