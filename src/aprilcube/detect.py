@@ -6,6 +6,7 @@ detects markers in camera/image/video, and estimates the cube's 6-DOF pose.
 """
 
 import argparse
+import itertools
 import json
 import sys
 import threading
@@ -21,6 +22,8 @@ from aprilcube.generate import CubeConfig, DICT_MAP, FACE_DEFS
 
 
 SINGLE_TAG_CFG_MAX_REPROJ_PX = 25.0
+SINGLE_TAG_CFG_MAX_OTHER_TAG_REPROJ_PX = 15.0
+MULTI_TAG_POSE_MAX_REPROJ_PX = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -40,11 +43,17 @@ def load_cube_config(path: str) -> tuple[CubeConfig, dict[str, set[int]]]:
         dict_id=dict_id, dict_name=data["dict"],
         tag_ids=data["tag_ids"],
         tag_size_mm=data["tag_size_mm"],
+        tag_pattern_mirrored=bool(data.get("tag_pattern_mirrored", True)),
         margin_cells=data["margin_cells"],
         border_cells=data["border_cells"],
         cell_size_mm=data["cell_size_mm"],
     )
     config.compute()
+    if "box_dims" in data:
+        box_dims = data["box_dims"]
+        if len(box_dims) != 3:
+            raise ValueError(f"config.json box_dims must contain 3 values, got {box_dims}")
+        config.box_dims = tuple(float(v) for v in box_dims)
 
     face_id_sets = {name: set(ids) for name, ids in data["faces"].items()}
     return config, face_id_sets
@@ -70,18 +79,19 @@ def build_tag_corner_map(config: CubeConfig) -> dict[int, np.ndarray]:
         n_tags = face_rows * face_cols
 
         # Centering offsets (same logic as build_face_grid in generate_cube.py)
-        tag_block_w = face_cols * mp + max(0, face_cols - 1) * config.margin_cells
-        tag_block_h = face_rows * mp + max(0, face_rows - 1) * config.margin_cells
-        row_off = (down_cells - tag_block_h) // 2
-        col_off = (right_cells - tag_block_w) // 2
-
         right_half = config.box_dims[right_ax] / 2.0
         down_half = config.box_dims[down_ax] / 2.0
         face_pos = normal_sign * config.box_dims[normal_ax] / 2.0
+        tag_size = config.marker_pixels * config.cell_size
+        margin = config.margin_cells * config.cell_size
+        tag_block_w = face_cols * tag_size + max(0, face_cols - 1) * margin
+        tag_block_h = face_rows * tag_size + max(0, face_rows - 1) * margin
+        col_off = (config.box_dims[right_ax] - tag_block_w) / 2.0
+        row_off = (config.box_dims[down_ax] - tag_block_h) / 2.0
 
-        def cell_to_3d(row: float, col: float) -> np.ndarray:
-            u = right_sign * (-right_half + col * cs)
-            v = down_sign * (-down_half + row * cs)
+        def face_mm_to_3d(row_mm: float, col_mm: float) -> np.ndarray:
+            u = right_sign * (-right_half + col_mm)
+            v = down_sign * (-down_half + row_mm)
             pt = np.zeros(3)
             pt[normal_ax] = face_pos
             pt[right_ax] = u
@@ -95,18 +105,27 @@ def build_tag_corner_map(config: CubeConfig) -> dict[int, np.ndarray]:
                     break
                 tag_id = config.tag_ids[id_cursor + idx]
 
-                rs = row_off + r * (mp + config.margin_cells)
-                cc = col_off + c * (mp + config.margin_cells)
+                rs = row_off + r * (tag_size + margin)
+                cc = col_off + c * (tag_size + margin)
 
-                # [TL, TR, BR, BL] as seen from outside.
-                # Tag patterns are np.fliplr'd in generate_cube.py, so the
-                # detector's TL/TR are column-swapped relative to grid coords.
-                corners_3d = np.array([
-                    cell_to_3d(rs, cc + mp),       # TL
-                    cell_to_3d(rs, cc),             # TR
-                    cell_to_3d(rs + mp, cc),        # BR
-                    cell_to_3d(rs + mp, cc + mp),   # BL
-                ], dtype=np.float64)
+                # [TL, TR, BR, BL] as seen from outside, matching detector
+                # corner ordering. Generated 3MF textures are horizontally
+                # mirrored, while paper sticker configs can opt into standard
+                # non-mirrored AprilTag orientation.
+                if config.tag_pattern_mirrored:
+                    corners_3d = np.array([
+                        face_mm_to_3d(rs, cc + tag_size),       # TL
+                        face_mm_to_3d(rs, cc),                  # TR
+                        face_mm_to_3d(rs + tag_size, cc),       # BR
+                        face_mm_to_3d(rs + tag_size, cc + tag_size),  # BL
+                    ], dtype=np.float64)
+                else:
+                    corners_3d = np.array([
+                        face_mm_to_3d(rs, cc),                  # TL
+                        face_mm_to_3d(rs, cc + tag_size),       # TR
+                        face_mm_to_3d(rs + tag_size, cc + tag_size),  # BR
+                        face_mm_to_3d(rs + tag_size, cc),       # BL
+                    ], dtype=np.float64)
 
                 tag_corner_map[tag_id] = corners_3d
 
@@ -261,10 +280,17 @@ _adaptive_image_enhancement_variants: tuple[dict, ...] = (
     {"name": "gamma brighten+clahe", "gamma": 0.7, "clahe": (2.0, (8, 8))},
     {"name": "gamma darken+clahe", "gamma": 1.4, "clahe": (2.0, (8, 8))},
     {"name": "contrast up+clahe", "alpha": 1.35, "beta": 0.0, "clahe": (2.0, (8, 8))},
+    {"name": "contrast stronger+clahe", "alpha": 1.60, "beta": 0.0, "clahe": (2.5, (8, 8))},
     {"name": "contrast bright+clahe", "alpha": 1.25, "beta": 18.0, "clahe": (2.0, (8, 8))},
+    {"name": "contrast brighter+clahe", "alpha": 1.45, "beta": 28.0, "clahe": (2.5, (8, 8))},
     {"name": "contrast dark+clahe", "alpha": 1.35, "beta": -18.0, "clahe": (2.0, (8, 8))},
+    {"name": "contrast darker+clahe", "alpha": 1.55, "beta": -30.0, "clahe": (2.5, (8, 8))},
     {"name": "stretch+clahe", "stretch": (1.0, 99.0), "clahe": (2.0, (8, 8))},
+    {"name": "stretch tight+clahe", "stretch": (2.0, 98.0), "clahe": (2.5, (8, 8))},
+    {"name": "stretch wide+clahe", "stretch": (0.5, 99.5), "clahe": (3.0, (8, 8))},
     {"name": "stretch+sharpen+clahe", "stretch": (1.0, 99.0), "sharpen": True, "clahe": (2.0, (8, 8))},
+    {"name": "gamma brighten strong+clahe", "gamma": 0.55, "clahe": (2.5, (8, 8))},
+    {"name": "gamma darken strong+clahe", "gamma": 1.8, "clahe": (2.5, (8, 8))},
     {"name": "sharpen+relaxed", "sharpen": True, "detector": "fallback"},
     {"name": "stretch+sharpen+relaxed", "stretch": (1.0, 99.0), "sharpen": True, "detector": "fallback"},
 )
@@ -443,6 +469,69 @@ def estimate_pose(
     return success, rvec, tvec, reproj_err, inliers
 
 
+def estimate_pose_direct(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    prev_rvec: np.ndarray | None = None,
+    prev_tvec: np.ndarray | None = None,
+) -> tuple[bool, np.ndarray | None, np.ndarray | None, float, np.ndarray | None]:
+    """Estimate pose from all correspondences without RANSAC."""
+    n_points = object_points.shape[0]
+    if n_points < 4:
+        return False, None, None, float("inf"), None
+
+    use_guess = prev_rvec is not None and prev_tvec is not None
+    pnp_flag = cv2.SOLVEPNP_ITERATIVE if use_guess else cv2.SOLVEPNP_SQPNP
+    try:
+        success, rvec, tvec = cv2.solvePnP(
+            objectPoints=object_points,
+            imagePoints=image_points,
+            cameraMatrix=camera_matrix,
+            distCoeffs=dist_coeffs,
+            rvec=prev_rvec.copy() if use_guess else None,
+            tvec=prev_tvec.copy() if use_guess else None,
+            useExtrinsicGuess=use_guess,
+            flags=pnp_flag,
+        )
+    except cv2.error:
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                objectPoints=object_points,
+                imagePoints=image_points,
+                cameraMatrix=camera_matrix,
+                distCoeffs=dist_coeffs,
+                rvec=prev_rvec.copy() if use_guess else None,
+                tvec=prev_tvec.copy() if use_guess else None,
+                useExtrinsicGuess=use_guess,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except cv2.error:
+            return False, None, None, float("inf"), None
+
+    if not success:
+        return False, None, None, float("inf"), None
+
+    inliers = np.arange(n_points, dtype=np.int32).reshape(-1, 1)
+    try:
+        rvec, tvec = cv2.solvePnPRefineLM(
+            objectPoints=object_points,
+            imagePoints=image_points,
+            cameraMatrix=camera_matrix,
+            distCoeffs=dist_coeffs,
+            rvec=rvec,
+            tvec=tvec,
+        )
+    except cv2.error:
+        pass
+
+    projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+    projected = projected.reshape(-1, 2)
+    reproj_err = float(np.mean(np.linalg.norm(image_points - projected, axis=1)))
+    return True, rvec, tvec, reproj_err, inliers
+
+
 def _rigid_transform_3d(src_points: np.ndarray, dst_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return R, t such that dst ~= R @ src + t."""
     src = np.asarray(src_points, dtype=np.float64).reshape(-1, 3)
@@ -485,98 +574,85 @@ def estimate_single_tag_cube_pose(
     dist_coeffs: np.ndarray,
     prev_rvec: np.ndarray | None = None,
     prev_tvec: np.ndarray | None = None,
+    allow_corner_rotations: bool = False,
 ) -> tuple[bool, np.ndarray | None, np.ndarray | None, float, np.ndarray | None, dict]:
     """Estimate cube pose from one decoded tag and cfg tag-to-cube geometry."""
-    candidates: list[tuple[float, np.ndarray, np.ndarray, float, int, str | None]] = []
+    candidates: list[tuple[float, np.ndarray, np.ndarray, float, int, str | None, int]] = []
     for tag_id, corners_2d in detections:
-        obj_corners = tag_corner_map.get(int(tag_id))
-        if obj_corners is None:
+        base_obj_corners = tag_corner_map.get(int(tag_id))
+        if base_obj_corners is None:
             continue
-        obj_corners = np.asarray(obj_corners, dtype=np.float64).reshape(4, 3)
+        base_obj_corners = np.asarray(base_obj_corners, dtype=np.float64).reshape(4, 3)
         corners_2d = np.asarray(corners_2d, dtype=np.float64).reshape(4, 2)
-        edge_len = float(np.mean([
-            np.linalg.norm(obj_corners[(i + 1) % 4] - obj_corners[i])
-            for i in range(4)
-        ]))
-        if edge_len <= 1e-9:
-            continue
-
-        # OpenCV IPPE_SQUARE expects TL, TR, BR, BL on a square centered at origin.
-        tag_local_corners = np.array([
-            [-edge_len / 2.0, edge_len / 2.0, 0.0],
-            [edge_len / 2.0, edge_len / 2.0, 0.0],
-            [edge_len / 2.0, -edge_len / 2.0, 0.0],
-            [-edge_len / 2.0, -edge_len / 2.0, 0.0],
-        ], dtype=np.float64)
-
-        try:
-            retval, tag_rvecs, tag_tvecs, _errs = cv2.solvePnPGeneric(
-                tag_local_corners,
-                corners_2d,
-                camera_matrix,
-                dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE,
-            )
-        except cv2.error:
-            retval, tag_rvecs, tag_tvecs = 0, (), ()
-        if not retval:
-            continue
-
-        r_cube_tag, t_cube_tag = _rigid_transform_3d(tag_local_corners, obj_corners)
-        T_cube_tag = np.eye(4, dtype=np.float64)
-        T_cube_tag[:3, :3] = r_cube_tag
-        T_cube_tag[:3, 3] = t_cube_tag.reshape(3)
-        T_tag_cube = np.linalg.inv(T_cube_tag)
 
         face_name = _face_name_for_tag(face_id_sets, int(tag_id))
         normal_obj = _face_normal(face_name)
 
-        for tag_rvec, tag_tvec in zip(tag_rvecs, tag_tvecs):
-            r_cam_tag, _ = cv2.Rodrigues(tag_rvec)
-            T_cam_tag = np.eye(4, dtype=np.float64)
-            T_cam_tag[:3, :3] = r_cam_tag
-            T_cam_tag[:3, 3] = np.asarray(tag_tvec, dtype=np.float64).reshape(3)
-            T_cam_cube = T_cam_tag @ T_tag_cube
-
-            r_cam_cube = T_cam_cube[:3, :3]
-            t_cam_cube = T_cam_cube[:3, 3].reshape(3, 1)
-            if float(t_cam_cube[2, 0]) <= 0.0:
+        rotations = range(4) if allow_corner_rotations else range(1)
+        for corner_rotation in rotations:
+            obj_corners = np.roll(base_obj_corners, -int(corner_rotation), axis=0)
+            try:
+                retval, rvecs, tvecs, _errs = cv2.solvePnPGeneric(
+                    obj_corners,
+                    corners_2d,
+                    camera_matrix,
+                    dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE,
+                )
+            except cv2.error:
+                retval, rvecs, tvecs = 0, (), ()
+            if not retval:
                 continue
-            if normal_obj is not None:
-                normal_cam = r_cam_cube @ normal_obj
-                if float(normal_cam[2]) > 0.0:
-                    continue
 
-            rvec_cube, _ = cv2.Rodrigues(r_cam_cube)
-            projected, _ = cv2.projectPoints(
-                obj_corners,
-                rvec_cube,
-                t_cam_cube,
-                camera_matrix,
-                dist_coeffs,
-            )
-            reproj_err = float(np.mean(np.linalg.norm(
-                corners_2d - projected.reshape(-1, 2),
-                axis=1,
-            )))
-            score = reproj_err
-            if prev_rvec is not None and prev_tvec is not None:
-                trans_delta = float(np.linalg.norm(t_cam_cube.reshape(3) - np.asarray(prev_tvec).reshape(3)))
-                r_prev, _ = cv2.Rodrigues(np.asarray(prev_rvec, dtype=np.float64).reshape(3, 1))
-                angle = np.arccos(np.clip((np.trace(r_prev.T @ r_cam_cube) - 1.0) / 2.0, -1.0, 1.0))
-                score += min(trans_delta / 20.0, 20.0) + min(np.degrees(angle) / 10.0, 20.0)
-            candidates.append((score, rvec_cube, t_cam_cube, reproj_err, int(tag_id), face_name))
+            for candidate_rvec, candidate_tvec in zip(rvecs, tvecs):
+                candidate_rvec = np.asarray(candidate_rvec, dtype=np.float64).reshape(3, 1)
+                candidate_tvec = np.asarray(candidate_tvec, dtype=np.float64).reshape(3, 1)
+                if float(candidate_tvec[2, 0]) <= 0.0:
+                    continue
+                r_cam_cube, _ = cv2.Rodrigues(candidate_rvec)
+                if normal_obj is not None:
+                    normal_cam = r_cam_cube @ normal_obj
+                    if float(normal_cam[2]) > 0.0:
+                        continue
+
+                projected, _ = cv2.projectPoints(
+                    obj_corners,
+                    candidate_rvec,
+                    candidate_tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                )
+                reproj_err = float(np.mean(np.linalg.norm(
+                    corners_2d - projected.reshape(-1, 2),
+                    axis=1,
+                )))
+                score = reproj_err
+                if prev_rvec is not None and prev_tvec is not None:
+                    trans_delta = float(np.linalg.norm(candidate_tvec.reshape(3) - np.asarray(prev_tvec).reshape(3)))
+                    r_prev, _ = cv2.Rodrigues(np.asarray(prev_rvec, dtype=np.float64).reshape(3, 1))
+                    angle = np.arccos(np.clip((np.trace(r_prev.T @ r_cam_cube) - 1.0) / 2.0, -1.0, 1.0))
+                    score += min(trans_delta / 20.0, 20.0) + min(np.degrees(angle) / 10.0, 20.0)
+                candidates.append((
+                    score,
+                    candidate_rvec,
+                    candidate_tvec,
+                    reproj_err,
+                    int(tag_id),
+                    face_name,
+                    int(corner_rotation),
+                ))
 
     if not candidates:
         return False, None, None, float("inf"), None, {}
 
     candidates.sort(key=lambda item: item[0])
-    _score, rvec, tvec, reproj_err, tag_id, face_name = candidates[0]
+    _score, rvec, tvec, reproj_err, tag_id, face_name, corner_rotation = candidates[0]
     inliers = np.arange(4, dtype=np.int32).reshape(-1, 1)
     meta = {
         "single_tag_id": int(tag_id),
         "single_tag_face": face_name,
         "single_tag_candidate_count": len(candidates),
+        "single_tag_corner_rotation_deg": int(corner_rotation) * 90,
     }
     return True, rvec, tvec, reproj_err, inliers, meta
 
@@ -1462,7 +1538,46 @@ class CubePoseEstimator:
             "reproj_error": float("inf"), "n_tags": 0,
             "n_inliers": 0, "detections": [], "tag_ids": [],
             "visible_faces": set(), "predicted": False,
+            "failure_reason": "not_evaluated",
+            "tag_corner_rotation_fallback": False,
         }
+
+        def reject(reason: str) -> dict:
+            result["failure_reason"] = reason
+            return self._store_latest(self._try_predict(timestamp, result), image)
+
+        def compute_per_tag_reprojection_errors() -> dict[int, float]:
+            if (
+                not success
+                or rvec is None
+                or tvec is None
+                or not detections
+                or object_points.shape[0] < len(detections) * 4
+                or image_points.shape[0] < len(detections) * 4
+            ):
+                return {}
+            projected, _ = cv2.projectPoints(
+                object_points,
+                rvec,
+                tvec,
+                self.camera_matrix,
+                self.dist_coeffs,
+            )
+            projected = projected.reshape(-1, 2)
+            per_tag: dict[int, float] = {}
+            for k, (tag_id, _corners_2d) in enumerate(detections):
+                start = k * 4
+                end = start + 4
+                per_tag[int(tag_id)] = float(np.mean(np.linalg.norm(
+                    image_points[start:end] - projected[start:end],
+                    axis=1,
+                )))
+            return per_tag
+
+        def update_reprojection_debug() -> None:
+            per_tag = compute_per_tag_reprojection_errors()
+            if per_tag:
+                result["per_tag_reproj_error"] = per_tag
 
         # Collect detections that belong to this cube instance.
         detections: list[tuple[int, np.ndarray]] = []
@@ -1539,7 +1654,7 @@ class CubePoseEstimator:
 
         if not obj_pts:
             self._prev_gray = gray.copy()  # still save for next frame's flow
-            return self._store_latest(self._try_predict(timestamp, result), image)
+            return reject("no_valid_cube_tags")
 
         object_points = np.vstack(obj_pts).astype(np.float64)
         image_points = np.vstack(img_pts).astype(np.float64)
@@ -1561,10 +1676,12 @@ class CubePoseEstimator:
 
         single_tag_cfg_pose = False
         single_tag_meta: dict = {}
+        rotation_fallback_meta: dict = {}
 
         def apply_single_tag_cfg_pose(force: bool = False) -> bool:
             nonlocal success, rvec, tvec, reproj_err, inliers
             nonlocal single_tag_cfg_pose, single_tag_meta
+            nonlocal object_points, image_points
             if used_flow or not detections:
                 return False
             (
@@ -1582,6 +1699,7 @@ class CubePoseEstimator:
                 self.dist_coeffs,
                 pnp_rv_guess,
                 pnp_tv_guess,
+                allow_corner_rotations=not self.config.tag_pattern_mirrored,
             )
             if not single_success:
                 return False
@@ -1594,9 +1712,227 @@ class CubePoseEstimator:
             inliers = single_inliers
             single_tag_cfg_pose = True
             single_tag_meta = candidate_meta
+            selected_tag_id = int(candidate_meta.get("single_tag_id", -1))
+            selected_rotation = int(candidate_meta.get("single_tag_corner_rotation_deg", 0)) // 90
+            obj_pts_for_debug = []
+            img_pts_for_debug = []
+            for detected_tag_id, corners_2d in detections:
+                obj_corners = self.tag_corner_map[detected_tag_id]
+                if int(detected_tag_id) == selected_tag_id and selected_rotation:
+                    obj_corners = np.roll(obj_corners, -selected_rotation, axis=0)
+                obj_pts_for_debug.append(obj_corners)
+                img_pts_for_debug.append(corners_2d)
+            object_points = np.vstack(obj_pts_for_debug).astype(np.float64)
+            image_points = np.vstack(img_pts_for_debug).astype(np.float64)
             face_name = candidate_meta.get("single_tag_face", None)
             if face_name:
                 result["visible_faces"] = {str(face_name)}
+            return True
+
+        def face_normals_ok(
+            test_rvec: np.ndarray,
+            visible_faces: set[str] | None = None,
+        ) -> bool:
+            R_test, _ = cv2.Rodrigues(test_rvec)
+            faces_to_check = result["visible_faces"] if visible_faces is None else visible_faces
+            for visible_face in faces_to_check:
+                for fd in FACE_DEFS:
+                    if fd[0] != visible_face:
+                        continue
+                    normal_obj = np.zeros(3)
+                    normal_obj[fd[1]] = fd[2]
+                    normal_cam = R_test @ normal_obj
+                    if normal_cam[2] > 0:
+                        return False
+                    break
+            return True
+
+        def apply_tag_corner_rotation_fallback() -> bool:
+            nonlocal success, rvec, tvec, reproj_err, inliers
+            nonlocal object_points, image_points, rotation_fallback_meta
+            if used_flow or not detections or self.config.tag_pattern_mirrored:
+                return False
+            if len(detections) > 4:
+                return False
+
+            best: tuple[float, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, dict] | None = None
+            best_rejected: tuple[str, float] | None = None
+            for rotations in itertools.product(range(4), repeat=len(detections)):
+                if all(rot == 0 for rot in rotations):
+                    continue
+                rotated_obj_pts = []
+                rotated_img_pts = []
+                for (tag_id, corners_2d), rot in zip(detections, rotations):
+                    rotated_obj_pts.append(np.roll(self.tag_corner_map[tag_id], -int(rot), axis=0))
+                    rotated_img_pts.append(corners_2d)
+
+                candidate_object_points = np.vstack(rotated_obj_pts).astype(np.float64)
+                candidate_image_points = np.vstack(rotated_img_pts).astype(np.float64)
+                (
+                    candidate_success,
+                    candidate_rvec,
+                    candidate_tvec,
+                    candidate_reproj_err,
+                    candidate_inliers,
+                ) = estimate_pose_direct(
+                    candidate_object_points,
+                    candidate_image_points,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    pnp_rv_guess,
+                    pnp_tv_guess,
+                )
+                if not candidate_success:
+                    if best_rejected is None:
+                        best_rejected = ("direct_pnp_failed", float("inf"))
+                    continue
+                if candidate_tvec is None or float(candidate_tvec.reshape(3)[2]) <= 0.0:
+                    if best_rejected is None or candidate_reproj_err < best_rejected[1]:
+                        best_rejected = ("behind_camera", candidate_reproj_err)
+                    continue
+                if candidate_rvec is None or not face_normals_ok(candidate_rvec):
+                    if best_rejected is None or candidate_reproj_err < best_rejected[1]:
+                        best_rejected = ("face_normal_away", candidate_reproj_err)
+                    continue
+
+                meta = {
+                    "tag_corner_rotations_deg": {
+                        int(tag_id): int(rot) * 90
+                        for (tag_id, _corners_2d), rot in zip(detections, rotations)
+                        if int(rot) != 0
+                    }
+                }
+                if best is None or candidate_reproj_err < best[0]:
+                    best = (
+                        candidate_reproj_err,
+                        candidate_rvec,
+                        candidate_tvec,
+                        candidate_inliers,
+                        candidate_object_points,
+                        meta,
+                    )
+
+            if best is None:
+                if best_rejected is not None:
+                    rotation_fallback_meta = {
+                        "tag_corner_rotation_fallback_reject": best_rejected[0],
+                        "tag_corner_rotation_fallback_best_reproj": best_rejected[1],
+                    }
+                    result.update(rotation_fallback_meta)
+                return False
+
+            reproj_err, rvec, tvec, inliers, object_points, rotation_fallback_meta = best
+            image_points = np.vstack([c2d for _tid, c2d in detections]).astype(np.float64)
+            success = True
+            return True
+
+        def face_template_corner_map() -> dict[str, np.ndarray]:
+            templates: dict[str, np.ndarray] = {}
+            for face_name, ids in self.face_id_sets.items():
+                for candidate_id in ids:
+                    if int(candidate_id) in self.tag_corner_map:
+                        templates[str(face_name)] = self.tag_corner_map[int(candidate_id)]
+                        break
+            return templates
+
+        def apply_face_assignment_fallback() -> bool:
+            nonlocal success, rvec, tvec, reproj_err, inliers
+            nonlocal object_points, image_points, rotation_fallback_meta
+            if used_flow or not detections or self.config.tag_pattern_mirrored:
+                return False
+            if len(detections) > 4:
+                return False
+
+            templates = face_template_corner_map()
+            face_names = list(templates.keys())
+            if len(face_names) < len(detections):
+                return False
+
+            best: tuple[
+                float,
+                np.ndarray,
+                np.ndarray,
+                np.ndarray | None,
+                np.ndarray,
+                set[str],
+                dict,
+            ] | None = None
+            for assigned_faces in itertools.permutations(face_names, len(detections)):
+                assigned_face_set = set(str(face) for face in assigned_faces)
+                for rotations in itertools.product(range(4), repeat=len(detections)):
+                    candidate_obj_pts = []
+                    candidate_img_pts = []
+                    tag_to_face: dict[int, str] = {}
+                    tag_rotations: dict[int, int] = {}
+                    for (tag_id, corners_2d), face_name, rot in zip(
+                        detections,
+                        assigned_faces,
+                        rotations,
+                    ):
+                        candidate_obj_pts.append(
+                            np.roll(templates[str(face_name)], -int(rot), axis=0)
+                        )
+                        candidate_img_pts.append(corners_2d)
+                        tag_to_face[int(tag_id)] = str(face_name)
+                        if int(rot) != 0:
+                            tag_rotations[int(tag_id)] = int(rot) * 90
+
+                    candidate_object_points = np.vstack(candidate_obj_pts).astype(np.float64)
+                    candidate_image_points = np.vstack(candidate_img_pts).astype(np.float64)
+                    (
+                        candidate_success,
+                        candidate_rvec,
+                        candidate_tvec,
+                        candidate_reproj_err,
+                        candidate_inliers,
+                    ) = estimate_pose_direct(
+                        candidate_object_points,
+                        candidate_image_points,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                        pnp_rv_guess,
+                        pnp_tv_guess,
+                    )
+                    if (
+                        not candidate_success
+                        or candidate_rvec is None
+                        or candidate_tvec is None
+                        or float(candidate_tvec.reshape(3)[2]) <= 0.0
+                        or not face_normals_ok(candidate_rvec, assigned_face_set)
+                    ):
+                        continue
+
+                    meta = {
+                        "face_assignment_fallback": True,
+                        "tag_face_assignment": tag_to_face,
+                        "tag_corner_rotations_deg": tag_rotations,
+                    }
+                    if best is None or candidate_reproj_err < best[0]:
+                        best = (
+                            candidate_reproj_err,
+                            candidate_rvec,
+                            candidate_tvec,
+                            candidate_inliers,
+                            candidate_object_points,
+                            assigned_face_set,
+                            meta,
+                        )
+
+            if best is None:
+                return False
+
+            (
+                reproj_err,
+                rvec,
+                tvec,
+                inliers,
+                object_points,
+                assigned_face_set,
+                rotation_fallback_meta,
+            ) = best
+            image_points = np.vstack([c2d for _tid, c2d in detections]).astype(np.float64)
+            result["visible_faces"] = set(assigned_face_set)
+            success = True
             return True
 
         # Solve PnP
@@ -1605,12 +1941,22 @@ class CubePoseEstimator:
             self.camera_matrix, self.dist_coeffs,
             pnp_rv_guess, pnp_tv_guess,
         )
+        fallback_reproj_trigger = (
+            3.0 if len(detections) <= 1 else MULTI_TAG_POSE_MAX_REPROJ_PX
+        )
         if (
-            (len(detections) == 1 or not success or reproj_err > 3.0)
+            (len(detections) == 1 or not success or reproj_err > fallback_reproj_trigger)
             and not used_flow
             and detections
         ):
-            apply_single_tag_cfg_pose(force=(len(detections) == 1 or not success))
+            if len(detections) > 1:
+                if (
+                    not apply_tag_corner_rotation_fallback()
+                    and not apply_face_assignment_fallback()
+                ):
+                    apply_single_tag_cfg_pose(force=not success)
+            else:
+                apply_single_tag_cfg_pose(force=True)
 
         # Per-tag reprojection outlier rejection: if a tag's mean corner
         # reprojection error is much higher than the median, drop it and
@@ -1659,13 +2005,50 @@ class CubePoseEstimator:
         max_reproj = 3.0
         if used_flow:
             max_reproj = 5.0
+        elif len(detections) > 1 and not single_tag_cfg_pose:
+            max_reproj = MULTI_TAG_POSE_MAX_REPROJ_PX
         if single_tag_cfg_pose:
             max_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX
         if not success or reproj_err > max_reproj:
-            if apply_single_tag_cfg_pose(force=True):
+            if len(detections) > 1 and (
+                apply_tag_corner_rotation_fallback()
+                or apply_face_assignment_fallback()
+            ):
+                max_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX
+                single_tag_cfg_pose = False
+                single_tag_meta = {}
+            elif apply_single_tag_cfg_pose(force=True):
                 max_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX
             if not success or reproj_err > max_reproj:
-                return self._store_latest(self._try_predict(timestamp, result), image)
+                update_reprojection_debug()
+                if success:
+                    return reject(f"reproj_too_high:{reproj_err:.2f}>{max_reproj:.2f}")
+                return reject("pnp_failed")
+
+        # A single detected face can define a plausible cube pose, but when
+        # other decoded tags from the same cube are visible, that pose must also
+        # explain them. Otherwise a local single-tag pose can draw a convincing
+        # but physically wrong cube wireframe.
+        if single_tag_cfg_pose and len(detections) > 1:
+            per_tag = compute_per_tag_reprojection_errors()
+            if per_tag:
+                result["per_tag_reproj_error"] = per_tag
+                single_tag_id = int(single_tag_meta.get("single_tag_id", -1))
+                inconsistent = {
+                    tag_id: err
+                    for tag_id, err in per_tag.items()
+                    if tag_id != single_tag_id
+                    and err > SINGLE_TAG_CFG_MAX_OTHER_TAG_REPROJ_PX
+                }
+                if inconsistent:
+                    compact = ",".join(
+                        f"{tag_id}:{err:.1f}"
+                        for tag_id, err in sorted(inconsistent.items())
+                    )
+                    return reject(
+                        "single_tag_pose_inconsistent:"
+                        f"{compact}>{SINGLE_TAG_CFG_MAX_OTHER_TAG_REPROJ_PX:.1f}"
+                    )
 
         # Reject flipped PnP solutions: verify that every detected face's
         # outward normal points toward the camera (negative z in camera frame).
@@ -1678,13 +2061,16 @@ class CubePoseEstimator:
                     normal_cam = R_est @ normal_obj
                     # Outward normal should face camera (z < 0 in camera frame)
                     if normal_cam[2] > 0:
-                        if not single_tag_cfg_pose and apply_single_tag_cfg_pose(force=True):
+                        if (
+                            len(detections) == 1
+                            and not single_tag_cfg_pose
+                            and apply_single_tag_cfg_pose(force=True)
+                        ):
                             R_est, _ = cv2.Rodrigues(rvec)
                             normal_cam = R_est @ normal_obj
                             if normal_cam[2] <= 0:
                                 continue
-                        return self._store_latest(
-                            self._try_predict(timestamp, result), image)
+                        return reject(f"face_normal_away:{face_name}")
                     break
 
         # Temporal consistency: reject sudden large jumps.
@@ -1703,14 +2089,19 @@ class CubePoseEstimator:
                 max_jump_mm = max(100.0, speed * dt * 3.0)
                 max_angle = max(np.radians(45), omega * dt * 3.0)
             if jump_mm > max_jump_mm or angle > max_angle:
-                return self._store_latest(
-                    self._try_predict(timestamp, result), image)
+                return reject(
+                    f"temporal_jump:{jump_mm:.1f}mm/{np.degrees(angle):.1f}deg"
+                )
         else:
             # Re-initialization after dropout — require reasonable reproj error
-            max_init_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX if single_tag_cfg_pose else 2.5
+            if single_tag_cfg_pose:
+                max_init_reproj = SINGLE_TAG_CFG_MAX_REPROJ_PX
+            elif len(detections) > 1:
+                max_init_reproj = MULTI_TAG_POSE_MAX_REPROJ_PX
+            else:
+                max_init_reproj = 2.5
             if reproj_err > max_init_reproj:
-                return self._store_latest(
-                    self._try_predict(timestamp, result), image)
+                return reject(f"init_reproj_too_high:{reproj_err:.2f}>{max_init_reproj:.2f}")
 
         # Kalman filter update
         n_inlier_count = len(inliers) if inliers is not None else 0
@@ -1739,6 +2130,7 @@ class CubePoseEstimator:
             self._prev_gray = gray.copy()
 
         result["success"] = True
+        result["failure_reason"] = ""
         result["rvec"] = rvec
         result["tvec"] = tvec
         T = np.eye(4)
@@ -1747,9 +2139,13 @@ class CubePoseEstimator:
         result["T"] = T
         result["reproj_error"] = reproj_err
         result["n_inliers"] = n_inlier_count
+        update_reprojection_debug()
         if single_tag_cfg_pose:
             result["single_tag_cfg_pose"] = True
             result.update(single_tag_meta)
+        if rotation_fallback_meta:
+            result["tag_corner_rotation_fallback"] = True
+            result.update(rotation_fallback_meta)
         return self._store_latest(result, image)
 
     def process_frame(self, image: np.ndarray,
@@ -1854,7 +2250,10 @@ class CubePoseEstimator:
             if result.get("single_tag_cfg_pose", False):
                 tag_id = result.get("single_tag_id", "?")
                 face = result.get("single_tag_face", "?")
-                lines.append(f"single-tag cfg pose: id={tag_id} face={face}")
+                rot_deg = int(result.get("single_tag_corner_rotation_deg", 0))
+                lines.append(f"single-tag cfg pose: id={tag_id} face={face} rot={rot_deg}")
+            if result.get("face_assignment_fallback", False):
+                lines.append(f"face assignment: {result.get('tag_face_assignment', {})}")
         for i, line in enumerate(lines):
             y = h - 10 - (len(lines) - 1 - i) * 25
             cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,

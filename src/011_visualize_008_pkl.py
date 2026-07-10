@@ -20,7 +20,7 @@ VISER_HOST = "0.0.0.0"
 VISER_PORT = 8091
 DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect_multi_cube.py"
 POSE_CACHE_FORMAT = "aprilcube_008_pose_cache_v1"
-IMAGE_RECOVERY_VERSION = 2
+IMAGE_RECOVERY_VERSION = 7
 SINGLE_TAG_CONTINUITY_GATE_ENABLED = True
 SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG = 45.0
 SINGLE_TAG_CONTINUITY_MIN_FACE_OBSERVATIONS = 2
@@ -40,7 +40,9 @@ TEMPORAL_SMOOTHING_ENABLED = True
 TEMPORAL_SMOOTHING_WINDOW_RADIUS = 2
 TEMPORAL_SMOOTHING_SIGMA_FRAMES = 1.2
 TEMPORAL_SMOOTHING_MAX_ROTATION_DEG = 15.0
-TEMPORAL_SMOOTHING_VERSION = 4
+TEMPORAL_SMOOTHING_MAX_DISPLAY_REPROJ_PX = 12.0
+TEMPORAL_SMOOTHING_MAX_REPROJ_RATIO = 2.5
+TEMPORAL_SMOOTHING_VERSION = 5
 TEMPORAL_ROTATION_JUMP_LIMIT_ENABLED = True
 TEMPORAL_ROTATION_JUMP_MAX_DEG = 20.0
 TEMPORAL_ROTATION_JUMP_HOLD_DEG = 60.0
@@ -458,7 +460,7 @@ class ReplayPoseEstimator:
         if self.shared_tag_detection:
             shared_tags = detector_entries[0]["detector"].detect_tags(
                 detect_frame,
-                adaptive_clahe=False,
+                adaptive_clahe=self.adaptive_clahe,
             )
             decoded_tag_ids.update(int(tag_id) for tag_id, _ in shared_tags["detections"])
 
@@ -483,7 +485,7 @@ class ReplayPoseEstimator:
                     enhanced=cube_tags["enhanced"],
                     timestamp=timestamp,
                 )
-                recovery_mode = "shared_base"
+                recovery_mode = "shared_adaptive" if self.adaptive_clahe else "shared_base"
             else:
                 result, cube_tags, recovery_mode = self.estimate_cube_with_clahe_recovery(
                     detector,
@@ -827,10 +829,38 @@ def cube_scene_node_name(cube_name: str) -> str:
     return f"/world_thumb_web_camera/{safe}"
 
 
+def cube_pose_tracks(pose_cache: list[dict[str, Any]]) -> dict[str, list[tuple[int, np.ndarray]]]:
+    tracks: dict[str, list[tuple[int, np.ndarray]]] = {}
+    for frame_idx, pose_frame in enumerate(pose_cache):
+        for cube in pose_frame.get("cube_results", []):
+            cube_name = str(cube.get("cube_name", ""))
+            result = cube.get("result", {})
+            if not cube_name or not bool(result.get("success", False)):
+                continue
+            tvec = result.get("tvec", None)
+            if tvec is None:
+                continue
+            tracks.setdefault(cube_name, []).append(
+                (frame_idx, np.asarray(tvec, dtype=np.float64).reshape(3) / 1000.0)
+            )
+    return tracks
+
+
+def make_track_segments(track: list[tuple[int, np.ndarray]]) -> np.ndarray:
+    if len(track) < 2:
+        return np.zeros((0, 2, 3), dtype=np.float32)
+    return np.asarray(
+        [[track[i][1], track[i + 1][1]] for i in range(len(track) - 1)],
+        dtype=np.float32,
+    )
+
+
 def create_3d_scene_handles(
     server: viser.ViserServer,
     estimator: ReplayPoseEstimator,
+    pose_cache: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
+    server.scene.set_up_direction("-y")
     server.scene.world_axes.visible = False
     server.scene.add_frame(
         "/world_thumb_web_camera",
@@ -848,12 +878,26 @@ def create_3d_scene_handles(
         z = i * grid_step
         grid_lines.append([[x, 0.0, -grid_half], [x, 0.0, grid_half]])
         grid_lines.append([[-grid_half, 0.0, z], [grid_half, 0.0, z]])
-    server.scene.add_line_segments(
+    grid_handle = server.scene.add_line_segments(
         "/world_thumb_web_camera/xz_grid_y0",
         points=np.asarray(grid_lines, dtype=np.float32),
         colors=(80, 80, 80),
         line_width=1.0,
         visible=False,
+    )
+    aspect = estimator.detect_img_size[0] / max(estimator.detect_img_size[1], 1)
+    first_camera = estimator.active_camera_names[0]
+    camera_matrix = estimator.detection_camera_matrix_by_camera[first_camera]
+    fy = float(camera_matrix[1, 1])
+    fov_y = float(2.0 * np.arctan(estimator.detect_img_size[1] / max(2.0 * fy, 1e-12)))
+    camera_frustum = server.scene.add_camera_frustum(
+        "/world_thumb_web_camera/frustum",
+        fov=fov_y,
+        aspect=aspect,
+        scale=0.08,
+        line_width=1.5,
+        color=(180, 180, 180),
+        visible=True,
     )
 
     palette = [
@@ -864,13 +908,21 @@ def create_3d_scene_handles(
         (255, 220, 80),
         (180, 180, 180),
     ]
-    handles: dict[str, dict[str, Any]] = {}
+    handles: dict[str, dict[str, Any]] = {
+        "__scene__": {
+            "grid": grid_handle,
+            "camera_frustum": camera_frustum,
+        }
+    }
+    tracks = cube_pose_tracks(pose_cache)
     color_idx = 0
     for camera_name in estimator.active_camera_names:
         for entry in estimator.detector_entries_by_camera.get(camera_name, []):
             cube_name = entry["cube_name"]
             detector = entry["detector"]
             node = cube_scene_node_name(cube_name)
+            safe = node.rsplit("/", 1)[-1]
+            track_node = f"/world_thumb_web_camera/pose_tracks/{safe}"
             dims_m = tuple(float(v) / 1000.0 for v in detector.config.box_dims)
             color = palette[color_idx % len(palette)]
             color_idx += 1
@@ -889,10 +941,67 @@ def create_3d_scene_handles(
                 side="double",
                 visible=False,
             )
+            track = tracks.get(cube_name, [])
+            track_segments = make_track_segments(track)
+            trajectory_handle = server.scene.add_line_segments(
+                f"{track_node}/trajectory",
+                points=track_segments,
+                colors=np.asarray(color, dtype=np.uint8),
+                line_width=2.0,
+                visible=track_segments.shape[0] > 0,
+            )
+            if track:
+                sample_points = np.asarray([pos for _idx, pos in track], dtype=np.float32)
+                sample_colors = np.tile(np.asarray(color, dtype=np.uint8), (len(track), 1))
+            else:
+                sample_points = np.zeros((0, 3), dtype=np.float32)
+                sample_colors = np.zeros((0, 3), dtype=np.uint8)
+            samples_handle = server.scene.add_point_cloud(
+                f"{track_node}/trajectory_samples",
+                points=sample_points,
+                colors=sample_colors,
+                point_size=0.004,
+                point_shape="circle",
+                visible=sample_points.shape[0] > 0,
+            )
+            marker_radius = max(max(dims_m) * 0.08, 0.0015)
+            current_handle = server.scene.add_icosphere(
+                f"{track_node}/current_position",
+                radius=marker_radius,
+                color=(255, 255, 255),
+                subdivisions=2,
+                visible=False,
+            )
+            start_handle = None
+            end_handle = None
+            if track:
+                _start_idx, start_pos = track[0]
+                _end_idx, end_pos = track[-1]
+                start_handle = server.scene.add_icosphere(
+                    f"{track_node}/track_start",
+                    radius=marker_radius,
+                    color=(40, 220, 80),
+                    subdivisions=2,
+                    position=start_pos,
+                    visible=True,
+                )
+                end_handle = server.scene.add_icosphere(
+                    f"{track_node}/track_end",
+                    radius=marker_radius,
+                    color=(240, 80, 80),
+                    subdivisions=2,
+                    position=end_pos,
+                    visible=True,
+                )
             handles[cube_name] = {
                 "frame": frame_handle,
                 "box": box_handle,
                 "base_color": color,
+                "trajectory": trajectory_handle,
+                "samples": samples_handle,
+                "current": current_handle,
+                "start": start_handle,
+                "end": end_handle,
             }
     return handles
 
@@ -904,14 +1013,19 @@ def update_3d_scene(
     seen: set[str] = set()
     for cube in pose_frame.get("cube_results", []):
         cube_name = str(cube.get("cube_name", ""))
+        if cube_name.startswith("__"):
+            continue
         result = cube.get("result", {})
         handles = scene_handles.get(cube_name)
         if handles is None:
             continue
         seen.add(cube_name)
         success = bool(result.get("success", False))
-        for key in ("frame", "box"):
-            handles[key].visible = success
+        handles["pose_visible"] = success
+        for key in ("frame", "box", "current"):
+            handle = handles.get(key)
+            if handle is not None:
+                handle.visible = success
         if not success:
             continue
 
@@ -920,6 +1034,7 @@ def update_3d_scene(
         wxyz = rvec_to_quat(rvec)
         handles["frame"].position = tvec_m
         handles["frame"].wxyz = wxyz
+        handles["current"].position = tvec_m
         handles["box"].color = (
             (255, 0, 0)
             if bool(result.get("temporal_filled", False))
@@ -927,10 +1042,49 @@ def update_3d_scene(
         )
 
     for cube_name, handles in scene_handles.items():
+        if cube_name.startswith("__"):
+            continue
         if cube_name in seen:
             continue
-        for key in ("frame", "box"):
-            handles[key].visible = False
+        handles["pose_visible"] = False
+        for key in ("frame", "box", "current"):
+            handle = handles.get(key)
+            if handle is not None:
+                handle.visible = False
+
+
+def set_optional_visible(handle: Any, visible: bool) -> None:
+    if handle is not None:
+        handle.visible = bool(visible)
+
+
+def apply_3d_visibility(
+    scene_handles: dict[str, dict[str, Any]],
+    *,
+    show_box: bool,
+    show_axes: bool,
+    show_trajectory: bool,
+    show_samples: bool,
+    show_endpoints: bool,
+    show_grid: bool,
+    show_camera: bool,
+) -> None:
+    scene = scene_handles.get("__scene__", {})
+    set_optional_visible(scene.get("grid"), show_grid)
+    set_optional_visible(scene.get("camera_frustum"), show_camera)
+    for cube_name, handles in scene_handles.items():
+        if cube_name.startswith("__"):
+            continue
+        pose_visible = bool(handles.get("pose_visible", False))
+        if "box" in handles:
+            handles["box"].visible = bool(show_box) and pose_visible
+        if "frame" in handles:
+            handles["frame"].visible = bool(show_axes) and pose_visible
+        set_optional_visible(handles.get("current"), show_trajectory and pose_visible)
+        set_optional_visible(handles.get("trajectory"), show_trajectory)
+        set_optional_visible(handles.get("samples"), show_samples)
+        set_optional_visible(handles.get("start"), show_endpoints)
+        set_optional_visible(handles.get("end"), show_endpoints)
 
 
 def precompute_pose_cache(
@@ -1459,6 +1613,50 @@ def pose_result_smoothing_weight(result: dict[str, Any], frame_distance: int) ->
     return time_weight * quality_weight
 
 
+def pose_reprojection_errors_for_result(
+    result: dict[str, Any],
+    detector: Any,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+) -> tuple[float, dict[int, float]] | None:
+    detections = result.get("detections", [])
+    if not detections:
+        return None
+
+    object_chunks = []
+    image_chunks = []
+    tag_ids = []
+    for tag_id, corners_2d in detections:
+        corners_3d = detector.tag_corner_map.get(int(tag_id))
+        if corners_3d is None:
+            continue
+        object_chunks.append(np.asarray(corners_3d, dtype=np.float64).reshape(4, 3))
+        image_chunks.append(np.asarray(corners_2d, dtype=np.float64).reshape(4, 2))
+        tag_ids.append(int(tag_id))
+    if not object_chunks:
+        return None
+
+    object_points = np.vstack(object_chunks).astype(np.float64)
+    image_points = np.vstack(image_chunks).astype(np.float64)
+    projected, _ = cv2.projectPoints(
+        object_points,
+        np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+        detector.camera_matrix,
+        detector.dist_coeffs,
+    )
+    projected = projected.reshape(-1, 2)
+    per_tag: dict[int, float] = {}
+    for k, tag_id in enumerate(tag_ids):
+        start = k * 4
+        end = start + 4
+        per_tag[tag_id] = float(np.mean(np.linalg.norm(
+            image_points[start:end] - projected[start:end],
+            axis=1,
+        )))
+    return float(np.mean(list(per_tag.values()))), per_tag
+
+
 def weighted_average_quats(
     quats: list[np.ndarray],
     weights: list[float],
@@ -1554,9 +1752,49 @@ def smooth_pose_cache_temporally(
                 rvec = quat_to_rvec(q_limited)
 
                 target_result = cube.get("result", {})
+                detector = estimator.detector_by_camera_cube.get((camera_name, cube_name))
+                reproj_eval = (
+                    None
+                    if detector is None
+                    else pose_reprojection_errors_for_result(source_result, detector, rvec, tvec)
+                )
+                if reproj_eval is not None:
+                    smoothed_reproj, _smoothed_per_tag = reproj_eval
+                    source_reproj = float(source_result.get("reproj_error", smoothed_reproj))
+                    max_allowed_reproj = max(
+                        TEMPORAL_SMOOTHING_MAX_DISPLAY_REPROJ_PX,
+                        source_reproj * TEMPORAL_SMOOTHING_MAX_REPROJ_RATIO,
+                    )
+                    if smoothed_reproj > max_allowed_reproj:
+                        target_result["temporal_smoothing_rejected"] = True
+                        target_result["temporal_smoothing_reject_reason"] = (
+                            "display_reprojection_too_high"
+                        )
+                        target_result["temporal_smoothing_candidate_reproj_error"] = float(
+                            smoothed_reproj
+                        )
+                        target_result["temporal_smoothing_max_allowed_reproj_error"] = float(
+                            max_allowed_reproj
+                        )
+                        continue
+
                 target_result["tvec"] = tvec
                 target_result["rvec"] = rvec
                 target_result["T"] = pose_transform_from_rvec_tvec(rvec, tvec)
+                if reproj_eval is not None:
+                    smoothed_reproj, smoothed_per_tag = reproj_eval
+                    if "reproj_error_before_smoothing" not in target_result:
+                        target_result["reproj_error_before_smoothing"] = target_result.get(
+                            "reproj_error",
+                            None,
+                        )
+                    if "per_tag_reproj_error_before_smoothing" not in target_result:
+                        target_result["per_tag_reproj_error_before_smoothing"] = target_result.get(
+                            "per_tag_reproj_error",
+                            None,
+                        )
+                    target_result["reproj_error"] = float(smoothed_reproj)
+                    target_result["per_tag_reproj_error"] = smoothed_per_tag
                 target_result["temporal_smoothed"] = True
                 target_result["temporal_smoothing_source_count"] = int(len(samples))
                 target_result["temporal_smoothing_window_radius"] = int(window_radius)
@@ -1732,8 +1970,10 @@ def make_pose_cache_key(
         "temporal_rotation_jump_max_deg": float(TEMPORAL_ROTATION_JUMP_MAX_DEG),
         "temporal_rotation_jump_hold_deg": float(TEMPORAL_ROTATION_JUMP_HOLD_DEG),
         "temporal_rotation_jump_limit_version": int(TEMPORAL_ROTATION_JUMP_LIMIT_VERSION),
-        "fisheye_rectified_horizontal_fov_deg": float(
-            getattr(demo008, "FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG", 0.0)
+        "fisheye_rectified_horizontal_fov_deg": (
+            None
+            if getattr(demo008, "FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG", None) is None
+            else float(getattr(demo008, "FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG"))
         ),
     }
 
@@ -2017,7 +2257,7 @@ def main() -> None:
     )
 
     server = viser.ViserServer(host=args.host, port=int(args.port))
-    scene_handles = create_3d_scene_handles(server, estimator)
+    scene_handles = create_3d_scene_handles(server, estimator, pose_cache)
     update_3d_scene(scene_handles, pose_cache[0])
 
     with server.gui.add_folder("Detector Input TagPose"):
@@ -2058,6 +2298,14 @@ def main() -> None:
             jpeg_quality=int(args.jpeg_quality),
         )
 
+    with server.gui.add_folder("3D View"):
+        show_box_checkbox = server.gui.add_checkbox("Cube box", initial_value=True)
+        show_axes_checkbox = server.gui.add_checkbox("Cube axes", initial_value=True)
+        show_trajectory_checkbox = server.gui.add_checkbox("Trajectory", initial_value=True)
+        show_samples_checkbox = server.gui.add_checkbox("Pose samples", initial_value=True)
+        show_endpoints_checkbox = server.gui.add_checkbox("Start/end points", initial_value=True)
+        show_camera_checkbox = server.gui.add_checkbox("Camera frustum", initial_value=True)
+
     with server.gui.add_folder("Replay Metadata"):
         server.gui.add_text("PKL", initial_value=str(pkl_path), disabled=True)
         if isinstance(metadata, dict):
@@ -2081,6 +2329,16 @@ def main() -> None:
     current_idx = -1
     last_auto_play_step = time.monotonic()
     while True:
+        apply_3d_visibility(
+            scene_handles,
+            show_box=bool(show_box_checkbox.value),
+            show_axes=bool(show_axes_checkbox.value),
+            show_trajectory=bool(show_trajectory_checkbox.value),
+            show_samples=bool(show_samples_checkbox.value),
+            show_endpoints=bool(show_endpoints_checkbox.value),
+            show_grid=False,
+            show_camera=bool(show_camera_checkbox.value),
+        )
         if bool(auto_play_checkbox.value):
             now = time.monotonic()
             if now - last_auto_play_step >= 0.1:
@@ -2113,6 +2371,16 @@ def main() -> None:
                 status_text.value = record_summary(record, slider_idx, total_frames)
                 pose_text.content = pose_markdown(pose_cache[slider_idx])
                 update_3d_scene(scene_handles, pose_cache[slider_idx])
+                apply_3d_visibility(
+                    scene_handles,
+                    show_box=bool(show_box_checkbox.value),
+                    show_axes=bool(show_axes_checkbox.value),
+                    show_trajectory=bool(show_trajectory_checkbox.value),
+                    show_samples=bool(show_samples_checkbox.value),
+                    show_endpoints=bool(show_endpoints_checkbox.value),
+                    show_grid=False,
+                    show_camera=bool(show_camera_checkbox.value),
+                )
                 current_idx = slider_idx
             except Exception as exc:
                 status_text.value = f"Failed to load frame {slider_idx}: {type(exc).__name__}: {exc}"
