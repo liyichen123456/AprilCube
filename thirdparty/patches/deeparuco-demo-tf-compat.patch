@@ -1,0 +1,44 @@
+diff --git a/demo.py b/demo.py
+index 5c8ebf5..ddd8ce9 100644
+--- a/demo.py
++++ b/demo.py
+@@ -7,11 +7,20 @@ from impl.aruco import find_id
+ from impl.heatmaps import pos_from_heatmap
+ from impl.losses import weighted_loss
+ from impl.utils import marker_from_corners, ordered_corners
++from tensorflow.keras.layers import Conv2DTranspose
+ from tensorflow.keras.models import load_model
+ from ultralytics import YOLO
+ 
+ norm = lambda x: (x - np.min(x)) / (np.max(x) - np.min(x) + 1e-9)
+ 
++
++class Conv2DTransposeCompat(Conv2DTranspose):
++    @classmethod
++    def from_config(cls, config):
++        config = dict(config)
++        config.pop("groups", None)
++        return super().from_config(config)
++
+ if __name__ == "__main__":
+     parser = ArgumentParser(description="DeepArUco v2 demo tool.")
+     parser.add_argument("pic_path", help="input image path")
+@@ -50,11 +59,16 @@ if __name__ == "__main__":
+     # Load models
+ 
+     detector = YOLO(f"{model_dir}/{args.detector}.pt")
++    custom_objects = {
++        "Conv2DTranspose": Conv2DTransposeCompat,
++        "weighted_loss": weighted_loss,
++    }
+     regressor = load_model(
+         f"{model_dir}/{args.regressor}.h5",
+-        custom_objects={"weighted_loss": weighted_loss},
++        custom_objects=custom_objects,
++        compile=False,
+     )
+-    decoder = load_model(f"{model_dir}/dec_new.h5")
++    decoder = load_model(f"{model_dir}/dec_new.h5", custom_objects=custom_objects, compile=False)
+ 
+     # Use graph execution for tf models
+ 
