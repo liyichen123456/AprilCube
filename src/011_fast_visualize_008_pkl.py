@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import importlib
 import importlib.util
@@ -16,16 +15,45 @@ import viser
 from PIL import Image
 
 THIS_FILE = Path(__file__).resolve()
-DEFAULT_RECORDING_DIR = THIS_FILE.parent.parent / "recordings"
-VISER_HOST = "0.0.0.0"
-VISER_PORT = 8091
 DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect_multi_cube.py"
 ASSETS_DIR = THIS_FILE.parent.parent / "assets"
 OBJ_MESH_SCALE = 0.001
+
+# ============================================================
+# User macros
+# Defaults reproduce 008_raw_frames_20260710_230819_15mm_cube_middle_finger.pkl.
+# ============================================================
+
+PKL_PATH = Path(
+    "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/recordings/"
+    "008_raw_frames_20260710_230819_15mm_cube_middle_finger.pkl"
+)
+# Camera names, intrinsics, cube cfgs, and undistortion settings come from the PKL header.
+PINHOLE_UNDISTORT_ALPHA = 0.0
+ADAPTIVE_CLAHE_DETECTION = True
+FAST_DETECTOR = True
+ENABLE_RUNTIME_POSE_FILTER = False
+SHARED_TAG_DETECTION = False
+ENABLE_TEMPORAL_POSTPROCESS = False
+RECOMPUTE_POSE = False
+PRECOMPUTE_ONLY = False
+
+VISER_HOST = "0.0.0.0"
+VISER_PORT = 8092
+VISER_MAX_IMAGE_WIDTH = 960  # 0 keeps the original image size.
+VISER_JPEG_QUALITY = 85
+
 POSE_CACHE_FORMAT = "aprilcube_008_pose_cache_v1"
-INLINE_POSE_FRAME_FIELD = "offline_pose_frame"
-INLINE_POSE_CACHE_KEY_FIELD = "offline_pose_cache_key"
-IMAGE_RECOVERY_VERSION = 9
+POSE_CACHE_FORMAT_020_MULTISTAGE = "aprilcube_020_multistage_008_pose_v1"
+OFFLINE_POS_FRAME_FIELD = "offline_pos"
+OFFLINE_POS_CACHE_KEY_FIELD = "offline_pos_cache_key"
+LEGACY_INLINE_POSE_FRAME_FIELD = "offline_pose_frame"
+LEGACY_INLINE_POSE_CACHE_KEY_FIELD = "offline_pose_cache_key"
+IMAGE_RECOVERY_VERSION = 10
+SINGLE_TAG_FACE_FRAME_SOLVER_VERSION = 1
+SINGLE_TAG_FACE_FRAME_MAX_REPROJ_PX = 5.0
+SINGLE_TAG_FACE_FRAME_REPROJ_TIE_PX = 1.0
+SINGLE_TAG_FACE_FRAME_LM_REFINE = True
 SINGLE_TAG_CONTINUITY_GATE_ENABLED = True
 SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG = 45.0
 SINGLE_TAG_CONTINUITY_MIN_FACE_OBSERVATIONS = 2
@@ -92,14 +120,8 @@ def load_demo008_module() -> Any:
     return module
 
 
-def resolve_pkl_path(path_str: str | None) -> Path:
-    if path_str is None:
-        candidates = sorted(DEFAULT_RECORDING_DIR.glob("008_raw_frames_*.pkl"))
-        if not candidates:
-            raise FileNotFoundError(f"No 008_raw_frames_*.pkl found in {DEFAULT_RECORDING_DIR}")
-        return candidates[-1].resolve()
-
-    path = Path(path_str).expanduser().resolve()
+def resolve_pkl_path(path_value: str | Path) -> Path:
+    path = Path(path_value).expanduser().resolve()
     if path.is_dir():
         candidates = sorted(path.glob("008_raw_frames_*.pkl"))
         if not candidates:
@@ -133,14 +155,19 @@ def build_frame_index(
     dict[str, Any] | None,
     dict[str, Any] | None,
     dict[str, Any] | None,
+    dict[str, Any] | None,
 ]:
     header: dict[str, Any] | None = None
     footer: dict[str, Any] | None = None
     pose_cache_record: dict[str, Any] | None = None
-    inline_pose_cache_key: dict[str, Any] | None = None
-    inline_pose_cache: list[dict[str, Any] | None] = []
-    inline_pose_cache_complete = True
-    inline_pose_cache_keys_match = True
+    offline_pos_cache_key: dict[str, Any] | None = None
+    offline_pos_cache: list[dict[str, Any] | None] = []
+    offline_pos_cache_complete = True
+    offline_pos_cache_keys_match = True
+    legacy_inline_pose_cache_key: dict[str, Any] | None = None
+    legacy_inline_pose_cache: list[dict[str, Any] | None] = []
+    legacy_inline_pose_cache_complete = True
+    legacy_inline_pose_cache_keys_match = True
     frame_offsets: list[int] = []
     file_size = path.stat().st_size
     last_print = time.monotonic()
@@ -160,17 +187,32 @@ def build_frame_index(
                 header = record
             elif record_type == "frame":
                 frame_offsets.append(offset)
-                inline_pose_frame = record.get(INLINE_POSE_FRAME_FIELD, None)
-                inline_key = record.get(INLINE_POSE_CACHE_KEY_FIELD, None)
-                if isinstance(inline_pose_frame, dict) and isinstance(inline_key, dict):
-                    inline_pose_cache.append(inline_pose_frame)
-                    if inline_pose_cache_key is None:
-                        inline_pose_cache_key = inline_key
-                    elif inline_pose_cache_key != inline_key:
-                        inline_pose_cache_keys_match = False
+                offline_pos = record.get(OFFLINE_POS_FRAME_FIELD, None)
+                offline_pos_key = record.get(OFFLINE_POS_CACHE_KEY_FIELD, None)
+                if isinstance(offline_pos, dict) and isinstance(offline_pos_key, dict):
+                    offline_pos_cache.append(offline_pos)
+                    if offline_pos_cache_key is None:
+                        offline_pos_cache_key = offline_pos_key
+                    elif offline_pos_cache_key != offline_pos_key:
+                        offline_pos_cache_keys_match = False
                 else:
-                    inline_pose_cache.append(None)
-                    inline_pose_cache_complete = False
+                    offline_pos_cache.append(None)
+                    offline_pos_cache_complete = False
+
+                legacy_inline_pose = record.get(LEGACY_INLINE_POSE_FRAME_FIELD, None)
+                legacy_inline_key = record.get(
+                    LEGACY_INLINE_POSE_CACHE_KEY_FIELD,
+                    None,
+                )
+                if isinstance(legacy_inline_pose, dict) and isinstance(legacy_inline_key, dict):
+                    legacy_inline_pose_cache.append(legacy_inline_pose)
+                    if legacy_inline_pose_cache_key is None:
+                        legacy_inline_pose_cache_key = legacy_inline_key
+                    elif legacy_inline_pose_cache_key != legacy_inline_key:
+                        legacy_inline_pose_cache_keys_match = False
+                else:
+                    legacy_inline_pose_cache.append(None)
+                    legacy_inline_pose_cache_complete = False
             elif record_type == "footer":
                 footer = record
             elif record_type == "pose_cache":
@@ -182,20 +224,40 @@ def build_frame_index(
                 last_print = now
 
     print_index_progress(file_size, file_size, force_newline=True)
-    inline_pose_cache_record = None
+    offline_pos_cache_record = None
     if (
-        inline_pose_cache_complete
-        and inline_pose_cache_keys_match
-        and inline_pose_cache_key is not None
-        and len(inline_pose_cache) == len(frame_offsets)
+        offline_pos_cache_complete
+        and offline_pos_cache_keys_match
+        and offline_pos_cache_key is not None
+        and len(offline_pos_cache) == len(frame_offsets)
     ):
-        inline_pose_cache_record = {
+        offline_pos_cache_record = {
             "type": "pose_cache",
             "format": POSE_CACHE_FORMAT,
-            "key": inline_pose_cache_key,
-            "pose_cache": inline_pose_cache,
+            "key": offline_pos_cache_key,
+            "pose_cache": offline_pos_cache,
         }
-    return header, frame_offsets, footer, pose_cache_record, inline_pose_cache_record
+    legacy_inline_pose_cache_record = None
+    if (
+        legacy_inline_pose_cache_complete
+        and legacy_inline_pose_cache_keys_match
+        and legacy_inline_pose_cache_key is not None
+        and len(legacy_inline_pose_cache) == len(frame_offsets)
+    ):
+        legacy_inline_pose_cache_record = {
+            "type": "pose_cache",
+            "format": POSE_CACHE_FORMAT,
+            "key": legacy_inline_pose_cache_key,
+            "pose_cache": legacy_inline_pose_cache,
+        }
+    return (
+        header,
+        frame_offsets,
+        footer,
+        pose_cache_record,
+        offline_pos_cache_record,
+        legacy_inline_pose_cache_record,
+    )
 
 
 def load_frame_at_offset(path: Path, offset: int) -> dict[str, Any]:
@@ -255,6 +317,272 @@ def print_pose_progress(done: int, total: int, *, force_newline: bool = False) -
         sys.stdout.flush()
 
 
+def face_name_for_tag(face_id_sets: dict[str, set[int]], tag_id: int) -> str | None:
+    for face_name, tag_ids in face_id_sets.items():
+        if int(tag_id) in tag_ids:
+            return str(face_name)
+    return None
+
+
+def face_normal_for_name(face_name: str | None) -> np.ndarray | None:
+    if face_name is None:
+        return None
+    from aprilcube.generate import FACE_DEFS
+
+    for definition in FACE_DEFS:
+        if definition[0] != face_name:
+            continue
+        normal = np.zeros(3, dtype=np.float64)
+        normal[int(definition[1])] = float(definition[2])
+        return normal
+    return None
+
+
+def build_tag_face_frame(
+    cube_corners: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    corners = np.asarray(cube_corners, dtype=np.float64).reshape(4, 3)
+    center_cube = np.mean(corners, axis=0)
+    x_axis = corners[1] - corners[0]
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm < 1e-9:
+        return None
+    x_axis /= x_norm
+
+    y_axis = corners[3] - corners[0]
+    y_axis -= x_axis * float(np.dot(y_axis, x_axis))
+    y_norm = float(np.linalg.norm(y_axis))
+    if y_norm < 1e-9:
+        return None
+    y_axis /= y_norm
+
+    z_axis = np.cross(x_axis, y_axis)
+    z_norm = float(np.linalg.norm(z_axis))
+    if z_norm < 1e-9:
+        return None
+    z_axis /= z_norm
+
+    rotation_cube_from_face = np.column_stack((x_axis, y_axis, z_axis))
+    corners_face = (corners - center_cube) @ rotation_cube_from_face
+    corners_face[:, 2] = 0.0
+    return center_cube, rotation_cube_from_face, corners_face
+
+
+def pose_continuity_cost(
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    prev_rvec: np.ndarray | None,
+    prev_tvec: np.ndarray | None,
+) -> float:
+    if prev_rvec is None or prev_tvec is None:
+        return 0.0
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    prev_rotation, _ = cv2.Rodrigues(
+        np.asarray(prev_rvec, dtype=np.float64).reshape(3, 1)
+    )
+    angle = np.arccos(
+        np.clip((np.trace(prev_rotation.T @ rotation) - 1.0) / 2.0, -1.0, 1.0)
+    )
+    translation_delta = float(
+        np.linalg.norm(
+            np.asarray(tvec, dtype=np.float64).reshape(3)
+            - np.asarray(prev_tvec, dtype=np.float64).reshape(3)
+        )
+    )
+    return min(translation_delta / 20.0, 20.0) + min(
+        float(np.degrees(angle)) / 10.0,
+        20.0,
+    )
+
+
+def estimate_single_tag_cube_pose_via_face_frame(
+    detections: list[tuple[int, np.ndarray]],
+    tag_corner_map: dict[int, np.ndarray],
+    face_id_sets: dict[str, set[int]],
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    prev_rvec: np.ndarray | None = None,
+    prev_tvec: np.ndarray | None = None,
+    allow_corner_rotations: bool = False,
+) -> tuple[
+    bool,
+    np.ndarray | None,
+    np.ndarray | None,
+    float,
+    np.ndarray | None,
+    dict[str, Any],
+]:
+    """Solve a tag-local planar pose, then compose it back to the cube frame."""
+    candidates: list[dict[str, Any]] = []
+    raw_candidate_count = 0
+    for tag_id, corners_2d_value in detections:
+        base_cube_corners = tag_corner_map.get(int(tag_id))
+        if base_cube_corners is None:
+            continue
+        corners_2d = np.asarray(corners_2d_value, dtype=np.float64).reshape(4, 2)
+        face_name = face_name_for_tag(face_id_sets, int(tag_id))
+        outward_normal_cube = face_normal_for_name(face_name)
+        rotations = range(4) if allow_corner_rotations else range(1)
+
+        for corner_rotation in rotations:
+            cube_corners = np.roll(
+                np.asarray(base_cube_corners, dtype=np.float64).reshape(4, 3),
+                -int(corner_rotation),
+                axis=0,
+            )
+            face_frame = build_tag_face_frame(cube_corners)
+            if face_frame is None:
+                continue
+            center_cube, rotation_cube_from_face, corners_face = face_frame
+            try:
+                retval, face_rvecs, face_tvecs, _errors = cv2.solvePnPGeneric(
+                    corners_face,
+                    corners_2d,
+                    camera_matrix,
+                    dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE,
+                )
+            except cv2.error:
+                retval, face_rvecs, face_tvecs = 0, (), ()
+            if not retval:
+                continue
+
+            for face_rvec_value, face_tvec_value in zip(face_rvecs, face_tvecs):
+                raw_candidate_count += 1
+                face_rvec = np.asarray(face_rvec_value, dtype=np.float64).reshape(3, 1)
+                face_tvec = np.asarray(face_tvec_value, dtype=np.float64).reshape(3, 1)
+                lm_refined = False
+                if SINGLE_TAG_FACE_FRAME_LM_REFINE:
+                    try:
+                        face_rvec, face_tvec = cv2.solvePnPRefineLM(
+                            corners_face,
+                            corners_2d,
+                            camera_matrix,
+                            dist_coeffs,
+                            face_rvec,
+                            face_tvec,
+                        )
+                        lm_refined = True
+                    except cv2.error:
+                        pass
+
+                rotation_camera_from_face, _ = cv2.Rodrigues(face_rvec)
+                rotation_camera_from_cube = (
+                    rotation_camera_from_face @ rotation_cube_from_face.T
+                )
+                translation_camera_from_cube = (
+                    face_tvec
+                    - rotation_camera_from_cube @ center_cube.reshape(3, 1)
+                )
+                if float(translation_camera_from_cube[2, 0]) <= 0.0:
+                    continue
+                if (
+                    outward_normal_cube is not None
+                    and float((rotation_camera_from_cube @ outward_normal_cube)[2]) > 0.0
+                ):
+                    continue
+
+                cube_rvec, _ = cv2.Rodrigues(rotation_camera_from_cube)
+                projected, _ = cv2.projectPoints(
+                    cube_corners,
+                    cube_rvec,
+                    translation_camera_from_cube,
+                    camera_matrix,
+                    dist_coeffs,
+                )
+                reproj_error = float(
+                    np.mean(
+                        np.linalg.norm(
+                            corners_2d - projected.reshape(-1, 2),
+                            axis=1,
+                        )
+                    )
+                )
+                if (
+                    not np.isfinite(reproj_error)
+                    or reproj_error > SINGLE_TAG_FACE_FRAME_MAX_REPROJ_PX
+                ):
+                    continue
+                candidates.append(
+                    {
+                        "rvec": cube_rvec,
+                        "tvec": translation_camera_from_cube,
+                        "reproj_error": reproj_error,
+                        "continuity_cost": pose_continuity_cost(
+                            cube_rvec,
+                            translation_camera_from_cube,
+                            prev_rvec,
+                            prev_tvec,
+                        ),
+                        "tag_id": int(tag_id),
+                        "face_name": face_name,
+                        "corner_rotation": int(corner_rotation),
+                        "lm_refined": lm_refined,
+                    }
+                )
+
+    if not candidates:
+        return False, None, None, float("inf"), None, {
+            "single_tag_face_frame_pose": True,
+            "single_tag_face_frame_raw_candidate_count": raw_candidate_count,
+        }
+
+    best_reproj_error = min(float(candidate["reproj_error"]) for candidate in candidates)
+    near_best = [
+        candidate
+        for candidate in candidates
+        if float(candidate["reproj_error"])
+        <= best_reproj_error + SINGLE_TAG_FACE_FRAME_REPROJ_TIE_PX
+    ]
+    if prev_rvec is not None and prev_tvec is not None:
+        selected = min(
+            near_best,
+            key=lambda candidate: (
+                float(candidate["continuity_cost"]),
+                float(candidate["reproj_error"]),
+            ),
+        )
+    else:
+        selected = min(near_best, key=lambda candidate: float(candidate["reproj_error"]))
+
+    inliers = np.arange(4, dtype=np.int32).reshape(-1, 1)
+    return (
+        True,
+        selected["rvec"],
+        selected["tvec"],
+        float(selected["reproj_error"]),
+        inliers,
+        {
+            "single_tag_id": int(selected["tag_id"]),
+            "single_tag_face": selected["face_name"],
+            "single_tag_candidate_count": len(candidates),
+            "single_tag_corner_rotation_deg": int(selected["corner_rotation"]) * 90,
+            "single_tag_face_frame_pose": True,
+            "single_tag_face_frame_lm_refined": bool(selected["lm_refined"]),
+            "single_tag_face_frame_raw_candidate_count": raw_candidate_count,
+            "single_tag_face_frame_near_best_count": len(near_best),
+            "single_tag_face_frame_best_reproj_error": best_reproj_error,
+        },
+    )
+
+
+def process_detections_with_face_frame_solver(
+    detector: Any,
+    image: np.ndarray,
+    tag_detections: list[tuple[int, np.ndarray]],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Use the 011-only face-frame solver without changing other entry points."""
+    from aprilcube import detect as detect_mod
+
+    original_solver = detect_mod.estimate_single_tag_cube_pose
+    detect_mod.estimate_single_tag_cube_pose = estimate_single_tag_cube_pose_via_face_frame
+    try:
+        return detector.process_detections(image, tag_detections, **kwargs)
+    finally:
+        detect_mod.estimate_single_tag_cube_pose = original_solver
+
+
 def result_copy_for_replay(result: dict[str, Any]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     for key in (
@@ -274,6 +602,13 @@ def result_copy_for_replay(result: dict[str, Any]) -> dict[str, Any]:
         "single_tag_id",
         "single_tag_face",
         "single_tag_candidate_count",
+        "single_tag_corner_rotation_deg",
+        "single_tag_face_frame_pose",
+        "single_tag_face_frame_lm_refined",
+        "single_tag_face_frame_raw_candidate_count",
+        "single_tag_face_frame_near_best_count",
+        "single_tag_face_frame_best_reproj_error",
+        "failure_reason",
         "temporal_filled",
         "temporal_fill_source",
         "temporal_fill_alpha",
@@ -545,7 +880,8 @@ class ReplayPoseEstimator:
             if self.shared_tag_detection:
                 cube_tags = shared_tags
                 assert cube_tags is not None
-                result = detector.process_detections(
+                result = process_detections_with_face_frame_solver(
+                    detector,
                     detect_frame,
                     cube_tags["detections"],
                     rejected_quads=cube_tags["rejected"],
@@ -570,7 +906,10 @@ class ReplayPoseEstimator:
             result = result_copy_for_replay(result)
             result["decoded_tags_this_cube_pass"] = len(cube_tags["detections"])
             result["clahe_recovery_mode"] = recovery_mode
-            status_lines.append(self.demo008.result_to_text(camera_name, cube_name, result))
+            result_text = self.demo008.result_to_text(camera_name, cube_name, result)
+            if result.get("single_tag_face_frame_pose", False):
+                result_text += " face_frame_ippe"
+            status_lines.append(result_text)
             cube_results.append(
                 {
                     "cube_name": cube_name,
@@ -601,7 +940,8 @@ class ReplayPoseEstimator:
     ) -> tuple[dict[str, Any], dict[str, Any], str]:
         state_before = snapshot_detector_tracking_state(detector)
         base_tags = detector.detect_tags(detect_frame, adaptive_clahe=False)
-        base_result = detector.process_detections(
+        base_result = process_detections_with_face_frame_solver(
+            detector,
             detect_frame,
             base_tags["detections"],
             rejected_quads=base_tags["rejected"],
@@ -640,7 +980,8 @@ class ReplayPoseEstimator:
                 adaptive_clahe=True,
                 enhancement_variants=(dict(variant),),
             )
-            candidate_result = detector.process_detections(
+            candidate_result = process_detections_with_face_frame_solver(
+                detector,
                 detect_frame,
                 candidate_tags["detections"],
                 rejected_quads=candidate_tags["rejected"],
@@ -732,7 +1073,8 @@ class ReplayPoseEstimator:
         vis = base_frame.copy()
         for cube in pose_frame["cube_results"]:
             detector = self.detector_by_camera_cube[(camera_name, cube["cube_name"])]
-            vis = detector.draw_result(vis, cube["result"])
+            result = self.normalize_result_for_draw(cube.get("result", {}))
+            vis = detector.draw_result(vis, result)
         vis = self.demo008.draw_text_panel(vis, pose_frame["status_lines"])
         temporal_cubes = self.temporal_filled_cube_names(pose_frame)
         if temporal_cubes:
@@ -744,6 +1086,21 @@ class ReplayPoseEstimator:
         if not self.pose_frame_has_all_cube_pose(camera_name, pose_frame):
             return self.draw_red_alert_box(vis, "INCOMPLETE CUBE POSE")
         return vis
+
+    @staticmethod
+    def normalize_result_for_draw(result: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(result or {})
+        normalized.setdefault("success", False)
+        normalized.setdefault("detections", [])
+        normalized.setdefault("visible_faces", set())
+        normalized.setdefault("n_tags", 0)
+        normalized.setdefault("reproj_error", float("inf"))
+        for key in ("rvec", "tvec"):
+            if normalized.get(key) is not None and not isinstance(normalized[key], np.ndarray):
+                normalized[key] = np.asarray(normalized[key], dtype=np.float64).reshape(3, 1)
+        if normalized.get("T") is not None and not isinstance(normalized["T"], np.ndarray):
+            normalized["T"] = np.asarray(normalized["T"], dtype=np.float64).reshape(4, 4)
+        return normalized
 
     @staticmethod
     def draw_red_alert_box(
@@ -2034,6 +2391,7 @@ def make_pose_cache_key(
     shared_tag_detection: bool,
     enable_filter: bool,
     fast: bool,
+    temporal_postprocess_enabled: bool,
     demo008: Any,
 ) -> dict[str, Any]:
     return {
@@ -2047,9 +2405,20 @@ def make_pose_cache_key(
         "use_undistort": bool(use_undistort),
         "adaptive_clahe": bool(adaptive_clahe),
         "image_recovery_version": int(IMAGE_RECOVERY_VERSION),
+        "single_tag_face_frame_solver_version": int(
+            SINGLE_TAG_FACE_FRAME_SOLVER_VERSION
+        ),
+        "single_tag_face_frame_max_reproj_px": float(
+            SINGLE_TAG_FACE_FRAME_MAX_REPROJ_PX
+        ),
+        "single_tag_face_frame_reproj_tie_px": float(
+            SINGLE_TAG_FACE_FRAME_REPROJ_TIE_PX
+        ),
+        "single_tag_face_frame_lm_refine": bool(SINGLE_TAG_FACE_FRAME_LM_REFINE),
         "shared_tag_detection": bool(shared_tag_detection),
         "enable_filter": bool(enable_filter),
         "fast": bool(fast),
+        "temporal_postprocess_enabled": bool(temporal_postprocess_enabled),
         "single_tag_continuity_gate_enabled": bool(SINGLE_TAG_CONTINUITY_GATE_ENABLED),
         "single_tag_continuity_max_rotation_deg": float(
             SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG
@@ -2096,12 +2465,21 @@ def make_pose_cache_key(
 def load_cached_pose_cache(
     pose_cache_record: dict[str, Any] | None,
     expected_key: dict[str, Any],
+    *,
+    allow_temporal_postprocess_mismatch: bool = False,
 ) -> tuple[list[dict[str, Any]], bool] | None:
     if not isinstance(pose_cache_record, dict):
         return None
     if pose_cache_record.get("format") != POSE_CACHE_FORMAT:
         return None
     record_key = pose_cache_record.get("key")
+    if isinstance(record_key, dict) and record_key.get("format") == POSE_CACHE_FORMAT_020_MULTISTAGE:
+        if not bool(expected_key.get("temporal_postprocess_enabled", True)):
+            return None
+        pose_cache = pose_cache_record.get("pose_cache", None)
+        if isinstance(pose_cache, list) and len(pose_cache) == int(expected_key["frame_count"]):
+            return pose_cache, True
+        return None
     exact_match = record_key == expected_key
     if not exact_match and isinstance(record_key, dict):
         stable_record_key = {
@@ -2139,6 +2517,8 @@ def load_cached_pose_cache(
             "temporal_rotation_jump_hold_deg",
             "temporal_rotation_jump_limit_version",
         }
+        if allow_temporal_postprocess_mismatch:
+            temporal_keys.add("temporal_postprocess_enabled")
         stripped_record_key = {
             key: value for key, value in record_key.items() if key not in temporal_keys
         }
@@ -2179,8 +2559,8 @@ def write_pose_cache_into_pkl_frames(
                         raise ValueError(
                             f"PKL has more frame records than pose cache entries: >{len(pose_cache)}"
                         )
-                    record[INLINE_POSE_FRAME_FIELD] = pose_cache[frame_idx]
-                    record[INLINE_POSE_CACHE_KEY_FIELD] = cache_key
+                    record[OFFLINE_POS_FRAME_FIELD] = pose_cache[frame_idx]
+                    record[OFFLINE_POS_CACHE_KEY_FIELD] = cache_key
                     frame_idx += 1
 
                 pickle.dump(record, dst, protocol=pickle.HIGHEST_PROTOCOL)
@@ -2196,81 +2576,18 @@ def write_pose_cache_into_pkl_frames(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Visualize 008 raw-frame PKL with a Viser sidebar frame slider."
-    )
-    parser.add_argument(
-        "pkl_path",
-        nargs="?",
-        default=None,
-        help="Path to 008_raw_frames_*.pkl, or directory containing such files. Defaults to latest recording.",
-    )
-    parser.add_argument("--host", type=str, default=VISER_HOST, help="Viser server host.")
-    parser.add_argument("--port", type=int, default=VISER_PORT, help="Viser server port.")
-    parser.add_argument(
-        "--max-width",
-        type=int,
-        default=1600,
-        help="Resize displayed image to this max width. Use 0 for original size.",
-    )
-    parser.add_argument(
-        "--jpeg-quality",
-        type=int,
-        default=85,
-        help="JPEG quality for Viser GUI image transport.",
-    )
-    parser.add_argument(
-        "--cameras",
-        type=str,
-        default=None,
-        help="Comma-separated logical camera names. Defaults to 008 ACTIVE_CAMERA_NAMES.",
-    )
-    parser.add_argument(
-        "--cube-dirs",
-        type=str,
-        default=None,
-        help="Comma-separated AprilCube cfg directories. Defaults to 008 CUBE_CFG_DIRS.",
-    )
-    parser.add_argument(
-        "--slow",
-        action="store_true",
-        help="Use 008 slow/high-accuracy detector parameters.",
-    )
-    parser.add_argument(
-        "--no-filter",
-        action="store_true",
-        help="Disable 008 runtime temporal pose filter during sequential replay.",
-    )
-    parser.add_argument(
-        "--with-filter",
-        action="store_true",
-        help=(
-            "Enable the 008 runtime temporal pose filter during replay. "
-            "The offline viewer disables it by default and applies its own postprocess."
-        ),
-    )
-    parser.add_argument(
-        "--no-undistort",
-        action="store_true",
-        help="Do not run the 008 fisheye rectification path before detection.",
-    )
-    parser.add_argument(
-        "--shared-detect-tags",
-        action="store_true",
-        help="Use the realtime 008 shared detect_tags() path. Default offline mode detects tags per cube.",
-    )
-    parser.add_argument(
-        "--precompute-only",
-        action="store_true",
-        help="Compute/write offline pose results into the PKL, then exit before starting Viser.",
-    )
-    args = parser.parse_args()
-
     demo008 = load_demo008_module()
-    pkl_path = resolve_pkl_path(args.pkl_path)
+    pkl_path = resolve_pkl_path(PKL_PATH)
     print(f"[INFO] PKL: {pkl_path}")
     print("[INFO] Building lightweight frame index. This scans the file once without retaining images.")
-    header, frame_offsets, footer, pose_cache_record, inline_pose_cache_record = build_frame_index(pkl_path)
+    (
+        header,
+        frame_offsets,
+        footer,
+        pose_cache_record,
+        offline_pos_cache_record,
+        legacy_inline_pose_cache_record,
+    ) = build_frame_index(pkl_path)
     if not frame_offsets:
         raise ValueError(f"No frame records found in {pkl_path}")
 
@@ -2282,54 +2599,82 @@ def main() -> None:
     if footer is not None:
         print(f"[INFO] Footer frame_count={footer.get('frame_count')} reason={footer.get('reason')}")
 
-    if args.cameras:
-        active_camera_names = [x.strip() for x in args.cameras.split(",") if x.strip()]
-    else:
-        active_camera_names = list(demo008.ACTIVE_CAMERA_NAMES)
-        if (
-            first_record_camera_name
-            and len(active_camera_names) == 1
-            and first_record_camera_name != active_camera_names[0]
-        ):
-            config_camera_name = active_camera_names[0]
-            active_camera_names = [first_record_camera_name]
-            demo008.CAMERA_TO_INTRINSICS_YAML[first_record_camera_name] = (
-                demo008.CAMERA_TO_INTRINSICS_YAML[config_camera_name]
-            )
-            print(
-                "[INFO] Historical PKL camera alias: "
-                f"recorded camera '{first_record_camera_name}' uses current 008 "
-                f"config '{config_camera_name}'."
-            )
-    missing_camera_configs = [
-        name for name in active_camera_names if name not in demo008.CAMERA_TO_INTRINSICS_YAML
-    ]
-    if missing_camera_configs and len(demo008.ACTIVE_CAMERA_NAMES) == 1:
-        config_camera_name = demo008.ACTIVE_CAMERA_NAMES[0]
-        for camera_name in missing_camera_configs:
-            demo008.CAMERA_TO_INTRINSICS_YAML[camera_name] = (
-                demo008.CAMERA_TO_INTRINSICS_YAML[config_camera_name]
-            )
-        print(
-            "[INFO] Historical PKL camera alias: "
-            f"{missing_camera_configs} use current 008 config '{config_camera_name}'."
+    if not isinstance(metadata, dict):
+        raise ValueError("PKL header metadata must be a dictionary.")
+
+    recorded_camera_names = metadata.get("opened_cameras", None)
+    if not isinstance(recorded_camera_names, (list, tuple)) or not recorded_camera_names:
+        raise ValueError("PKL header has no non-empty metadata['opened_cameras'] list.")
+    active_camera_names = [str(name) for name in recorded_camera_names]
+    if first_record_camera_name and first_record_camera_name not in active_camera_names:
+        raise ValueError(
+            f"First PKL frame uses camera '{first_record_camera_name}', but "
+            f"metadata['opened_cameras']={active_camera_names}."
         )
-    cube_paths = (
-        [demo008.validate_cube_path(Path(x.strip())) for x in args.cube_dirs.split(",") if x.strip()]
-        if args.cube_dirs
-        else [demo008.validate_cube_path(Path(path)) for path in demo008.CUBE_CFG_DIRS]
+
+    recorded_intrinsics = metadata.get("intrinsics_yaml", None)
+    if not isinstance(recorded_intrinsics, dict):
+        raise ValueError("PKL header has no metadata['intrinsics_yaml'] mapping.")
+    camera_to_intrinsics_yaml: dict[str, str] = {}
+    for camera_name in active_camera_names:
+        intrinsics_path = recorded_intrinsics.get(camera_name, None)
+        if not isinstance(intrinsics_path, (str, Path)):
+            raise ValueError(
+                f"PKL header has no intrinsics YAML for camera '{camera_name}'."
+            )
+        resolved_intrinsics_path = Path(intrinsics_path).expanduser().resolve()
+        if not resolved_intrinsics_path.is_file():
+            raise FileNotFoundError(
+                f"PKL-recorded intrinsics YAML does not exist: {resolved_intrinsics_path}"
+            )
+        camera_to_intrinsics_yaml[camera_name] = str(resolved_intrinsics_path)
+        print(
+            f"[INFO] [{camera_name}] Using PKL-recorded intrinsics YAML: "
+            f"{resolved_intrinsics_path}"
+        )
+
+    recorded_cube_paths = metadata.get("cube_paths", None)
+    if not isinstance(recorded_cube_paths, (list, tuple)) or not recorded_cube_paths:
+        raise ValueError("PKL header has no non-empty metadata['cube_paths'] list.")
+    cube_paths = [
+        demo008.validate_cube_path(Path(path).expanduser().resolve())
+        for path in recorded_cube_paths
+    ]
+    print(f"[INFO] Using PKL-recorded cube cfgs: {[str(path) for path in cube_paths]}")
+
+    if "undistort_before_detection" not in metadata:
+        raise ValueError(
+            "PKL header has no metadata['undistort_before_detection'] setting."
+        )
+    use_undistort = bool(metadata["undistort_before_detection"])
+    fisheye_fov_setting = metadata.get(
+        "fisheye_rectified_horizontal_fov_deg_setting",
+        None,
     )
-    use_undistort = bool(demo008.UNDISTORT_BEFORE_DETECTION) and not args.no_undistort
-    adaptive_clahe = bool(getattr(demo008, "ADAPTIVE_CLAHE_DETECTION", False))
-    enable_filter = bool(args.with_filter) and not args.no_filter
-    fast = not args.slow
+    if fisheye_fov_setting is not None:
+        fisheye_fov_setting = float(fisheye_fov_setting)
+
+    demo008.ACTIVE_CAMERA_NAMES = list(active_camera_names)
+    demo008.CAMERA_TO_INTRINSICS_YAML = camera_to_intrinsics_yaml
+    demo008.CUBE_CFG_DIRS = list(cube_paths)
+    demo008.UNDISTORT_BEFORE_DETECTION = use_undistort
+    demo008.FISHEYE_RECTIFIED_HORIZONTAL_FOV_DEG = fisheye_fov_setting
+    demo008.PINHOLE_UNDISTORT_ALPHA = float(PINHOLE_UNDISTORT_ALPHA)
+    demo008.ADAPTIVE_CLAHE_DETECTION = bool(ADAPTIVE_CLAHE_DETECTION)
+    demo008.ENABLE_FILTER = bool(ENABLE_RUNTIME_POSE_FILTER)
+    demo008.FAST_DETECTOR = bool(FAST_DETECTOR)
+
+    adaptive_clahe = bool(ADAPTIVE_CLAHE_DETECTION)
+    enable_filter = bool(ENABLE_RUNTIME_POSE_FILTER)
+    fast = bool(FAST_DETECTOR)
+    temporal_postprocess_enabled = bool(ENABLE_TEMPORAL_POSTPROCESS)
     estimator = ReplayPoseEstimator(
         demo008,
         active_camera_names=active_camera_names,
         cube_paths=cube_paths,
         use_undistort=use_undistort,
         adaptive_clahe=adaptive_clahe,
-        shared_tag_detection=bool(args.shared_detect_tags),
+        shared_tag_detection=bool(SHARED_TAG_DETECTION),
         enable_filter=enable_filter,
         fast=fast,
     )
@@ -2339,29 +2684,72 @@ def main() -> None:
         cube_paths=cube_paths,
         use_undistort=use_undistort,
         adaptive_clahe=adaptive_clahe,
-        shared_tag_detection=bool(args.shared_detect_tags),
+        shared_tag_detection=bool(SHARED_TAG_DETECTION),
         enable_filter=enable_filter,
         fast=fast,
+        temporal_postprocess_enabled=temporal_postprocess_enabled,
         demo008=demo008,
     )
     print(
         "[INFO] 008 replay detection path: "
-        f"{'shared' if args.shared_detect_tags else 'per-cube'} detect_tags(frame) "
+        f"{'shared' if SHARED_TAG_DETECTION else 'per-cube'} detect_tags(frame) "
         "+ per-cube process_detections(), sequential over PKL frames."
     )
-    inline_cached_pose = load_cached_pose_cache(inline_pose_cache_record, pose_cache_key)
-    appended_cached_pose = load_cached_pose_cache(pose_cache_record, pose_cache_key)
-    cached_pose = inline_cached_pose if inline_cached_pose is not None else appended_cached_pose
-    pose_cache_needs_write = inline_cached_pose is None
+    print(
+        "[INFO] 011 single-tag face-frame solver: "
+        f"max_reproj={SINGLE_TAG_FACE_FRAME_MAX_REPROJ_PX:.1f}px "
+        f"tie={SINGLE_TAG_FACE_FRAME_REPROJ_TIE_PX:.1f}px "
+        f"lm_refine={SINGLE_TAG_FACE_FRAME_LM_REFINE}."
+    )
+    print(
+        "[INFO] 011 offline temporal postprocess: "
+        f"enabled={temporal_postprocess_enabled}."
+    )
+    if RECOMPUTE_POSE:
+        offline_pos_cached_pose = None
+        legacy_inline_cached_pose = None
+        appended_cached_pose = None
+        print("[INFO] Ignoring existing pose caches because RECOMPUTE_POSE is enabled.")
+    else:
+        offline_pos_cached_pose = load_cached_pose_cache(
+            offline_pos_cache_record,
+            pose_cache_key,
+            allow_temporal_postprocess_mismatch=temporal_postprocess_enabled,
+        )
+        legacy_inline_cached_pose = load_cached_pose_cache(
+            legacy_inline_pose_cache_record,
+            pose_cache_key,
+        )
+        appended_cached_pose = load_cached_pose_cache(pose_cache_record, pose_cache_key)
+    cache_candidates = (
+        ("offline_pos frame records", offline_pos_cached_pose),
+        ("legacy offline_pose_frame records", legacy_inline_cached_pose),
+        ("appended PKL cache", appended_cached_pose),
+    )
+    cache_source, cached_pose = next(
+        ((source, cached) for source, cached in cache_candidates if cached is not None),
+        ("", None),
+    )
+    pose_cache_needs_write = bool(RECOMPUTE_POSE)
     if cached_pose is not None:
         pose_cache, cache_exact_match = cached_pose
-        cache_source = "inline frame records" if inline_cached_pose is not None else "appended PKL cache"
-        if cache_exact_match:
+        using_offline_pos = cache_source == "offline_pos frame records"
+        if not using_offline_pos:
             print(
-                "[INFO] Loaded cached temporal-completed smoothed pose estimation "
+                f"[INFO] No compatible offline_pos cache; using {cache_source} "
+                "as a read-only visualization fallback."
+            )
+        if cache_exact_match:
+            cache_description = (
+                "temporal-completed smoothed"
+                if temporal_postprocess_enabled
+                else "raw measured"
+            )
+            print(
+                f"[INFO] Loaded cached {cache_description} pose estimation "
                 f"from {cache_source}: frames={len(pose_cache)}"
             )
-        else:
+        elif temporal_postprocess_enabled:
             (
                 pose_cache,
                 filled_count,
@@ -2372,55 +2760,72 @@ def main() -> None:
                 pose_cache,
                 estimator,
             )
-            pose_cache_needs_write = True
+            pose_cache_needs_write = False
             print(
                 f"[INFO] Loaded cached pose estimation from {cache_source} and applied "
                 "single-tag gate + temporal completion+smoothing: "
                 f"frames={len(pose_cache)} reset={reset_count} "
                 f"rejected={rejected_count} filled={filled_count} smoothed={smoothed_count}"
             )
+        else:
+            pose_cache_needs_write = using_offline_pos
+            print(
+                f"[INFO] Loaded compatible raw pose estimation from {cache_source}: "
+                f"frames={len(pose_cache)}"
+            )
     else:
         pose_cache = precompute_pose_cache(pkl_path, frame_offsets, metadata, estimator)
-        (
-            pose_cache,
-            filled_count,
-            smoothed_count,
-            rejected_count,
-            reset_count,
-        ) = complete_and_smooth_pose_cache(
-            pose_cache,
-            estimator,
-        )
         pose_cache_needs_write = True
-        print(
-            "[INFO] Applied single-tag gate + temporal completion+smoothing: "
-            f"reset={reset_count} rejected={rejected_count} "
-            f"filled={filled_count} smoothed={smoothed_count}"
-        )
+        if temporal_postprocess_enabled:
+            (
+                pose_cache,
+                filled_count,
+                smoothed_count,
+                rejected_count,
+                reset_count,
+            ) = complete_and_smooth_pose_cache(
+                pose_cache,
+                estimator,
+            )
+            print(
+                "[INFO] Applied single-tag gate + temporal completion+smoothing: "
+                f"reset={reset_count} rejected={rejected_count} "
+                f"filled={filled_count} smoothed={smoothed_count}"
+            )
+        else:
+            print("[INFO] Kept raw measured poses; skipped offline temporal postprocess.")
 
     if pose_cache_needs_write:
         write_pose_cache_into_pkl_frames(pkl_path, pose_cache_key, pose_cache)
+        cache_description = (
+            "temporal-completed smoothed"
+            if temporal_postprocess_enabled
+            else "raw measured"
+        )
         print(
-            "[INFO] Wrote temporal-completed smoothed pose estimation into ordered "
+            f"[INFO] Wrote {cache_description} pose estimation into ordered "
             f"PKL frame records: frames={len(pose_cache)}"
         )
-    if args.precompute_only:
+    if PRECOMPUTE_ONLY:
         print("[INFO] Precompute-only mode finished; exiting before starting Viser.")
         return
 
-    first_raw_rgb = bgr_to_rgb_for_viser(first_record["image_bgr"], int(args.max_width))
+    first_raw_rgb = bgr_to_rgb_for_viser(
+        first_record["image_bgr"],
+        int(VISER_MAX_IMAGE_WIDTH),
+    )
     first_detector_tagpose_bgr = estimator.draw_detector_input_pose_frame(first_record, pose_cache[0])
     first_detector_tagpose_rgb = bgr_to_rgb_for_viser(
         first_detector_tagpose_bgr,
-        int(args.max_width),
+        int(VISER_MAX_IMAGE_WIDTH),
     )
     first_undistorted_debug_bgr = estimator.draw_undistorted_debug_frame(first_record, pose_cache[0])
     first_undistorted_debug_rgb = bgr_to_rgb_for_viser(
         first_undistorted_debug_bgr,
-        int(args.max_width),
+        int(VISER_MAX_IMAGE_WIDTH),
     )
 
-    server = viser.ViserServer(host=args.host, port=int(args.port))
+    server = viser.ViserServer(host=VISER_HOST, port=int(VISER_PORT))
     scene_handles = create_3d_scene_handles(server, estimator, pose_cache)
     update_3d_scene(scene_handles, pose_cache[0])
 
@@ -2429,7 +2834,7 @@ def main() -> None:
             first_detector_tagpose_rgb,
             label="",
             format="jpeg",
-            jpeg_quality=int(args.jpeg_quality),
+            jpeg_quality=int(VISER_JPEG_QUALITY),
         )
         frame_slider = server.gui.add_slider(
             "Frame",
@@ -2451,7 +2856,7 @@ def main() -> None:
             first_undistorted_debug_rgb,
             label="undistorted frame red-box on missing pose",
             format="jpeg",
-            jpeg_quality=int(args.jpeg_quality),
+            jpeg_quality=int(VISER_JPEG_QUALITY),
         )
 
     with server.gui.add_folder("Raw Image"):
@@ -2459,7 +2864,7 @@ def main() -> None:
             first_raw_rgb,
             label="raw origin_frame_bgr",
             format="jpeg",
-            jpeg_quality=int(args.jpeg_quality),
+            jpeg_quality=int(VISER_JPEG_QUALITY),
         )
 
     with server.gui.add_folder("3D View"):
@@ -2485,7 +2890,7 @@ def main() -> None:
                 )
             )
 
-    print(f"[INFO] Viser: http://{args.host}:{int(args.port)}")
+    print(f"[INFO] Viser: http://{VISER_HOST}:{int(VISER_PORT)}")
     print(
         "[INFO] Use the sidebar folders: Detector Input TagPose, "
         "Undistorted Debug Image, Raw Image, Replay Metadata."
@@ -2523,7 +2928,7 @@ def main() -> None:
                 )
                 detector_tagpose_handle.image = bgr_to_rgb_for_viser(
                     detector_tagpose_bgr,
-                    int(args.max_width),
+                    int(VISER_MAX_IMAGE_WIDTH),
                 )
                 undistorted_debug_bgr = estimator.draw_undistorted_debug_frame(
                     record,
@@ -2531,9 +2936,12 @@ def main() -> None:
                 )
                 undistorted_debug_handle.image = bgr_to_rgb_for_viser(
                     undistorted_debug_bgr,
-                    int(args.max_width),
+                    int(VISER_MAX_IMAGE_WIDTH),
                 )
-                raw_image_handle.image = bgr_to_rgb_for_viser(record["image_bgr"], int(args.max_width))
+                raw_image_handle.image = bgr_to_rgb_for_viser(
+                    record["image_bgr"],
+                    int(VISER_MAX_IMAGE_WIDTH),
+                )
                 status_text.value = record_summary(record, slider_idx, total_frames)
                 pose_text.content = pose_markdown(pose_cache[slider_idx])
                 update_3d_scene(scene_handles, pose_cache[slider_idx])
@@ -2557,4 +2965,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 1:
+        raise SystemExit(
+            "011 no longer accepts command-line arguments; edit the User macros "
+            "at the top of this script."
+        )
     main()
