@@ -5,6 +5,7 @@
     "grid": "1x1x1"
   },
   "dict": "apriltag_36h11",
+  "tag_pattern_mirrored": true,
   "grid": "1x1x1",
   "tag_ids": [
     0,
