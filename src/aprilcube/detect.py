@@ -1941,6 +1941,39 @@ class CubePoseEstimator:
             self.camera_matrix, self.dist_coeffs,
             pnp_rv_guess, pnp_tv_guess,
         )
+        if len(detections) == 2 and not used_flow:
+            (
+                direct_success,
+                direct_rvec,
+                direct_tvec,
+                direct_reproj_err,
+                direct_inliers,
+            ) = estimate_pose_direct(
+                object_points,
+                image_points,
+                self.camera_matrix,
+                self.dist_coeffs,
+                pnp_rv_guess,
+                pnp_tv_guess,
+            )
+            if (
+                direct_success
+                and direct_rvec is not None
+                and direct_tvec is not None
+                and float(direct_tvec.reshape(3)[2]) > 0.0
+                and face_normals_ok(direct_rvec)
+                and (
+                    not success
+                    or direct_reproj_err <= reproj_err
+                    or reproj_err > MULTI_TAG_POSE_MAX_REPROJ_PX
+                )
+            ):
+                success = True
+                rvec = direct_rvec
+                tvec = direct_tvec
+                reproj_err = direct_reproj_err
+                inliers = direct_inliers
+                result["direct_all_point_pnp"] = True
         fallback_reproj_trigger = (
             3.0 if len(detections) <= 1 else MULTI_TAG_POSE_MAX_REPROJ_PX
         )

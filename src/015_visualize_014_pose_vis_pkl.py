@@ -16,6 +16,7 @@ DEFAULT_PKL = APRILCUBE_ROOT / "recordings" / "012_rs_raw_frames_20260710_214336
 SUPPORTED_FORMATS = {
     "aprilcube_012_offline_pose_vis_stream_v1",
     "aprilcube_012_raw_with_pose_stream_v1",
+    "aprilcube_deeptag_fused_stream_v1",
     "deeptag_012_offline_stream_v1",
 }
 
@@ -130,6 +131,8 @@ def pose_markdown(frame: dict[str, Any]) -> str:
         f"timestamp: `{frame.get('capture_timestamp', None)}`",
         f"success: `{pose.get('success', False)}`",
         f"pose_source: `{pose.get('pose_source', '')}`",
+        f"quality_level: `{pose.get('quality_level', '')}`",
+        f"quality_reason: `{pose.get('quality_reason', '')}`",
         f"pose_filled: `{pose.get('pose_filled', False)}`",
         f"reproj_error: `{pose.get('reproj_error', None)}`",
         f"n_tags: `{pose.get('n_tags', 0)}`",

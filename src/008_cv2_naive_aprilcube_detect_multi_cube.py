@@ -62,7 +62,7 @@ CAMERA_TO_PORT: dict[str, str] = {
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0618_181728.yaml",
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_210450.yaml",
-    # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
+    "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
 
     # fisheye middle finger yaml
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_charuco_2592x1944_0705_180038.yaml",
@@ -74,8 +74,8 @@ CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_1_1920x1200_0707_013313.yaml",
 
     # IR 3MP f3.6mm
-    "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_offline_eval_0708_150154_0708_150928/"
-            "intrinsics_None_charuco_2592x1944_0708_150154_offline_filtered.yaml",
+    # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_offline_eval_0708_150154_0708_150928/"
+    #         "intrinsics_None_charuco_2592x1944_0708_150154_offline_filtered.yaml",
 }
 
 ACTIVE_CAMERA_NAMES: list[str] = ["cam1"]
@@ -92,8 +92,8 @@ RECORD_OUTPUT_DIR = THIS_FILE.parent.parent / "recordings"
 ADAPTIVE_CLAHE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_15mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",  # test
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_15mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
     THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_15mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",

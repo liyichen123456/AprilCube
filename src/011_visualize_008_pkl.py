@@ -23,6 +23,8 @@ DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect_multi_cube.py
 ASSETS_DIR = THIS_FILE.parent.parent / "assets"
 OBJ_MESH_SCALE = 0.001
 POSE_CACHE_FORMAT = "aprilcube_008_pose_cache_v1"
+INLINE_POSE_FRAME_FIELD = "offline_pose_frame"
+INLINE_POSE_CACHE_KEY_FIELD = "offline_pose_cache_key"
 IMAGE_RECOVERY_VERSION = 9
 SINGLE_TAG_CONTINUITY_GATE_ENABLED = True
 SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG = 45.0
@@ -125,10 +127,20 @@ def print_index_progress(done_bytes: int, total_bytes: int, *, force_newline: bo
 
 def build_frame_index(
     path: Path,
-) -> tuple[dict[str, Any] | None, list[int], dict[str, Any] | None, dict[str, Any] | None]:
+) -> tuple[
+    dict[str, Any] | None,
+    list[int],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     header: dict[str, Any] | None = None
     footer: dict[str, Any] | None = None
     pose_cache_record: dict[str, Any] | None = None
+    inline_pose_cache_key: dict[str, Any] | None = None
+    inline_pose_cache: list[dict[str, Any] | None] = []
+    inline_pose_cache_complete = True
+    inline_pose_cache_keys_match = True
     frame_offsets: list[int] = []
     file_size = path.stat().st_size
     last_print = time.monotonic()
@@ -148,6 +160,17 @@ def build_frame_index(
                 header = record
             elif record_type == "frame":
                 frame_offsets.append(offset)
+                inline_pose_frame = record.get(INLINE_POSE_FRAME_FIELD, None)
+                inline_key = record.get(INLINE_POSE_CACHE_KEY_FIELD, None)
+                if isinstance(inline_pose_frame, dict) and isinstance(inline_key, dict):
+                    inline_pose_cache.append(inline_pose_frame)
+                    if inline_pose_cache_key is None:
+                        inline_pose_cache_key = inline_key
+                    elif inline_pose_cache_key != inline_key:
+                        inline_pose_cache_keys_match = False
+                else:
+                    inline_pose_cache.append(None)
+                    inline_pose_cache_complete = False
             elif record_type == "footer":
                 footer = record
             elif record_type == "pose_cache":
@@ -159,7 +182,20 @@ def build_frame_index(
                 last_print = now
 
     print_index_progress(file_size, file_size, force_newline=True)
-    return header, frame_offsets, footer, pose_cache_record
+    inline_pose_cache_record = None
+    if (
+        inline_pose_cache_complete
+        and inline_pose_cache_keys_match
+        and inline_pose_cache_key is not None
+        and len(inline_pose_cache) == len(frame_offsets)
+    ):
+        inline_pose_cache_record = {
+            "type": "pose_cache",
+            "format": POSE_CACHE_FORMAT,
+            "key": inline_pose_cache_key,
+            "pose_cache": inline_pose_cache,
+        }
+    return header, frame_offsets, footer, pose_cache_record, inline_pose_cache_record
 
 
 def load_frame_at_offset(path: Path, offset: int) -> dict[str, Any]:
@@ -2003,7 +2039,6 @@ def make_pose_cache_key(
     return {
         "format": POSE_CACHE_FORMAT,
         "frame_count": len(frame_offsets),
-        "frame_offsets": [int(v) for v in frame_offsets],
         "active_camera_names": list(active_camera_names),
         "cube_paths": [str(path) for path in cube_paths],
         "intrinsics_yaml": {
@@ -2068,9 +2103,18 @@ def load_cached_pose_cache(
         return None
     record_key = pose_cache_record.get("key")
     exact_match = record_key == expected_key
+    if not exact_match and isinstance(record_key, dict):
+        stable_record_key = {
+            key: value for key, value in record_key.items() if key != "frame_offsets"
+        }
+        stable_expected_key = {
+            key: value for key, value in expected_key.items() if key != "frame_offsets"
+        }
+        exact_match = stable_record_key == stable_expected_key
     compatible_without_temporal = False
     if not exact_match and isinstance(record_key, dict):
         temporal_keys = {
+            "frame_offsets",
             "single_tag_continuity_gate_enabled",
             "single_tag_continuity_max_rotation_deg",
             "single_tag_continuity_version",
@@ -2112,20 +2156,43 @@ def load_cached_pose_cache(
     return pose_cache, exact_match
 
 
-def append_pose_cache_to_pkl(
+def write_pose_cache_into_pkl_frames(
     pkl_path: Path,
     cache_key: dict[str, Any],
     pose_cache: list[dict[str, Any]],
 ) -> None:
-    record = {
-        "type": "pose_cache",
-        "format": POSE_CACHE_FORMAT,
-        "created_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "key": cache_key,
-        "pose_cache": pose_cache,
-    }
-    with pkl_path.open("ab") as f:
-        pickle.dump(record, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path = pkl_path.with_name(f".{pkl_path.name}.rewrite-{time.time_ns()}.tmp")
+    frame_idx = 0
+    try:
+        with pkl_path.open("rb") as src, tmp_path.open("wb") as dst:
+            while True:
+                try:
+                    record = pickle.load(src)
+                except EOFError:
+                    break
+
+                if isinstance(record, dict) and record.get("type") == "pose_cache":
+                    continue
+
+                if isinstance(record, dict) and record.get("type") == "frame":
+                    if frame_idx >= len(pose_cache):
+                        raise ValueError(
+                            f"PKL has more frame records than pose cache entries: >{len(pose_cache)}"
+                        )
+                    record[INLINE_POSE_FRAME_FIELD] = pose_cache[frame_idx]
+                    record[INLINE_POSE_CACHE_KEY_FIELD] = cache_key
+                    frame_idx += 1
+
+                pickle.dump(record, dst, protocol=pickle.HIGHEST_PROTOCOL)
+
+        if frame_idx != len(pose_cache):
+            raise ValueError(
+                f"PKL frame count {frame_idx} does not match pose cache count {len(pose_cache)}"
+            )
+        tmp_path.replace(pkl_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def main() -> None:
@@ -2192,13 +2259,18 @@ def main() -> None:
         action="store_true",
         help="Use the realtime 008 shared detect_tags() path. Default offline mode detects tags per cube.",
     )
+    parser.add_argument(
+        "--precompute-only",
+        action="store_true",
+        help="Compute/write offline pose results into the PKL, then exit before starting Viser.",
+    )
     args = parser.parse_args()
 
     demo008 = load_demo008_module()
     pkl_path = resolve_pkl_path(args.pkl_path)
     print(f"[INFO] PKL: {pkl_path}")
     print("[INFO] Building lightweight frame index. This scans the file once without retaining images.")
-    header, frame_offsets, footer, pose_cache_record = build_frame_index(pkl_path)
+    header, frame_offsets, footer, pose_cache_record, inline_pose_cache_record = build_frame_index(pkl_path)
     if not frame_offsets:
         raise ValueError(f"No frame records found in {pkl_path}")
 
@@ -2277,12 +2349,18 @@ def main() -> None:
         f"{'shared' if args.shared_detect_tags else 'per-cube'} detect_tags(frame) "
         "+ per-cube process_detections(), sequential over PKL frames."
     )
-    cached_pose = load_cached_pose_cache(pose_cache_record, pose_cache_key)
-    pose_cache_needs_append = False
+    inline_cached_pose = load_cached_pose_cache(inline_pose_cache_record, pose_cache_key)
+    appended_cached_pose = load_cached_pose_cache(pose_cache_record, pose_cache_key)
+    cached_pose = inline_cached_pose if inline_cached_pose is not None else appended_cached_pose
+    pose_cache_needs_write = inline_cached_pose is None
     if cached_pose is not None:
         pose_cache, cache_exact_match = cached_pose
+        cache_source = "inline frame records" if inline_cached_pose is not None else "appended PKL cache"
         if cache_exact_match:
-            print(f"[INFO] Loaded cached temporal-completed smoothed pose estimation from PKL: frames={len(pose_cache)}")
+            print(
+                "[INFO] Loaded cached temporal-completed smoothed pose estimation "
+                f"from {cache_source}: frames={len(pose_cache)}"
+            )
         else:
             (
                 pose_cache,
@@ -2294,9 +2372,9 @@ def main() -> None:
                 pose_cache,
                 estimator,
             )
-            pose_cache_needs_append = True
+            pose_cache_needs_write = True
             print(
-                "[INFO] Loaded cached pose estimation from PKL and applied "
+                f"[INFO] Loaded cached pose estimation from {cache_source} and applied "
                 "single-tag gate + temporal completion+smoothing: "
                 f"frames={len(pose_cache)} reset={reset_count} "
                 f"rejected={rejected_count} filled={filled_count} smoothed={smoothed_count}"
@@ -2313,16 +2391,22 @@ def main() -> None:
             pose_cache,
             estimator,
         )
-        pose_cache_needs_append = True
+        pose_cache_needs_write = True
         print(
             "[INFO] Applied single-tag gate + temporal completion+smoothing: "
             f"reset={reset_count} rejected={rejected_count} "
             f"filled={filled_count} smoothed={smoothed_count}"
         )
 
-    if pose_cache_needs_append:
-        append_pose_cache_to_pkl(pkl_path, pose_cache_key, pose_cache)
-        print(f"[INFO] Appended temporal-completed smoothed pose estimation to PKL: frames={len(pose_cache)}")
+    if pose_cache_needs_write:
+        write_pose_cache_into_pkl_frames(pkl_path, pose_cache_key, pose_cache)
+        print(
+            "[INFO] Wrote temporal-completed smoothed pose estimation into ordered "
+            f"PKL frame records: frames={len(pose_cache)}"
+        )
+    if args.precompute_only:
+        print("[INFO] Precompute-only mode finished; exiting before starting Viser.")
+        return
 
     first_raw_rgb = bgr_to_rgb_for_viser(first_record["image_bgr"], int(args.max_width))
     first_detector_tagpose_bgr = estimator.draw_detector_input_pose_frame(first_record, pose_cache[0])

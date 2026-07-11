@@ -65,13 +65,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fallback-max-reproj",
         type=float,
-        default=20.0,
+        default=5.0,
         help="Accept fallback PnP poses up to this mean reprojection error in pixels.",
     )
     parser.add_argument(
         "--fallback-ransac-reproj",
         type=float,
-        default=8.0,
+        default=3.0,
         help="RANSAC reprojection threshold in pixels for fallback PnP.",
     )
     parser.add_argument(
@@ -115,9 +115,13 @@ def resolve_pkl_path(path_str: str) -> Path:
 def build_stream_index(path: Path) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
     frame_offsets: list[int] = []
     footer: dict[str, Any] | None = None
+    supported_formats = {
+        "aprilcube_rs_raw_frame_stream_v1",
+        "aprilcube_012_raw_with_pose_stream_v1",
+    }
     with path.open("rb") as f:
         header = pickle.load(f)
-        if not isinstance(header, dict) or header.get("format") != "aprilcube_rs_raw_frame_stream_v1":
+        if not isinstance(header, dict) or header.get("format") not in supported_formats:
             raise ValueError(f"Unsupported pkl format in {path}")
 
         while True:
@@ -310,6 +314,9 @@ def sanitize_result(result: dict[str, Any]) -> dict[str, Any]:
         "T": ndarray_to_list(result.get("T", None)),
         "detections": detections,
         "per_tag_reproj_error": per_tag_reproj_error,
+        "fallback_outlier_rejected_ids": [
+            int(v) for v in result.get("fallback_outlier_rejected_ids", []) or []
+        ],
     }
 
 
@@ -457,13 +464,27 @@ class OfflineEstimator:
                     visible.add(str(face_name))
         return visible
 
-    def _fallback_pose(self, result: dict[str, Any]) -> dict[str, Any] | None:
-        if not self.fallback_tag_corner_map:
-            return None
+    def _face_normals_ok(self, rvec: np.ndarray, visible_faces: set[str]) -> bool:
+        rot, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+        for face_name in visible_faces:
+            for face_def in aprilcube.FACE_DEFS:
+                if str(face_def[0]) != str(face_name):
+                    continue
+                normal = np.zeros(3, dtype=np.float64)
+                normal[int(face_def[1])] = float(face_def[2])
+                normal_cam = rot @ normal
+                if float(normal_cam[2]) > 0.0:
+                    return False
+                break
+        return True
+
+    def _fallback_points_from_detections(
+        self,
+        detections: list[tuple[int, np.ndarray]],
+    ) -> tuple[np.ndarray, np.ndarray, list[int]]:
         object_chunks: list[np.ndarray] = []
         image_chunks: list[np.ndarray] = []
         used_ids: list[int] = []
-        detections = result.get("detections", []) or []
         for tag_id_raw, corners_raw in detections:
             tag_id = int(tag_id_raw)
             corners_3d = self.fallback_tag_corner_map.get(tag_id)
@@ -474,33 +495,68 @@ class OfflineEstimator:
             image_chunks.append(corners_2d)
             used_ids.append(tag_id)
         if not object_chunks:
-            return None
+            return (
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 2), dtype=np.float64),
+                [],
+            )
+        return (
+            np.vstack(object_chunks).astype(np.float64),
+            np.vstack(image_chunks).astype(np.float64),
+            used_ids,
+        )
 
-        object_points = np.vstack(object_chunks).astype(np.float64)
-        image_points = np.vstack(image_chunks).astype(np.float64)
+    def _solve_fallback_global_pnp(
+        self,
+        detections: list[tuple[int, np.ndarray]],
+    ) -> dict[str, Any] | None:
+        object_points, image_points, used_ids = self._fallback_points_from_detections(detections)
         if object_points.shape[0] < 4:
             return None
 
-        try:
-            success, rvec, tvec, inliers = cv2.solvePnPRansac(
-                objectPoints=object_points,
-                imagePoints=image_points,
-                cameraMatrix=self.detection_camera_matrix,
-                distCoeffs=self.detector_dist_coeffs,
-                iterationsCount=300,
-                reprojectionError=float(self.fallback_ransac_reproj),
-                confidence=0.995,
-                flags=cv2.SOLVEPNP_SQPNP,
-            )
-        except cv2.error:
-            success, rvec, tvec = cv2.solvePnP(
-                objectPoints=object_points,
-                imagePoints=image_points,
-                cameraMatrix=self.detection_camera_matrix,
-                distCoeffs=self.detector_dist_coeffs,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
+        inliers = None
+        if object_points.shape[0] >= 6:
+            try:
+                success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    objectPoints=object_points,
+                    imagePoints=image_points,
+                    cameraMatrix=self.detection_camera_matrix,
+                    distCoeffs=self.detector_dist_coeffs,
+                    iterationsCount=200,
+                    reprojectionError=float(self.fallback_ransac_reproj),
+                    confidence=0.99,
+                    flags=cv2.SOLVEPNP_SQPNP,
+                )
+            except cv2.error:
+                success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    objectPoints=object_points,
+                    imagePoints=image_points,
+                    cameraMatrix=self.detection_camera_matrix,
+                    distCoeffs=self.detector_dist_coeffs,
+                    iterationsCount=200,
+                    reprojectionError=float(self.fallback_ransac_reproj),
+                    confidence=0.99,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+        else:
+            try:
+                success, rvec, tvec = cv2.solvePnP(
+                    objectPoints=object_points,
+                    imagePoints=image_points,
+                    cameraMatrix=self.detection_camera_matrix,
+                    distCoeffs=self.detector_dist_coeffs,
+                    flags=cv2.SOLVEPNP_SQPNP,
+                )
+            except cv2.error:
+                success, rvec, tvec = cv2.solvePnP(
+                    objectPoints=object_points,
+                    imagePoints=image_points,
+                    cameraMatrix=self.detection_camera_matrix,
+                    distCoeffs=self.detector_dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
             inliers = np.arange(object_points.shape[0], dtype=np.int32).reshape(-1, 1) if success else None
+
         if not success or rvec is None or tvec is None:
             return None
         if float(np.asarray(tvec).reshape(3)[2]) <= 0.0:
@@ -528,28 +584,93 @@ class OfflineEstimator:
             self.detector_dist_coeffs,
         )
         projected = projected.reshape(-1, 2)
-        reproj_error = float(np.mean(np.linalg.norm(image_points - projected, axis=1)))
+        corner_errors = np.linalg.norm(image_points - projected, axis=1)
+        per_tag_reproj_error: dict[int, float] = {}
+        for idx, tag_id in enumerate(used_ids):
+            start = idx * 4
+            end = start + 4
+            per_tag_reproj_error[int(tag_id)] = float(np.mean(corner_errors[start:end]))
+
+        visible_faces = self._visible_faces_for_ids(used_ids)
+        if not self._face_normals_ok(np.asarray(rvec, dtype=np.float64).reshape(3, 1), visible_faces):
+            return None
+
+        return {
+            "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+            "reproj_error": float(np.mean(corner_errors)),
+            "n_inliers": 0 if inliers is None else int(len(inliers)),
+            "used_ids": used_ids,
+            "visible_faces": visible_faces,
+            "per_tag_reproj_error": per_tag_reproj_error,
+        }
+
+    def _fallback_pose(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.fallback_tag_corner_map:
+            return None
+        detections = [
+            (int(tag_id), np.asarray(corners, dtype=np.float64).reshape(4, 2))
+            for tag_id, corners in (result.get("detections", []) or [])
+            if int(tag_id) in self.fallback_tag_corner_map
+        ]
+        if not detections:
+            return None
+
+        solved = self._solve_fallback_global_pnp(detections)
+        if solved is None:
+            return None
+        outlier_rejected_ids: list[int] = []
+        if len(detections) >= 3:
+            per_tag = solved["per_tag_reproj_error"]
+            per_tag_values = np.asarray([per_tag[int(tag_id)] for tag_id, _ in detections], dtype=np.float64)
+            median_err = float(np.median(per_tag_values))
+            tag_reproj_thresh = max(median_err * 3.0, 2.0)
+            keep = [
+                idx
+                for idx, (tag_id, _corners) in enumerate(detections)
+                if float(per_tag[int(tag_id)]) <= tag_reproj_thresh
+            ]
+            if len(keep) < len(detections) and len(keep) >= 1:
+                outlier_rejected_ids = [
+                    int(tag_id)
+                    for idx, (tag_id, _corners) in enumerate(detections)
+                    if idx not in keep
+                ]
+                detections = [detections[idx] for idx in keep]
+                solved = self._solve_fallback_global_pnp(detections)
+                if solved is None:
+                    return None
+
+        reproj_error = float(solved["reproj_error"])
         if reproj_error > self.fallback_max_reproj:
             return None
 
-        rot, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+        rvec = np.asarray(solved["rvec"], dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(solved["tvec"], dtype=np.float64).reshape(3, 1)
+        used_ids = [int(v) for v in solved["used_ids"]]
+
+        rot, _ = cv2.Rodrigues(rvec)
         transform = np.eye(4, dtype=np.float64)
         transform[:3, :3] = rot
-        transform[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+        transform[:3, 3] = tvec.reshape(3)
 
         fallback = dict(result)
         fallback.update(
             {
                 "success": True,
                 "failure_reason": "",
-                "pose_source": f"fallback_pnp_{self.fallback_layout}",
-                "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1),
-                "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+                "pose_source": f"fallback_pnp_{self.fallback_layout}_aprilcube_style",
+                "rvec": rvec,
+                "tvec": tvec,
                 "T": transform,
                 "reproj_error": reproj_error,
-                "n_inliers": 0 if inliers is None else int(len(inliers)),
-                "visible_faces": self._visible_faces_for_ids(used_ids),
+                "n_inliers": int(solved["n_inliers"]),
+                "n_tags": len(used_ids),
+                "visible_faces": solved["visible_faces"],
                 "tag_ids": used_ids,
+                "detections": detections,
+                "per_tag_reproj_error": solved["per_tag_reproj_error"],
+                "fallback_outlier_rejected_ids": outlier_rejected_ids,
                 "fallback_original_failure_reason": str(result.get("failure_reason", "")),
                 "fallback_layout": self.fallback_layout,
             }
@@ -566,8 +687,10 @@ class OfflineEstimator:
         )
         detector_success = bool(result.get("success", False))
         detector_reproj = float(result.get("reproj_error", float("inf")))
+        detector_n_tags = int(result.get("n_tags", 0) or 0)
         detector_usable = (
             detector_success
+            and detector_n_tags > 0
             and np.isfinite(detector_reproj)
             and detector_reproj <= self.fallback_max_reproj
         )
@@ -578,6 +701,8 @@ class OfflineEstimator:
             rejected_reason = (
                 ""
                 if not detector_success
+                else "detector_no_tags"
+                if detector_n_tags <= 0
                 else f"detector_reproj_rejected:{detector_reproj:.2f}>{self.fallback_max_reproj:.2f}"
             )
             fallback_seed = dict(result)
@@ -842,6 +967,8 @@ def main() -> None:
     pkl_path = resolve_pkl_path(args.pkl_path)
     header, offsets, footer = build_stream_index(pkl_path)
     metadata = dict(header.get("metadata", {}))
+    if header.get("format") == "aprilcube_012_raw_with_pose_stream_v1":
+        metadata = dict(header.get("raw_header", {}).get("metadata", metadata))
     if args.max_frames > 0:
         offsets = offsets[: int(args.max_frames)]
 
