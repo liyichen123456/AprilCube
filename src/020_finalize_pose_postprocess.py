@@ -13,6 +13,14 @@ from typing import Any
 APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = APRILCUBE_ROOT / "src"
 RECORDINGS_DIR = APRILCUBE_ROOT / "recordings"
+HELPER_SOURCE_COMMIT = "515de6d"
+HELPER_SCRIPT_NAMES = {
+    "020_deeptag_dense_keypoints_pose.py",
+    "022_benchmark_single_frame_recovery_methods.py",
+    "023_fuse_all_single_frame_recovery_methods.py",
+    "024_temporal_outline_refine_recovery.py",
+    "025_global_temporal_filter_fill_remaining.py",
+}
 
 DEFAULT_012_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
 DEFAULT_RAW_PKL = DEFAULT_012_PKL
@@ -151,7 +159,44 @@ def run_command(cmd: list[str], *, dry_run: bool) -> None:
 
 
 def python_cmd(args: argparse.Namespace, script_name: str, *extra: str) -> list[str]:
-    return [str(Path(args.python).expanduser()), str(SRC_DIR / script_name), *extra]
+    helper_dir = getattr(args, "_helper_script_dir", None)
+    if helper_dir is not None and script_name in HELPER_SCRIPT_NAMES:
+        script_path = Path(helper_dir) / script_name
+    else:
+        script_path = SRC_DIR / script_name
+    return [str(Path(args.python).expanduser()), str(script_path), *extra]
+
+
+def prepare_helper_scripts(args: argparse.Namespace, work_dir: Path) -> Path:
+    helper_dir = work_dir / "_020_stage_helpers"
+    args._helper_script_dir = helper_dir
+    if bool(args.dry_run):
+        return helper_dir
+
+    helper_dir.mkdir(parents=True, exist_ok=True)
+    for script_name in sorted(HELPER_SCRIPT_NAMES):
+        source_ref = f"{HELPER_SOURCE_COMMIT}:src/{script_name}"
+        result = subprocess.run(
+            ["git", "show", source_ref],
+            cwd=str(APRILCUBE_ROOT),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        script_path = helper_dir / script_name
+        script_path.write_text(result.stdout, encoding="utf-8")
+        script_path.chmod(0o755)
+
+    for name, target in {
+        "012_rs_aprilcube_detect.py": SRC_DIR / "012_rs_aprilcube_detect.py",
+        "aprilcube": SRC_DIR / "aprilcube",
+    }.items():
+        link = helper_dir / name
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(target, target_is_directory=target.is_dir())
+
+    return helper_dir
 
 
 def run_008_pipeline(args: argparse.Namespace) -> Path:
@@ -195,6 +240,8 @@ def run_012_pipeline(args: argparse.Namespace) -> Path:
     output_pkl = Path(args.output_pkl).expanduser().resolve() if args.output_pkl else default_012_output_path(raw_pkl)
     work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else default_work_dir(raw_pkl).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    helper_dir = prepare_helper_scripts(args, work_dir)
+    print(f"[INFO] Stage helper scripts: {helper_dir}")
 
     april_strict_pkl = work_dir / f"014_offline_pose_vis_{raw_pkl.stem}_aprilcube_style_nofill_notagfix.pkl"
     april_merged_pkl = work_dir / f"017_{raw_pkl.stem}_with_aprilcube_pose.pkl"
