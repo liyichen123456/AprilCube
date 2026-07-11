@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import pickle
 import shutil
 import subprocess
@@ -13,21 +12,35 @@ from typing import Any
 APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = APRILCUBE_ROOT / "src"
 RECORDINGS_DIR = APRILCUBE_ROOT / "recordings"
-HELPER_SOURCE_COMMIT = "515de6d"
-HELPER_SCRIPT_NAMES = {
-    "020_deeptag_dense_keypoints_pose.py",
-    "022_benchmark_single_frame_recovery_methods.py",
-    "023_fuse_all_single_frame_recovery_methods.py",
-    "024_temporal_outline_refine_recovery.py",
-    "025_global_temporal_filter_fill_remaining.py",
-}
 
-DEFAULT_012_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
-DEFAULT_RAW_PKL = DEFAULT_012_PKL
-DEFAULT_FINAL_POSE_PKL = RECORDINGS_DIR / "025_global_temporal_filter_fill_final.pkl"
-DEFAULT_OUTPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_final_postprocessed_pose.pkl"
+# Edit these constants before running. This script intentionally does not accept
+# command-line arguments, so a run is reproducible from the file contents.
+RUN_MODE = "012"  # "012", "008", or "MERGE_FINAL"
+PYTHON_EXE = Path("/home/ps/miniconda3/envs/foundation_stereo/bin/python")
 
-SUPPORTED_008_FORMATS = {"aprilcube_raw_frame_stream_v1"}
+INPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
+OUTPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_final_postprocessed_pose.pkl"
+WORK_DIR = RECORDINGS_DIR / "020_work"
+KEEP_INTERMEDIATES = False
+DRY_RUN = False
+
+RUN_012_SLOW_APRILTAG = True
+RUN_012_UNDISTORT = True
+RUN_012_FILL_MISSING_POSE = True
+RUN_012_FALLBACK_LAYOUT = "cfg"
+
+RUN_008_SHARED_DETECT_TAGS = True
+RUN_008_SLOW_APRILTAG = True
+RUN_008_UNDISTORT = True
+
+MERGE_RAW_PKL = INPUT_PKL
+MERGE_FINAL_POSE_PKL = RECORDINGS_DIR / "025_global_temporal_filter_fill_final.pkl"
+MERGE_OUTPUT_PKL = OUTPUT_PKL
+MERGE_TIMESTAMP_TOLERANCE = 1e-6
+MERGE_KEEP_ORIGINAL_POSE = True
+MERGE_KEEP_POSE_CANDIDATES = True
+
+FORMAT_008_RAW = "aprilcube_raw_frame_stream_v1"
 FORMAT_012_RAW = "aprilcube_rs_raw_frame_stream_v1"
 FORMAT_012_RAW_WITH_POSE = "aprilcube_012_raw_with_pose_stream_v1"
 SUPPORTED_012_INPUT_FORMATS = {FORMAT_012_RAW, FORMAT_012_RAW_WITH_POSE}
@@ -39,105 +52,13 @@ PIPELINE_STAGES = [
     },
     {
         "stage": "012_aprilcube_offline",
-        "summary": "Run src/014_visualize_012_pkl.py to create AprilCube single-frame/fallback pose pkl.",
-    },
-    {
-        "stage": "012_merge_aprilcube_pose",
-        "summary": "Run src/017_merge_012_raw_and_014_pose_pkl.py to attach AprilCube pose to raw frames.",
-    },
-    {
-        "stage": "012_deeptag_robust",
-        "summary": "Run src/016_deeptag_012_pkl.py to create DeepTag robust pose candidates.",
-    },
-    {
-        "stage": "012_deeptag_dense_strict",
-        "summary": "Run src/020_deeptag_dense_keypoints_pose.py with coverage/min-tag2 gates.",
-    },
-    {
-        "stage": "012_deeptag_dense_loose",
-        "summary": "Run src/020_deeptag_dense_keypoints_pose.py in a looser mode for edge-gated fallback candidates.",
-    },
-    {
-        "stage": "012_single_frame_recovery_fusion",
-        "summary": "Run src/023_fuse_all_single_frame_recovery_methods.py with no temporal filtering.",
-    },
-    {
-        "stage": "012_temporal_outline_refine",
-        "summary": "Run src/024_temporal_outline_refine_recovery.py for conservative RGB-outline recovery.",
-    },
-    {
-        "stage": "012_global_temporal_fill",
-        "summary": "Run src/025_global_temporal_filter_fill_remaining.py for final remaining failed frames.",
+        "summary": "Run src/014_visualize_012_pkl.py over raw image frames and write an offline pose stream.",
     },
     {
         "stage": "merge_final",
-        "summary": "Merge a final pose stream into the raw frame stream by capture_timestamp.",
+        "summary": "Merge the selected pose stream into the raw frame stream by capture_timestamp.",
     },
 ]
-
-
-def rewrite_legacy_argv(argv: list[str]) -> list[str]:
-    commands = {"auto", "008", "012", "merge-final"}
-    if not argv or argv[0] in {"-h", "--help"}:
-        return argv
-    if argv and argv[0] in commands:
-        return argv
-    if any(arg in {"--raw-pkl", "--final-pose-pkl"} for arg in argv):
-        return ["merge-final", *argv]
-    return ["auto", *argv]
-
-
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "One-entry AprilCube offline pose postprocess pipeline. Passing a pkl path directly "
-            "uses auto mode. Use merge-final to only merge an already-computed pose stream."
-        )
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    auto = subparsers.add_parser("auto", help="Inspect pkl format and run the matching available pipeline.")
-    add_common_run_args(auto)
-    auto.add_argument("pkl_path", nargs="?", type=Path, default=DEFAULT_012_PKL, help="Input raw-frame pkl.")
-    auto.add_argument("--output-pkl", type=Path, default=None, help="Output pkl for 012/final merge modes.")
-    auto.add_argument("--work-dir", type=Path, default=None, help="Directory for 012 intermediate pkls.")
-    auto.add_argument("--keep-intermediates", action="store_true", help="Keep 012 intermediate pkls.")
-    auto.add_argument("--run-benchmark", action="store_true", help="Also run 022 benchmark diagnostics.")
-
-    cmd008 = subparsers.add_parser("008", help="Run the 008 offline image-to-pose pipeline in-place.")
-    add_common_run_args(cmd008)
-    cmd008.add_argument("pkl_path", type=Path, help="008 raw-frame pkl.")
-
-    cmd012 = subparsers.add_parser("012", help="Run the available 012 raw-image to fused-pose pipeline.")
-    add_common_run_args(cmd012)
-    cmd012.add_argument("pkl_path", nargs="?", type=Path, default=DEFAULT_012_PKL, help="012 raw-frame pkl.")
-    cmd012.add_argument("--output-pkl", type=Path, default=None)
-    cmd012.add_argument("--work-dir", type=Path, default=None)
-    cmd012.add_argument("--keep-intermediates", action="store_true")
-    cmd012.add_argument("--run-benchmark", action="store_true", help="Also run 022 benchmark diagnostics.")
-
-    merge = subparsers.add_parser("merge-final", help="Only merge an existing final pose pkl into a raw pkl.")
-    merge.add_argument("--raw-pkl", type=Path, default=DEFAULT_RAW_PKL)
-    merge.add_argument("--final-pose-pkl", type=Path, default=DEFAULT_FINAL_POSE_PKL)
-    merge.add_argument("--output-pkl", type=Path, default=DEFAULT_OUTPUT_PKL)
-    merge.add_argument("--timestamp-tolerance", type=float, default=1e-6)
-    merge.add_argument("--keep-original-pose", action=argparse.BooleanOptionalAction, default=True)
-    merge.add_argument("--keep-pose-candidates", action=argparse.BooleanOptionalAction, default=False)
-
-    return parser.parse_args(rewrite_legacy_argv(argv))
-
-
-def add_common_run_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--python", type=Path, default=Path(sys.executable), help="Python executable for child scripts.")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
-    parser.add_argument("--fast", action="store_true", help="Use faster detector settings where supported.")
-    parser.add_argument("--no-undistort", action="store_true", help="Disable undistortion where supported.")
-    parser.add_argument(
-        "--shared-detect-tags",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use shared AprilTag detection for 008 replay.",
-    )
 
 
 def inspect_pkl_format(path: Path) -> str:
@@ -151,307 +72,85 @@ def inspect_pkl_format(path: Path) -> str:
     return fmt
 
 
-def run_command(cmd: list[str], *, dry_run: bool) -> None:
+def run_command(cmd: list[str]) -> None:
     print("[CMD] " + " ".join(cmd), flush=True)
-    if dry_run:
+    if DRY_RUN:
         return
     subprocess.run(cmd, cwd=str(APRILCUBE_ROOT), check=True)
 
 
-def python_cmd(args: argparse.Namespace, script_name: str, *extra: str) -> list[str]:
-    helper_dir = getattr(args, "_helper_script_dir", None)
-    if helper_dir is not None and script_name in HELPER_SCRIPT_NAMES:
-        script_path = Path(helper_dir) / script_name
-    else:
-        script_path = SRC_DIR / script_name
-    return [str(Path(args.python).expanduser()), str(script_path), *extra]
+def python_cmd(script_name: str, *extra: str) -> list[str]:
+    return [str(PYTHON_EXE.expanduser()), str(SRC_DIR / script_name), *extra]
 
 
-def prepare_helper_scripts(args: argparse.Namespace, work_dir: Path) -> Path:
-    helper_dir = work_dir / "_020_stage_helpers"
-    args._helper_script_dir = helper_dir
-    if bool(args.dry_run):
-        return helper_dir
-
-    helper_dir.mkdir(parents=True, exist_ok=True)
-    for script_name in sorted(HELPER_SCRIPT_NAMES):
-        source_ref = f"{HELPER_SOURCE_COMMIT}:src/{script_name}"
-        result = subprocess.run(
-            ["git", "show", source_ref],
-            cwd=str(APRILCUBE_ROOT),
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-        )
-        script_path = helper_dir / script_name
-        script_path.write_text(result.stdout, encoding="utf-8")
-        script_path.chmod(0o755)
-
-    for name, target in {
-        "012_rs_aprilcube_detect.py": SRC_DIR / "012_rs_aprilcube_detect.py",
-        "aprilcube": SRC_DIR / "aprilcube",
-    }.items():
-        link = helper_dir / name
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(target, target_is_directory=target.is_dir())
-
-    return helper_dir
-
-
-def run_008_pipeline(args: argparse.Namespace) -> Path:
-    pkl_path = Path(args.pkl_path).expanduser().resolve()
+def run_008_pipeline() -> Path:
+    pkl_path = INPUT_PKL.expanduser().resolve()
     fmt = inspect_pkl_format(pkl_path)
-    if fmt not in SUPPORTED_008_FORMATS:
+    if fmt != FORMAT_008_RAW:
         raise ValueError(f"Expected 008 raw pkl format, got {fmt}: {pkl_path}")
 
-    cmd = python_cmd(args, "011_visualize_008_pkl.py", str(pkl_path), "--precompute-only")
-    if bool(args.shared_detect_tags):
+    cmd = python_cmd("011_visualize_008_pkl.py", str(pkl_path), "--precompute-only")
+    if RUN_008_SHARED_DETECT_TAGS:
         cmd.append("--shared-detect-tags")
-    if not bool(args.fast):
+    if RUN_008_SLOW_APRILTAG:
         cmd.append("--slow")
-    if bool(args.no_undistort):
+    if not RUN_008_UNDISTORT:
         cmd.append("--no-undistort")
 
-    run_command(cmd, dry_run=bool(args.dry_run))
-    if not bool(args.dry_run):
+    run_command(cmd)
+    if not DRY_RUN:
         summarize_008_pose_cache(pkl_path)
     return pkl_path
 
 
-def default_012_output_path(raw_pkl: Path) -> Path:
-    return raw_pkl.with_name(f"{raw_pkl.stem}_with_020_postprocessed_pose.pkl")
-
-
-def default_work_dir(raw_pkl: Path) -> Path:
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    return RECORDINGS_DIR / f"020_work_{raw_pkl.stem}_{stamp}"
-
-
-def run_012_pipeline(args: argparse.Namespace) -> Path:
-    raw_pkl = Path(args.pkl_path).expanduser().resolve()
+def run_012_pipeline() -> Path:
+    raw_pkl = INPUT_PKL.expanduser().resolve()
     fmt = inspect_pkl_format(raw_pkl)
     if fmt not in SUPPORTED_012_INPUT_FORMATS:
         raise ValueError(
-            "The one-click 012 pipeline must start from a 012 stream with raw images "
+            "The 012 pipeline must start from a 012 stream with raw images "
             f"(format={SUPPORTED_012_INPUT_FORMATS}), got {fmt}: {raw_pkl}"
         )
 
-    output_pkl = Path(args.output_pkl).expanduser().resolve() if args.output_pkl else default_012_output_path(raw_pkl)
-    work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else default_work_dir(raw_pkl).resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    helper_dir = prepare_helper_scripts(args, work_dir)
-    print(f"[INFO] Stage helper scripts: {helper_dir}")
+    work_dir = WORK_DIR.expanduser().resolve()
+    april_pose_pkl = work_dir / f"014_offline_pose_vis_{raw_pkl.stem}_020_aprilcube.pkl"
+    output_pkl = OUTPUT_PKL.expanduser().resolve()
 
-    april_strict_pkl = work_dir / f"014_offline_pose_vis_{raw_pkl.stem}_aprilcube_style_nofill_notagfix.pkl"
-    april_merged_pkl = work_dir / f"017_{raw_pkl.stem}_with_aprilcube_pose.pkl"
-    deeptag_raw_pkl = work_dir / f"016_deeptag_robust_cluster_{raw_pkl.stem}.pkl"
-    deeptag_dense_strict_pkl = (
-        work_dir / f"020_deeptag_dense_keypoints_pose_{raw_pkl.stem}_faceframe_alltags_coverage_mintag2.pkl"
-    )
-    deeptag_dense_loose_pkl = work_dir / f"020_deeptag_dense_keypoints_pose_{raw_pkl.stem}_faceframe_alltags.pkl"
-    benchmark_pkl = work_dir / f"022_recovery_method_benchmark_{raw_pkl.stem}.pkl"
-    fused_single_frame_pkl = work_dir / f"023_fused_all_single_frame_recovery_{raw_pkl.stem}.pkl"
-    outline_refine_pkl = work_dir / f"024_temporal_outline_refine_recovery_conservative_fixed_{raw_pkl.stem}.pkl"
-    final_pose_pkl = work_dir / f"025_global_temporal_filter_fill_final_{raw_pkl.stem}.pkl"
+    if not DRY_RUN:
+        work_dir.mkdir(parents=True, exist_ok=True)
 
     cmd014 = python_cmd(
-        args,
         "014_visualize_012_pkl.py",
         str(raw_pkl),
         "--output-pkl",
-        str(april_strict_pkl),
+        str(april_pose_pkl),
         "--precompute-only",
         "--no-filter",
         "--fallback-layout",
-        "cfg",
-        "--no-fill-missing-pose",
+        RUN_012_FALLBACK_LAYOUT,
     )
-    if not bool(args.fast):
+    if RUN_012_SLOW_APRILTAG:
         cmd014.append("--slow")
-    if bool(args.no_undistort):
+    if not RUN_012_UNDISTORT:
         cmd014.append("--no-undistort")
-    run_command(cmd014, dry_run=bool(args.dry_run))
+    if not RUN_012_FILL_MISSING_POSE:
+        cmd014.append("--no-fill-missing-pose")
+    run_command(cmd014)
 
-    if fmt == FORMAT_012_RAW:
-        run_command(
-            python_cmd(
-                args,
-                "017_merge_012_raw_and_014_pose_pkl.py",
-                "--raw-pkl",
-                str(raw_pkl),
-                "--pose-pkl",
-                str(april_strict_pkl),
-                "--output-pkl",
-                str(april_merged_pkl),
-            ),
-            dry_run=bool(args.dry_run),
-        )
+    if DRY_RUN:
+        print(f"[DRY-RUN] merge-final raw={raw_pkl} final_pose={april_pose_pkl} output={output_pkl}")
     else:
-        april_merged_pkl = raw_pkl
-        print(
-            "[INFO] Input already has raw images plus a pose field; "
-            "using it as the raw/old-April stream for downstream stages."
+        merge_final_pose_stream(
+            raw_pkl=raw_pkl,
+            final_pose_pkl=april_pose_pkl,
+            output_pkl=output_pkl,
+            timestamp_tolerance=MERGE_TIMESTAMP_TOLERANCE,
+            keep_original_pose=MERGE_KEEP_ORIGINAL_POSE,
+            keep_pose_candidates=MERGE_KEEP_POSE_CANDIDATES,
         )
-    run_command(
-        python_cmd(
-            args,
-            "016_deeptag_012_pkl.py",
-            str(april_merged_pkl),
-            "--output-pkl",
-            str(deeptag_raw_pkl),
-            "--quiet-deeptag",
-        ),
-        dry_run=bool(args.dry_run),
-    )
-
-    run_command(
-        python_cmd(
-            args,
-            "020_deeptag_dense_keypoints_pose.py",
-            str(deeptag_raw_pkl),
-            "--output-pkl",
-            str(deeptag_dense_strict_pkl),
-            "--min-tags",
-            "2",
-            "--max-reproj",
-            "6.0",
-            "--point-reject-px",
-            "8.0",
-            "--tag-reject-px",
-            "8.0",
-            "--min-inlier-tag-fraction",
-            "0.5",
-            "--coverage-check-min-raw-tags",
-            "3",
-            "--max-required-inlier-tags",
-            "4",
-        ),
-        dry_run=bool(args.dry_run),
-    )
-    run_command(
-        python_cmd(
-            args,
-            "020_deeptag_dense_keypoints_pose.py",
-            str(deeptag_raw_pkl),
-            "--output-pkl",
-            str(deeptag_dense_loose_pkl),
-            "--min-tags",
-            "1",
-            "--max-reproj",
-            "12.0",
-            "--point-reject-px",
-            "12.0",
-            "--tag-reject-px",
-            "12.0",
-            "--min-inlier-tag-fraction",
-            "0.0",
-            "--coverage-check-min-raw-tags",
-            "1000000",
-            "--max-required-inlier-tags",
-            "1000000",
-        ),
-        dry_run=bool(args.dry_run),
-    )
-
-    if bool(args.run_benchmark):
-        run_command(
-            python_cmd(
-                args,
-                "022_benchmark_single_frame_recovery_methods.py",
-                "--raw-pkl",
-                str(april_merged_pkl),
-                "--deeptag-pkl",
-                str(deeptag_raw_pkl),
-                "--failed-reference-pkl",
-                str(deeptag_dense_strict_pkl),
-                "--loose-candidate-pkl",
-                str(deeptag_dense_loose_pkl),
-                "--april-old-pkl",
-                str(april_merged_pkl),
-                "--output-pkl",
-                str(benchmark_pkl),
-            ),
-            dry_run=bool(args.dry_run),
-        )
-
-    run_command(
-        python_cmd(
-            args,
-            "023_fuse_all_single_frame_recovery_methods.py",
-            "--raw-pkl",
-            str(april_merged_pkl),
-            "--deeptag-raw-pkl",
-            str(deeptag_raw_pkl),
-            "--deeptag-pose-pkl",
-            str(deeptag_dense_strict_pkl),
-            "--april-strict-pkl",
-            str(april_strict_pkl),
-            "--loose-deeptag-pkl",
-            str(deeptag_dense_loose_pkl),
-            "--old-april-pkl",
-            str(april_merged_pkl),
-            "--output-pkl",
-            str(fused_single_frame_pkl),
-            "--min-tags",
-            "2",
-            "--max-reproj",
-            "3.0",
-            "--edge-threshold",
-            "0.45",
-            "--single-tag-edge-threshold",
-            "0.60",
-            "--single-tag-max-reproj",
-            "1.0",
-        ),
-        dry_run=bool(args.dry_run),
-    )
-    run_command(
-        python_cmd(
-            args,
-            "024_temporal_outline_refine_recovery.py",
-            "--input-pkl",
-            str(fused_single_frame_pkl),
-            "--raw-pkl",
-            str(april_merged_pkl),
-            "--output-pkl",
-            str(outline_refine_pkl),
-            "--reject-loose-input",
-        ),
-        dry_run=bool(args.dry_run),
-    )
-    run_command(
-        python_cmd(
-            args,
-            "025_global_temporal_filter_fill_remaining.py",
-            "--input-pkl",
-            str(outline_refine_pkl),
-            "--raw-pkl",
-            str(april_merged_pkl),
-            "--output-pkl",
-            str(final_pose_pkl),
-        ),
-        dry_run=bool(args.dry_run),
-    )
-
-    merge_args = argparse.Namespace(
-        raw_pkl=raw_pkl,
-        final_pose_pkl=final_pose_pkl,
-        output_pkl=output_pkl,
-        timestamp_tolerance=1e-6,
-        keep_original_pose=True,
-        keep_pose_candidates=True,
-    )
-    if not bool(args.dry_run):
-        merge_final_pose_stream(merge_args)
         summarize_pose_stream(output_pkl, "pose")
-    else:
-        print(
-            "[DRY-RUN] merge-final "
-            f"--raw-pkl {raw_pkl} --final-pose-pkl {final_pose_pkl} --output-pkl {output_pkl}"
-        )
 
-    if not bool(args.keep_intermediates) and not bool(args.dry_run):
+    if not KEEP_INTERMEDIATES and not DRY_RUN:
         shutil.rmtree(work_dir)
         print(f"[INFO] Removed work dir: {work_dir}")
     else:
@@ -459,15 +158,15 @@ def run_012_pipeline(args: argparse.Namespace) -> Path:
     return output_pkl
 
 
-def run_auto(args: argparse.Namespace) -> Path:
-    pkl_path = Path(args.pkl_path).expanduser().resolve()
-    fmt = inspect_pkl_format(pkl_path)
-    print(f"[INFO] Input format: {fmt}")
-    if fmt in SUPPORTED_008_FORMATS:
-        return run_008_pipeline(args)
-    if fmt in SUPPORTED_012_INPUT_FORMATS:
-        return run_012_pipeline(args)
-    raise ValueError(f"Unsupported input pkl format for auto mode: {fmt}")
+def run_merge_final_only() -> Path:
+    return merge_final_pose_stream(
+        raw_pkl=MERGE_RAW_PKL.expanduser().resolve(),
+        final_pose_pkl=MERGE_FINAL_POSE_PKL.expanduser().resolve(),
+        output_pkl=MERGE_OUTPUT_PKL.expanduser().resolve(),
+        timestamp_tolerance=MERGE_TIMESTAMP_TOLERANCE,
+        keep_original_pose=MERGE_KEEP_ORIGINAL_POSE,
+        keep_pose_candidates=MERGE_KEEP_POSE_CANDIDATES,
+    )
 
 
 def build_stream_index(path: Path) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
@@ -530,11 +229,15 @@ def frame_indices_match(raw_frame: dict[str, Any], pose_frame: dict[str, Any]) -
     return int(raw_idx) == int(pose_idx)
 
 
-def merge_final_pose_stream(args: argparse.Namespace) -> Path:
-    raw_pkl = Path(args.raw_pkl).expanduser().resolve()
-    final_pose_pkl = Path(args.final_pose_pkl).expanduser().resolve()
-    output_pkl = Path(args.output_pkl).expanduser().resolve()
-
+def merge_final_pose_stream(
+    *,
+    raw_pkl: Path,
+    final_pose_pkl: Path,
+    output_pkl: Path,
+    timestamp_tolerance: float,
+    keep_original_pose: bool,
+    keep_pose_candidates: bool,
+) -> Path:
     raw_header, raw_offsets, raw_footer = build_stream_index(raw_pkl)
     final_header, final_offsets, final_footer = build_stream_index(final_pose_pkl)
     if len(raw_offsets) != len(final_offsets):
@@ -562,9 +265,9 @@ def merge_final_pose_stream(args: argparse.Namespace) -> Path:
                 "metadata": {
                     "pipeline_stages": PIPELINE_STAGES,
                     "merge_key": "capture_timestamp",
-                    "timestamp_tolerance": float(args.timestamp_tolerance),
-                    "keep_original_pose": bool(args.keep_original_pose),
-                    "keep_pose_candidates": bool(args.keep_pose_candidates),
+                    "timestamp_tolerance": float(timestamp_tolerance),
+                    "keep_original_pose": bool(keep_original_pose),
+                    "keep_pose_candidates": bool(keep_pose_candidates),
                 },
             },
             f,
@@ -574,7 +277,7 @@ def merge_final_pose_stream(args: argparse.Namespace) -> Path:
         for out_idx, raw_offset in enumerate(raw_offsets):
             raw_frame = load_at(raw_pkl, raw_offset)
             raw_ts = float(raw_frame["capture_timestamp"])
-            pose_ts, pose_offset = nearest_timestamp(raw_ts, final_by_timestamp, float(args.timestamp_tolerance))
+            pose_ts, pose_offset = nearest_timestamp(raw_ts, final_by_timestamp, float(timestamp_tolerance))
             pose_frame = load_at(final_pose_pkl, pose_offset)
             if not frame_indices_match(raw_frame, pose_frame):
                 raise ValueError(
@@ -583,7 +286,7 @@ def merge_final_pose_stream(args: argparse.Namespace) -> Path:
                 )
 
             out_frame = dict(raw_frame)
-            if bool(args.keep_original_pose):
+            if keep_original_pose:
                 out_frame["pose_original_raw"] = raw_frame.get("pose", {})
             out_frame["pose"] = pose_frame.get("pose", {})
             out_frame["pose_postprocessed"] = True
@@ -594,7 +297,7 @@ def merge_final_pose_stream(args: argparse.Namespace) -> Path:
             out_frame["overlay_shape"] = pose_frame.get("overlay_shape", raw_frame.get("overlay_shape"))
             out_frame["overlay_format"] = pose_frame.get("overlay_format", raw_frame.get("overlay_format"))
             out_frame["overlay_jpeg"] = pose_frame.get("overlay_jpeg", raw_frame.get("overlay_jpeg"))
-            if bool(args.keep_pose_candidates) and "pose_candidates" in pose_frame:
+            if keep_pose_candidates and "pose_candidates" in pose_frame:
                 out_frame["pose_candidates"] = pose_frame["pose_candidates"]
 
             pose = out_frame.get("pose", {})
@@ -680,17 +383,17 @@ def summarize_pose_stream(path: Path, pose_field: str) -> None:
 
 
 def main() -> None:
-    args = parse_args(sys.argv[1:])
-    if args.command == "auto":
-        output = run_auto(args)
-    elif args.command == "008":
-        output = run_008_pipeline(args)
-    elif args.command == "012":
-        output = run_012_pipeline(args)
-    elif args.command == "merge-final":
-        output = merge_final_pose_stream(args)
+    if len(sys.argv) > 1:
+        raise SystemExit("020_finalize_pose_postprocess.py does not accept CLI args; edit constants at the top.")
+
+    if RUN_MODE == "008":
+        output = run_008_pipeline()
+    elif RUN_MODE == "012":
+        output = run_012_pipeline()
+    elif RUN_MODE == "MERGE_FINAL":
+        output = run_merge_final_only()
     else:
-        raise ValueError(f"Unknown command: {args.command}")
+        raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}")
     print(f"[INFO] Done: {output}")
 
 
