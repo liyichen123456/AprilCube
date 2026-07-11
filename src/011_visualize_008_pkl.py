@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib
 import importlib.util
 import pickle
 import sys
@@ -19,8 +20,10 @@ DEFAULT_RECORDING_DIR = THIS_FILE.parent.parent / "recordings"
 VISER_HOST = "0.0.0.0"
 VISER_PORT = 8091
 DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect_multi_cube.py"
+ASSETS_DIR = THIS_FILE.parent.parent / "assets"
+OBJ_MESH_SCALE = 0.001
 POSE_CACHE_FORMAT = "aprilcube_008_pose_cache_v1"
-IMAGE_RECOVERY_VERSION = 7
+IMAGE_RECOVERY_VERSION = 9
 SINGLE_TAG_CONTINUITY_GATE_ENABLED = True
 SINGLE_TAG_CONTINUITY_MAX_ROTATION_DEG = 45.0
 SINGLE_TAG_CONTINUITY_MIN_FACE_OBSERVATIONS = 2
@@ -47,6 +50,34 @@ TEMPORAL_ROTATION_JUMP_LIMIT_ENABLED = True
 TEMPORAL_ROTATION_JUMP_MAX_DEG = 20.0
 TEMPORAL_ROTATION_JUMP_HOLD_DEG = 60.0
 TEMPORAL_ROTATION_JUMP_LIMIT_VERSION = 2
+
+
+def install_numpy_pickle_compat() -> None:
+    """Allow NumPy 2.x pickles to load in NumPy 1.x environments."""
+    try:
+        numpy_core = importlib.import_module("numpy.core")
+    except Exception:
+        return
+
+    sys.modules.setdefault("numpy._core", numpy_core)
+    for module_name in (
+        "multiarray",
+        "numeric",
+        "numerictypes",
+        "overrides",
+        "fromnumeric",
+        "shape_base",
+        "umath",
+        "_multiarray_umath",
+    ):
+        try:
+            module = importlib.import_module(f"numpy.core.{module_name}")
+        except Exception:
+            continue
+        sys.modules.setdefault(f"numpy._core.{module_name}", module)
+
+
+install_numpy_pickle_compat()
 
 
 def load_demo008_module() -> Any:
@@ -202,6 +233,7 @@ def result_copy_for_replay(result: dict[str, Any]) -> dict[str, Any]:
         "tag_ids",
         "visible_faces",
         "predicted",
+        "direct_all_point_pnp",
         "single_tag_cfg_pose",
         "single_tag_id",
         "single_tag_face",
@@ -829,6 +861,27 @@ def cube_scene_node_name(cube_name: str) -> str:
     return f"/world_thumb_web_camera/{safe}"
 
 
+def load_obj_mesh_for_viser(
+    obj_name: str,
+    color: tuple[int, int, int],
+) -> tuple[Any, Path]:
+    import trimesh
+
+    obj_path = ASSETS_DIR / f"{obj_name}.obj"
+    if not obj_path.is_file():
+        raise FileNotFoundError(f"OBJ mesh not found: {obj_path}")
+
+    loaded = trimesh.load(obj_path, process=False)
+    if isinstance(loaded, trimesh.Scene):
+        mesh = trimesh.util.concatenate(tuple(loaded.geometry.values()))
+    else:
+        mesh = loaded
+
+    rgba = np.asarray([color[0], color[1], color[2], 210], dtype=np.uint8)
+    mesh.visual.vertex_colors = np.tile(rgba, (len(mesh.vertices), 1))
+    return mesh, obj_path
+
+
 def cube_pose_tracks(pose_cache: list[dict[str, Any]]) -> dict[str, list[tuple[int, np.ndarray]]]:
     tracks: dict[str, list[tuple[int, np.ndarray]]] = {}
     for frame_idx, pose_frame in enumerate(pose_cache):
@@ -915,6 +968,8 @@ def create_3d_scene_handles(
         }
     }
     tracks = cube_pose_tracks(pose_cache)
+    obj_mesh_cache: dict[str, tuple[Any, Path]] = {}
+    cfg_to_obj = getattr(estimator.demo008, "CUBE_CFG_NAME_TO_OBJ_NAME", {})
     color_idx = 0
     for camera_name in estimator.active_camera_names:
         for entry in estimator.detector_entries_by_camera.get(camera_name, []):
@@ -941,6 +996,27 @@ def create_3d_scene_handles(
                 side="double",
                 visible=False,
             )
+            obj_mesh_handle = None
+            obj_name = str(cfg_to_obj.get(cube_name, ""))
+            if obj_name:
+                try:
+                    if obj_name not in obj_mesh_cache:
+                        obj_mesh_cache[obj_name] = load_obj_mesh_for_viser(obj_name, color)
+                    mesh, obj_path = obj_mesh_cache[obj_name]
+                    obj_mesh_handle = server.scene.add_mesh_trimesh(
+                        f"{node}/finger_obj",
+                        mesh.copy(),
+                        scale=OBJ_MESH_SCALE,
+                        visible=False,
+                        cast_shadow=False,
+                        receive_shadow=False,
+                    )
+                    print(f"[INFO] 3D OBJ mesh: {cube_name} -> {obj_name} path={obj_path}")
+                except Exception as exc:
+                    print(
+                        f"[WARNING] Failed to add 3D OBJ mesh for {cube_name} -> {obj_name}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             track = tracks.get(cube_name, [])
             track_segments = make_track_segments(track)
             trajectory_handle = server.scene.add_line_segments(
@@ -996,6 +1072,7 @@ def create_3d_scene_handles(
             handles[cube_name] = {
                 "frame": frame_handle,
                 "box": box_handle,
+                "obj_mesh": obj_mesh_handle,
                 "base_color": color,
                 "trajectory": trajectory_handle,
                 "samples": samples_handle,
@@ -1022,7 +1099,7 @@ def update_3d_scene(
         seen.add(cube_name)
         success = bool(result.get("success", False))
         handles["pose_visible"] = success
-        for key in ("frame", "box", "current"):
+        for key in ("frame", "box", "obj_mesh", "current"):
             handle = handles.get(key)
             if handle is not None:
                 handle.visible = success
@@ -1047,7 +1124,7 @@ def update_3d_scene(
         if cube_name in seen:
             continue
         handles["pose_visible"] = False
-        for key in ("frame", "box", "current"):
+        for key in ("frame", "box", "obj_mesh", "current"):
             handle = handles.get(key)
             if handle is not None:
                 handle.visible = False
@@ -1062,6 +1139,7 @@ def apply_3d_visibility(
     scene_handles: dict[str, dict[str, Any]],
     *,
     show_box: bool,
+    show_obj: bool,
     show_axes: bool,
     show_trajectory: bool,
     show_samples: bool,
@@ -1078,6 +1156,8 @@ def apply_3d_visibility(
         pose_visible = bool(handles.get("pose_visible", False))
         if "box" in handles:
             handles["box"].visible = bool(show_box) and pose_visible
+        if "obj_mesh" in handles and handles["obj_mesh"] is not None:
+            handles["obj_mesh"].visible = bool(show_obj) and pose_visible
         if "frame" in handles:
             handles["frame"].visible = bool(show_axes) and pose_visible
         set_optional_visible(handles.get("current"), show_trajectory and pose_visible)
@@ -2300,6 +2380,7 @@ def main() -> None:
 
     with server.gui.add_folder("3D View"):
         show_box_checkbox = server.gui.add_checkbox("Cube box", initial_value=True)
+        show_obj_checkbox = server.gui.add_checkbox("Finger OBJ", initial_value=True)
         show_axes_checkbox = server.gui.add_checkbox("Cube axes", initial_value=True)
         show_trajectory_checkbox = server.gui.add_checkbox("Trajectory", initial_value=True)
         show_samples_checkbox = server.gui.add_checkbox("Pose samples", initial_value=True)
@@ -2332,6 +2413,7 @@ def main() -> None:
         apply_3d_visibility(
             scene_handles,
             show_box=bool(show_box_checkbox.value),
+            show_obj=bool(show_obj_checkbox.value),
             show_axes=bool(show_axes_checkbox.value),
             show_trajectory=bool(show_trajectory_checkbox.value),
             show_samples=bool(show_samples_checkbox.value),
@@ -2374,6 +2456,7 @@ def main() -> None:
                 apply_3d_visibility(
                     scene_handles,
                     show_box=bool(show_box_checkbox.value),
+                    show_obj=bool(show_obj_checkbox.value),
                     show_axes=bool(show_axes_checkbox.value),
                     show_trajectory=bool(show_trajectory_checkbox.value),
                     show_samples=bool(show_samples_checkbox.value),
