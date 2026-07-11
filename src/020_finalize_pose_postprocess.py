@@ -15,6 +15,12 @@ run by itself without launching or importing the old numbered stage scripts.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import copy
+import importlib
+import io
+import os
 import pickle
 import shutil
 import sys
@@ -23,12 +29,46 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
+import trimesh
+import viser
+import yaml
+from PIL import Image
+from scipy.interpolate import UnivariateSpline
+from scipy.optimize import minimize
+from scipy.spatial.transform import Rotation, Slerp
+
 APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = APRILCUBE_ROOT / "src"
 RECORDINGS_DIR = APRILCUBE_ROOT / "recordings"
+PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
+RECORDER_UTILS_DIR = PROJECT_ROOT / "scripts" / "utils"
+DEEPTAG_ROOT = APRILCUBE_ROOT / "thirdparty" / "deeptag-pytorch"
 
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_path in (SRC_DIR, RECORDER_UTILS_DIR, DEEPTAG_ROOT):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
+
+import aprilcube
+from aprilcube import detect as aprilcube_detect
+from aprilcube.detect import (
+    _gamma_correct,
+    _linear_contrast,
+    _preprocess,
+    _preprocess_clahe,
+    _quad_quality,
+    _sharpen,
+    create_detector,
+    create_fallback_detector,
+    estimate_pose,
+    estimate_single_tag_cube_pose,
+)
+from fiducial_marker.unit_arucotag import UnitArucoTag
+from recorder_cv2_cam import CV2CameraManager
+from stag_decode.pose_estimator import get_fine_grid_points_anno
+
+preprocess_tag_image = _preprocess
 
 # Set only these two paths before running. The pipeline intentionally has no
 # command-line options, so the configured input and output remain reproducible.
@@ -988,25 +1028,10 @@ def summarize_pose_stream(path: Path, pose_field: str) -> None:
 
 
 # ---- Camera calibration and AprilCube detector helpers ----
-import argparse
-import pickle
-import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-import yaml
 CV2_CAPTURE_THIS_FILE = Path(__file__).resolve()
 CV2_CAPTURE_THIRDPARTY_DIR = CV2_CAPTURE_THIS_FILE.parent.parent.parent
 CV2_CAPTURE_PROJECT_ROOT = CV2_CAPTURE_THIRDPARTY_DIR.parent
 CV2_CAPTURE_RECORDER_UTILS_DIR = CV2_CAPTURE_PROJECT_ROOT / 'scripts' / 'utils'
-if str(CV2_CAPTURE_RECORDER_UTILS_DIR) not in sys.path:
-    sys.path.insert(0, str(CV2_CAPTURE_RECORDER_UTILS_DIR))
-import aprilcube
-from aprilcube.detect import _preprocess as preprocess_tag_image
-from recorder_cv2_cam import CV2CameraManager
 
 def cv2_capture_load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
     yaml_path = Path(path).expanduser().resolve()
@@ -1216,7 +1241,6 @@ def cv2_capture_cube_cfg_name_from_path(cube_path: Path) -> str:
     return cube_path.name if cube_path.is_dir() else cube_path.parent.name
 
 def cv2_capture_load_obj_overlay(obj_name: str, *, max_edges: int=CV2_CAPTURE_OBJ_OVERLAY_MAX_EDGES) -> Cv2ObjectOverlay:
-    import trimesh
     obj_path = CV2_CAPTURE_ASSETS_DIR / f'{obj_name}.obj'
     if not obj_path.is_file():
         raise FileNotFoundError(f'OBJ overlay file not found: {obj_path}')
@@ -1527,18 +1551,6 @@ def cv2_capture_main() -> None:
 
 
 # ---- 008 recording replay and visualization ----
-import argparse
-import copy
-import importlib
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-import viser
-from PIL import Image
 REPLAY_008_THIS_FILE = Path(__file__).resolve()
 REPLAY_008_DEFAULT_RECORDING_DIR = REPLAY_008_THIS_FILE.parent.parent / 'recordings'
 REPLAY_008_VISER_HOST = '0.0.0.0'
@@ -1910,10 +1922,9 @@ class Replay008PoseEstimator:
         base_state_after = replay_008_snapshot_detector_tracking_state(detector)
         if replay_008_is_measured_pose(base_result) or not self.adaptive_clahe:
             return (base_result, base_tags, 'base')
-        from aprilcube import detect as detect_mod
-        variants = getattr(detect_mod, '_adaptive_image_enhancement_variants', ())
+        variants = getattr(aprilcube_detect, '_adaptive_image_enhancement_variants', ())
         if not variants:
-            variants = tuple(({'name': f'adaptive clip={float(clip_limit):.1f} tile={tuple(tile_grid_size)}', 'clahe': (float(clip_limit), tuple(tile_grid_size))} for clip_limit, tile_grid_size in getattr(detect_mod, '_adaptive_clahe_variants', ())))
+            variants = tuple(({'name': f'adaptive clip={float(clip_limit):.1f} tile={tuple(tile_grid_size)}', 'clahe': (float(clip_limit), tuple(tile_grid_size))} for clip_limit, tile_grid_size in getattr(aprilcube_detect, '_adaptive_clahe_variants', ())))
         for variant in variants:
             replay_008_restore_detector_tracking_state(detector, state_before)
             candidate_tags = detector.detect_tags(detect_frame, adaptive_clahe=True, enhancement_variants=(dict(variant),))
@@ -1939,14 +1950,13 @@ class Replay008PoseEstimator:
 
     @staticmethod
     def detector_input_gray_for_mode(gray: np.ndarray, mode: str) -> np.ndarray:
-        from aprilcube import detect as detect_mod
         if mode in ('base', 'shared_base', 'base_failed_enhancement_rejected', 'temporal_fill'):
-            return detect_mod._preprocess(gray)
-        variants = getattr(detect_mod, '_adaptive_image_enhancement_variants', ())
+            return aprilcube_detect._preprocess(gray)
+        variants = getattr(aprilcube_detect, '_adaptive_image_enhancement_variants', ())
         for variant in variants:
             if str(variant.get('name', '')) == mode:
-                return detect_mod._preprocess_enhancement_variant(gray, dict(variant))
-        return detect_mod._preprocess(gray)
+                return aprilcube_detect._preprocess_enhancement_variant(gray, dict(variant))
+        return aprilcube_detect._preprocess(gray)
 
     def draw_detector_input_frame(self, record: dict[str, Any], pose_frame: dict[str, Any]) -> np.ndarray:
         camera_name = pose_frame['camera_name']
@@ -2070,7 +2080,6 @@ def replay_008_cube_scene_node_name(cube_name: str) -> str:
     return f'/world_thumb_web_camera/{safe}'
 
 def replay_008_load_obj_mesh_for_viser(obj_name: str, color: tuple[int, int, int]) -> tuple[Any, Path]:
-    import trimesh
     obj_path = REPLAY_008_ASSETS_DIR / f'{obj_name}.obj'
     if not obj_path.is_file():
         raise FileNotFoundError(f'OBJ mesh not found: {obj_path}')
@@ -2896,27 +2905,11 @@ def replay_008_main(args: Replay008ViewerConfig) -> None:
 
 
 # ---- RealSense recording and calibration helpers ----
-import argparse
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-import yaml
 REALSENSE_THIS_FILE = Path(__file__).resolve()
 REALSENSE_APRILCUBE_ROOT = REALSENSE_THIS_FILE.parent.parent
 REALSENSE_THIRDPARTY_DIR = REALSENSE_APRILCUBE_ROOT.parent
 REALSENSE_PROJECT_ROOT = REALSENSE_THIRDPARTY_DIR.parent
 REALSENSE_RECORDER_UTILS_DIR = REALSENSE_PROJECT_ROOT / 'scripts' / 'utils'
-if str(REALSENSE_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(REALSENSE_THIS_FILE.parent))
-if str(REALSENSE_RECORDER_UTILS_DIR) not in sys.path:
-    sys.path.insert(0, str(REALSENSE_RECORDER_UTILS_DIR))
-import aprilcube
-from aprilcube.detect import _preprocess as preprocess_tag_image
-from recorder_rs import RealSenseManager
 REALSENSE_DEFAULT_INTRINSICS_YAML = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_realsense_1280x720_0707_171032.yaml')
 REALSENSE_DEFAULT_CUBE_CFG = Path('/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cubes/cube_april_36h11_100_123_2x2x2_outer62p5mm')
 REALSENSE_WINDOW_NAME = 'RealSense D435 AprilCube'
@@ -3069,23 +3062,11 @@ class RealSenseRawFrameRecorder:
         print(f'[INFO] Saved raw-frame PKL recording: {path} frames={total_frames}')
 
 # ---- Strict AprilCube offline pose estimation ----
-import argparse
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-import viser
 STRICT_APRILCUBE_THIS_FILE = Path(__file__).resolve()
 STRICT_APRILCUBE_APRILCUBE_ROOT = STRICT_APRILCUBE_THIS_FILE.parent.parent
 STRICT_APRILCUBE_DEFAULT_RECORDING_DIR = STRICT_APRILCUBE_APRILCUBE_ROOT / 'recordings'
 STRICT_APRILCUBE_DEFAULT_PORT = 8094
 STRICT_APRILCUBE_PLAYBACK_FPS = 15.0
-if str(STRICT_APRILCUBE_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(STRICT_APRILCUBE_THIS_FILE.parent))
-import aprilcube
 
 def strict_aprilcube_resolve_pkl_path(path_str: str) -> Path:
     path = Path(path_str).expanduser().resolve()
@@ -3587,7 +3568,6 @@ def strict_aprilcube_add_optional_cube_mesh(server: viser.ViserServer, cube_cfg:
     if not obj_path.exists():
         return
     try:
-        import trimesh
         mesh = trimesh.load(str(obj_path))
         server.scene.add_mesh_trimesh('/cube/mesh', mesh)
     except Exception as exc:
@@ -3703,14 +3683,6 @@ def strict_aprilcube_main(args: StrictAprilCubeEstimationConfig) -> None:
 
 
 # ---- Pose result visualization ----
-import argparse
-import pickle
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-import viser
 POSE_VIEWER_APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 POSE_VIEWER_DEFAULT_PKL = POSE_VIEWER_APRILCUBE_ROOT / 'recordings' / '012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
 POSE_VIEWER_SUPPORTED_FORMATS = {'aprilcube_012_offline_pose_vis_stream_v1', 'aprilcube_012_raw_with_pose_stream_v1', 'aprilcube_raw_with_020_postprocessed_pose_stream_v1', 'aprilcube_deeptag_fused_stream_v1', 'deeptag_012_offline_stream_v1'}
@@ -3894,28 +3866,12 @@ def pose_viewer_main(args: PoseVisualizationConfig) -> None:
 
 
 # ---- DeepTag keypoint detection ----
-import argparse
-import contextlib
-import io
-import json
-import os
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
 DEEPTAG_DETECTION_THIS_FILE = Path(__file__).resolve()
 DEEPTAG_DETECTION_APRILCUBE_ROOT = DEEPTAG_DETECTION_THIS_FILE.parent.parent
 DEEPTAG_DETECTION_DEEPTAG_ROOT = DEEPTAG_DETECTION_APRILCUBE_ROOT / 'thirdparty' / 'deeptag-pytorch'
 DEEPTAG_DETECTION_DEFAULT_INPUT_PKL = DEEPTAG_DETECTION_APRILCUBE_ROOT / 'recordings' / '012_rs_raw_frames_20260710_214336.pkl'
 DEEPTAG_DETECTION_DEFAULT_MERGED_INPUT_PKL = DEEPTAG_DETECTION_APRILCUBE_ROOT / 'recordings' / '012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
 DEEPTAG_DETECTION_DEFAULT_OUTPUT_PKL = DEEPTAG_DETECTION_APRILCUBE_ROOT / 'recordings' / '016_deeptag_robust_cluster_012_rs_raw_frames_20260710_214336.pkl'
-if str(DEEPTAG_DETECTION_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(DEEPTAG_DETECTION_THIS_FILE.parent))
-import aprilcube
-from aprilcube.detect import estimate_pose, estimate_single_tag_cube_pose
 
 DEEPTAG_DETECTION_SUPPORTED_INPUT_FORMATS = {'aprilcube_rs_raw_frame_stream_v1', 'aprilcube_012_raw_with_pose_stream_v1'}
 
@@ -3971,18 +3927,22 @@ def deeptag_detection_encode_bgr_jpeg(image_bgr: np.ndarray, quality: int) -> by
 def deeptag_detection_load_deeptag_engine(*, camera_matrix: np.ndarray, dist_coeffs: np.ndarray, tag_size_m: float, args: DeepTagDetectionConfig) -> Any:
     if not DEEPTAG_DETECTION_DEEPTAG_ROOT.exists():
         raise FileNotFoundError(f'DeepTag repo not found: {DEEPTAG_DETECTION_DEEPTAG_ROOT}')
-    if str(DEEPTAG_DETECTION_DEEPTAG_ROOT) not in sys.path:
-        sys.path.insert(0, str(DEEPTAG_DETECTION_DEEPTAG_ROOT))
     old_cwd = Path.cwd()
     os.chdir(DEEPTAG_DETECTION_DEEPTAG_ROOT)
     try:
-        from deeptag_model_setting import load_deeptag_models
-        from marker_dict_setting import load_marker_codebook
-        from stag_decode.detection_engine import DetectionEngine
+        load_deeptag_models = importlib.import_module(
+            "deeptag_model_setting"
+        ).load_deeptag_models
+        load_marker_codebook = importlib.import_module(
+            "marker_dict_setting"
+        ).load_marker_codebook
+        detection_engine_class = importlib.import_module(
+            "stag_decode.detection_engine"
+        ).DetectionEngine
         device = 'cpu' if args.cpu else None
         model_detector, model_decoder, device, tag_type, grid_size_cand_list = load_deeptag_models('apriltag', device)
         codebook = load_marker_codebook(str(DEEPTAG_DETECTION_DEEPTAG_ROOT / 'codebook' / 'apriltag_codebook.txt'), tag_type)
-        engine = DetectionEngine(model_detector, model_decoder, device, tag_type, grid_size_cand_list, stg2_iter_num=int(args.stg2_iter_num), min_center_score=float(args.min_center_score), min_corner_score=float(args.min_corner_score), batch_size_stg2=int(args.batch_size_stg2), hamming_dist=int(args.hamming_dist), cameraMatrix=np.asarray(camera_matrix, dtype=np.float32).reshape(3, 3), distCoeffs=np.asarray(dist_coeffs, dtype=np.float32).reshape(-1), codebook=codebook, tag_real_size_in_meter_dict={-1: float(tag_size_m)})
+        engine = detection_engine_class(model_detector, model_decoder, device, tag_type, grid_size_cand_list, stg2_iter_num=int(args.stg2_iter_num), min_center_score=float(args.min_center_score), min_corner_score=float(args.min_corner_score), batch_size_stg2=int(args.batch_size_stg2), hamming_dist=int(args.hamming_dist), cameraMatrix=np.asarray(camera_matrix, dtype=np.float32).reshape(3, 3), distCoeffs=np.asarray(dist_coeffs, dtype=np.float32).reshape(-1), codebook=codebook, tag_real_size_in_meter_dict={-1: float(tag_size_m)})
         return engine
     finally:
         os.chdir(old_cwd)
@@ -4382,12 +4342,6 @@ def deeptag_detection_main(args: DeepTagDetectionConfig) -> None:
 
 
 # ---- Raw frame and strict pose merge ----
-import argparse
-import pickle
-import time
-from pathlib import Path
-from typing import Any
-import numpy as np
 STRICT_POSE_MERGE_APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 STRICT_POSE_MERGE_DEFAULT_RAW_PKL = STRICT_POSE_MERGE_APRILCUBE_ROOT / 'recordings' / '012_rs_raw_frames_20260710_214336.pkl'
 STRICT_POSE_MERGE_DEFAULT_POSE_PKL = STRICT_POSE_MERGE_APRILCUBE_ROOT / 'recordings' / '014_offline_pose_vis_012_rs_raw_frames_20260710_214336.pkl'
@@ -4489,26 +4443,11 @@ def strict_pose_merge_main(args: RawPoseMergeConfig) -> None:
 
 
 # ---- Dense DeepTag pose estimation ----
-import argparse
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
 DENSE_DEEPTAG_THIS_FILE = Path(__file__).resolve()
 DENSE_DEEPTAG_APRILCUBE_ROOT = DENSE_DEEPTAG_THIS_FILE.parent.parent
 DENSE_DEEPTAG_DEEPTAG_ROOT = DENSE_DEEPTAG_APRILCUBE_ROOT / 'thirdparty' / 'deeptag-pytorch'
 DENSE_DEEPTAG_DEFAULT_INPUT_PKL = DENSE_DEEPTAG_APRILCUBE_ROOT / 'recordings' / '016_deeptag_robust_cluster_012_rs_raw_frames_20260710_214336.pkl'
 DENSE_DEEPTAG_DEFAULT_OUTPUT_PKL = DENSE_DEEPTAG_APRILCUBE_ROOT / 'recordings' / '020_deeptag_dense_keypoints_pose_012_rs_raw_frames_20260710_214336.pkl'
-if str(DENSE_DEEPTAG_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(DENSE_DEEPTAG_THIS_FILE.parent))
-if str(DENSE_DEEPTAG_DEEPTAG_ROOT) not in sys.path:
-    sys.path.insert(0, str(DENSE_DEEPTAG_DEEPTAG_ROOT))
-import aprilcube
-from stag_decode.pose_estimator import get_fine_grid_points_anno
-from fiducial_marker.unit_arucotag import UnitArucoTag
 DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS = {'id': (0, 1, 2, 3), 'rot90': (1, 2, 3, 0), 'rev': (0, 3, 2, 1), 'rot180': (2, 3, 0, 1), 'rot270': (3, 0, 1, 2), 'rev_rot90': (1, 0, 3, 2), 'rev_rot180': (2, 1, 0, 3), 'rev_rot270': (3, 2, 1, 0)}
 
 def dense_deeptag_build_stream_index(path: Path, expected_format: set[str] | None=None) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
@@ -5027,15 +4966,6 @@ def dense_deeptag_main(args: DenseDeepTagPoseConfig) -> None:
 
 
 # ---- Single-frame recovery primitives and benchmark ----
-import argparse
-import math
-import pickle
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
 POSE_RECOVERY_THIS_FILE = Path(__file__).resolve()
 POSE_RECOVERY_APRILCUBE_ROOT = POSE_RECOVERY_THIS_FILE.parent.parent
 POSE_RECOVERY_DEFAULT_RAW_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
@@ -5044,10 +4974,6 @@ POSE_RECOVERY_DEFAULT_FUSED_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/021
 POSE_RECOVERY_DEFAULT_LOOSE_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/020_deeptag_dense_keypoints_pose_012_rs_raw_frames_20260710_214336_faceframe_alltags.pkl'
 POSE_RECOVERY_DEFAULT_APRIL_OLD_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
 POSE_RECOVERY_DEFAULT_OUTPUT_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/022_recovery_method_benchmark.pkl'
-if str(POSE_RECOVERY_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(POSE_RECOVERY_THIS_FILE.parent))
-import aprilcube
-from aprilcube.detect import _gamma_correct, _linear_contrast, _preprocess, _preprocess_clahe, _quad_quality, _sharpen, create_detector, create_fallback_detector
 
 @dataclass
 class RecoveryPoseCandidate:
@@ -5354,16 +5280,6 @@ def pose_recovery_main(args: RecoveryBenchmarkConfig) -> None:
 
 
 # ---- Single-frame candidate fusion ----
-import argparse
-import copy
-import math
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
 SINGLE_FRAME_FUSION_THIS_FILE = Path(__file__).resolve()
 SINGLE_FRAME_FUSION_APRILCUBE_ROOT = SINGLE_FRAME_FUSION_THIS_FILE.parent.parent
 SINGLE_FRAME_FUSION_DEFAULT_RAW_PKL = SINGLE_FRAME_FUSION_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
@@ -5373,10 +5289,6 @@ SINGLE_FRAME_FUSION_DEFAULT_APRIL_STRICT_PKL = SINGLE_FRAME_FUSION_APRILCUBE_ROO
 SINGLE_FRAME_FUSION_DEFAULT_LOOSE_DEEPTAG_PKL = SINGLE_FRAME_FUSION_APRILCUBE_ROOT / 'recordings/020_deeptag_dense_keypoints_pose_012_rs_raw_frames_20260710_214336_faceframe_alltags.pkl'
 SINGLE_FRAME_FUSION_DEFAULT_OLD_APRIL_PKL = SINGLE_FRAME_FUSION_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
 SINGLE_FRAME_FUSION_DEFAULT_OUTPUT_PKL = SINGLE_FRAME_FUSION_APRILCUBE_ROOT / 'recordings/023_fused_all_single_frame_recovery.pkl'
-if str(SINGLE_FRAME_FUSION_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(SINGLE_FRAME_FUSION_THIS_FILE.parent))
-import aprilcube
-from aprilcube.detect import estimate_single_tag_cube_pose
 
 def single_frame_fusion_encode_bgr_jpeg(image_bgr: np.ndarray, quality: int) -> bytes:
     ok, encoded = cv2.imencode('.jpg', np.asarray(image_bgr, dtype=np.uint8), [int(cv2.IMWRITE_JPEG_QUALITY), int(max(1, min(int(quality), 100)))])
@@ -5625,25 +5537,11 @@ def single_frame_fusion_main(args: SingleFrameFusionConfig) -> None:
 
 
 # ---- Temporal outline recovery ----
-import argparse
-import copy
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-from scipy.optimize import minimize
-from scipy.spatial.transform import Rotation, Slerp
 OUTLINE_RECOVERY_THIS_FILE = Path(__file__).resolve()
 OUTLINE_RECOVERY_APRILCUBE_ROOT = OUTLINE_RECOVERY_THIS_FILE.parent.parent
 OUTLINE_RECOVERY_DEFAULT_INPUT_PKL = OUTLINE_RECOVERY_APRILCUBE_ROOT / 'recordings/023_fused_all_single_frame_recovery_edge045_centerpnp_singletag.pkl'
 OUTLINE_RECOVERY_DEFAULT_RAW_PKL = OUTLINE_RECOVERY_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
 OUTLINE_RECOVERY_DEFAULT_OUTPUT_PKL = OUTLINE_RECOVERY_APRILCUBE_ROOT / 'recordings/024_temporal_outline_refine_recovery.pkl'
-if str(OUTLINE_RECOVERY_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(OUTLINE_RECOVERY_THIS_FILE.parent))
-import aprilcube
 
 def outline_recovery_encode_bgr_jpeg(image_bgr: np.ndarray, quality: int) -> bytes:
     ok, encoded = cv2.imencode('.jpg', np.asarray(image_bgr, dtype=np.uint8), [int(cv2.IMWRITE_JPEG_QUALITY), int(max(1, min(int(quality), 100)))])
@@ -5904,25 +5802,11 @@ def outline_recovery_main(args: OutlinePoseRecoveryConfig) -> None:
 
 
 # ---- Global temporal fill ----
-import argparse
-import copy
-import pickle
-import sys
-import time
-from pathlib import Path
-from typing import Any
-import cv2
-import numpy as np
-from scipy.interpolate import UnivariateSpline
-from scipy.spatial.transform import Rotation, Slerp
 TEMPORAL_COMPLETION_THIS_FILE = Path(__file__).resolve()
 TEMPORAL_COMPLETION_APRILCUBE_ROOT = TEMPORAL_COMPLETION_THIS_FILE.parent.parent
 TEMPORAL_COMPLETION_DEFAULT_INPUT_PKL = TEMPORAL_COMPLETION_APRILCUBE_ROOT / 'recordings/024_temporal_outline_refine_recovery_conservative_fixed.pkl'
 TEMPORAL_COMPLETION_DEFAULT_RAW_PKL = TEMPORAL_COMPLETION_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
 TEMPORAL_COMPLETION_DEFAULT_OUTPUT_PKL = TEMPORAL_COMPLETION_APRILCUBE_ROOT / 'recordings/025_global_temporal_filter_fill_final.pkl'
-if str(TEMPORAL_COMPLETION_THIS_FILE.parent) not in sys.path:
-    sys.path.insert(0, str(TEMPORAL_COMPLETION_THIS_FILE.parent))
-import aprilcube
 
 def temporal_completion_encode_bgr_jpeg(image_bgr: np.ndarray, quality: int) -> bytes:
     ok, encoded = cv2.imencode('.jpg', np.asarray(image_bgr, dtype=np.uint8), [int(cv2.IMWRITE_JPEG_QUALITY), int(max(1, min(int(quality), 100)))])
