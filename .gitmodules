@@ -1,6 +1,6 @@
 [submodule "thirdparty/deeparuco"]
 	path = thirdparty/deeparuco
-	url = https://github.com/AVAuco/deeparuco.git
+	url = https://github.com/liyichen123456/deeparuco.git
 [submodule "thirdparty/deeptag-pytorch"]
 	path = thirdparty/deeptag-pytorch
-	url = https://github.com/herohuyongtao/deeptag-pytorch.git
+	url = https://github.com/liyichen123456/deeptag-pytorch.git
