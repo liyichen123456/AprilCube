@@ -37,6 +37,7 @@ recordings/
 
 debug/
 debugging/
+outputs/
 
 # Local recordings and device/runtime caches
 logs_002/
