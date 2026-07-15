@@ -21,12 +21,11 @@ OBJ_MESH_SCALE = 0.001
 
 # ============================================================
 # User macros
-# Defaults reproduce 008_raw_frames_20260710_230819_15mm_cube_middle_finger.pkl.
 # ============================================================
 
 PKL_PATH = Path(
     "/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/recordings/"
-    "008_raw_frames_20260710_230819_15mm_cube_middle_finger.pkl"
+    "008_raw_frames_20260715_000555.pkl"
 )
 # Camera names, intrinsics, cube cfgs, and undistortion settings come from the PKL header.
 PINHOLE_UNDISTORT_ALPHA = 0.0
@@ -34,8 +33,8 @@ ADAPTIVE_CLAHE_DETECTION = True
 FAST_DETECTOR = True
 ENABLE_RUNTIME_POSE_FILTER = False
 SHARED_TAG_DETECTION = False
-ENABLE_TEMPORAL_POSTPROCESS = False
-RECOMPUTE_POSE = False
+ENABLE_TEMPORAL_POSTPROCESS = True
+RECOMPUTE_POSE = True
 PRECOMPUTE_ONLY = False
 
 VISER_HOST = "0.0.0.0"
@@ -45,6 +44,7 @@ VISER_JPEG_QUALITY = 85
 
 POSE_CACHE_FORMAT = "aprilcube_008_pose_cache_v1"
 POSE_CACHE_FORMAT_020_MULTISTAGE = "aprilcube_020_multistage_008_pose_v1"
+POSE_CACHE_FORMAT_023_DEEPTAG_008 = "aprilcube_023_deeptag_008_pose_v1"
 OFFLINE_POS_FRAME_FIELD = "offline_pos"
 OFFLINE_POS_CACHE_KEY_FIELD = "offline_pos_cache_key"
 LEGACY_INLINE_POSE_FRAME_FIELD = "offline_pose_frame"
@@ -1075,7 +1075,7 @@ class ReplayPoseEstimator:
             detector = self.detector_by_camera_cube[(camera_name, cube["cube_name"])]
             result = self.normalize_result_for_draw(cube.get("result", {}))
             vis = detector.draw_result(vis, result)
-        vis = self.demo008.draw_text_panel(vis, pose_frame["status_lines"])
+        vis = self.demo008.draw_text_panel(vis, pose_frame.get("status_lines", []))
         temporal_cubes = self.temporal_filled_cube_names(pose_frame)
         if temporal_cubes:
             return self.draw_red_alert_box(
@@ -2473,6 +2473,11 @@ def load_cached_pose_cache(
     if pose_cache_record.get("format") != POSE_CACHE_FORMAT:
         return None
     record_key = pose_cache_record.get("key")
+    if isinstance(record_key, dict) and record_key.get("format") == POSE_CACHE_FORMAT_023_DEEPTAG_008:
+        pose_cache = pose_cache_record.get("pose_cache", None)
+        if isinstance(pose_cache, list) and len(pose_cache) == int(expected_key["frame_count"]):
+            return pose_cache, True
+        return None
     if isinstance(record_key, dict) and record_key.get("format") == POSE_CACHE_FORMAT_020_MULTISTAGE:
         if not bool(expected_key.get("temporal_postprocess_enabled", True)):
             return None
@@ -2636,6 +2641,19 @@ def main() -> None:
     recorded_cube_paths = metadata.get("cube_paths", None)
     if not isinstance(recorded_cube_paths, (list, tuple)) or not recorded_cube_paths:
         raise ValueError("PKL header has no non-empty metadata['cube_paths'] list.")
+    indexed_offline_pos_key = (
+        offline_pos_cache_record.get("key", {})
+        if isinstance(offline_pos_cache_record, dict)
+        else {}
+    )
+    if (
+        isinstance(indexed_offline_pos_key, dict)
+        and indexed_offline_pos_key.get("format") == POSE_CACHE_FORMAT_023_DEEPTAG_008
+    ):
+        cached_cube_paths = indexed_offline_pos_key.get("cube_paths", None)
+        if isinstance(cached_cube_paths, (list, tuple)) and cached_cube_paths:
+            recorded_cube_paths = cached_cube_paths
+            print("[INFO] Restricting cube cfgs to the 023 DeepTag cache selection.")
     cube_paths = [
         demo008.validate_cube_path(Path(path).expanduser().resolve())
         for path in recorded_cube_paths
@@ -2721,11 +2739,27 @@ def main() -> None:
             pose_cache_key,
         )
         appended_cached_pose = load_cached_pose_cache(pose_cache_record, pose_cache_key)
-    cache_candidates = (
-        ("offline_pos frame records", offline_pos_cached_pose),
-        ("legacy offline_pose_frame records", legacy_inline_cached_pose),
-        ("appended PKL cache", appended_cached_pose),
+    offline_pos_key = (
+        offline_pos_cache_record.get("key", {})
+        if isinstance(offline_pos_cache_record, dict)
+        else {}
     )
+    offline_pos_is_023 = (
+        isinstance(offline_pos_key, dict)
+        and offline_pos_key.get("format") == POSE_CACHE_FORMAT_023_DEEPTAG_008
+    )
+    if offline_pos_is_023:
+        cache_candidates = (
+            ("023 DeepTag offline_pos frame records", offline_pos_cached_pose),
+            ("legacy offline_pose_frame records", legacy_inline_cached_pose),
+            ("appended PKL cache", appended_cached_pose),
+        )
+    else:
+        cache_candidates = (
+            ("legacy offline_pose_frame records", legacy_inline_cached_pose),
+            ("offline_pos frame records", offline_pos_cached_pose),
+            ("appended PKL cache", appended_cached_pose),
+        )
     cache_source, cached_pose = next(
         ((source, cached) for source, cached in cache_candidates if cached is not None),
         ("", None),
@@ -2733,18 +2767,24 @@ def main() -> None:
     pose_cache_needs_write = bool(RECOMPUTE_POSE)
     if cached_pose is not None:
         pose_cache, cache_exact_match = cached_pose
-        using_offline_pos = cache_source == "offline_pos frame records"
+        using_offline_pos = cache_source in {
+            "offline_pos frame records",
+            "023 DeepTag offline_pos frame records",
+        }
         if not using_offline_pos:
             print(
                 f"[INFO] No compatible offline_pos cache; using {cache_source} "
                 "as a read-only visualization fallback."
             )
         if cache_exact_match:
-            cache_description = (
-                "temporal-completed smoothed"
-                if temporal_postprocess_enabled
-                else "raw measured"
-            )
+            if cache_source == "023 DeepTag offline_pos frame records":
+                cache_description = "023 DeepTag-grid measured"
+            else:
+                cache_description = (
+                    "temporal-completed smoothed"
+                    if temporal_postprocess_enabled
+                    else "raw measured"
+                )
             print(
                 f"[INFO] Loaded cached {cache_description} pose estimation "
                 f"from {cache_source}: frames={len(pose_cache)}"
@@ -2794,6 +2834,10 @@ def main() -> None:
             )
         else:
             print("[INFO] Kept raw measured poses; skipped offline temporal postprocess.")
+
+    for pose_frame in pose_cache:
+        if not isinstance(pose_frame.get("status_lines"), list):
+            rebuild_pose_frame_status_lines(estimator, pose_frame)
 
     if pose_cache_needs_write:
         write_pose_cache_into_pkl_frames(pkl_path, pose_cache_key, pose_cache)

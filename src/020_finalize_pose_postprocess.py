@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import hashlib
 import importlib
 import io
 import os
@@ -70,10 +71,16 @@ from stag_decode.pose_estimator import get_fine_grid_points_anno
 
 preprocess_tag_image = _preprocess
 
-# Set only these two paths before running. The pipeline intentionally has no
-# command-line options, so the configured input and output remain reproducible.
-INPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
+# Set these paths and the optional 008 cube filter before running. The pipeline
+# intentionally has no command-line options, so the configuration is reproducible.
+# INPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
+INPUT_PKL = RECORDINGS_DIR / "008_raw_frames_20260715_000555.pkl"
 OUTPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_final_postprocessed_pose.pkl"
+# The recording header also contains a thumb cfg, but this capture only contains
+# the index cube. Set to None to process every cube listed in the 008 header.
+PROCESS_008_CUBE_NAMES: tuple[str, ...] | None = (
+    "cube_april_36h11_6_11_1x1x1_15mm",
+)
 
 RAW_008_PKL_FORMAT = "aprilcube_raw_frame_stream_v1"
 RAW_012_PKL_FORMAT = "aprilcube_rs_raw_frame_stream_v1"
@@ -86,6 +93,8 @@ POSTPROCESSED_PKL_FORMAT = "aprilcube_raw_with_020_postprocessed_pose_stream_v1"
 LEGACY_POSTPROCESSED_PKL_FORMAT = (
     "aprilcube_012_raw_with_final_postprocessed_pose_stream_v1"
 )
+PROCESSING_CACHE_IDENTITY_VERSION = 1
+HASH_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -191,20 +200,6 @@ class DenseDeepTagPoseConfig:
     max_required_inlier_tags: int = 4
     jpeg_quality: int = 90
     no_source_overlay: bool = False
-
-
-@dataclass(frozen=True)
-class RecoveryBenchmarkConfig:
-    raw_pkl: Path
-    deeptag_pkl: Path
-    failed_reference_pkl: Path
-    loose_candidate_pkl: Path
-    april_old_pkl: Path
-    output_pkl: Path
-    max_reproj: float = 3.0
-    min_tags: int = 2
-    max_frames: int = 0
-    edge_threshold: float = 0.34
 
 
 @dataclass(frozen=True)
@@ -550,6 +545,40 @@ def process_012_recording(
     return output_pkl
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(HASH_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_processing_cache_identity(raw_pkl: Path) -> dict[str, Any]:
+    raw_pkl = raw_pkl.expanduser().resolve()
+    script_path = Path(__file__).resolve()
+    stat_before = raw_pkl.stat()
+    raw_sha256 = sha256_file(raw_pkl)
+    stat_after = raw_pkl.stat()
+    if (
+        stat_before.st_size != stat_after.st_size
+        or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+    ):
+        raise RuntimeError(f"Input PKL changed while hashing: {raw_pkl}")
+    return {
+        "version": PROCESSING_CACHE_IDENTITY_VERSION,
+        "raw_file": {
+            "path": str(raw_pkl),
+            "size": int(stat_after.st_size),
+            "mtime_ns": int(stat_after.st_mtime_ns),
+            "sha256": raw_sha256,
+        },
+        "pipeline_script": {
+            "path": str(script_path),
+            "sha256": sha256_file(script_path),
+        },
+    }
+
+
 def processed_output_matches_input(output_pkl: Path, raw_pkl: Path) -> bool:
     if not output_pkl.exists():
         return False
@@ -562,10 +591,41 @@ def processed_output_matches_input(output_pkl: Path, raw_pkl: Path) -> bool:
         LEGACY_POSTPROCESSED_PKL_FORMAT,
     }:
         return False
-    source_raw = header.get("source_raw_pkl", "")
+    stored_identity = header.get("processing_cache_identity")
+    if not isinstance(stored_identity, dict):
+        return False
+    if stored_identity.get("version") != PROCESSING_CACHE_IDENTITY_VERSION:
+        return False
     try:
-        return Path(str(source_raw)).expanduser().resolve() == raw_pkl.expanduser().resolve()
-    except Exception:
+        raw_pkl = raw_pkl.expanduser().resolve()
+        raw_stat = raw_pkl.stat()
+        stored_raw = stored_identity["raw_file"]
+        if not isinstance(stored_raw, dict):
+            return False
+        if (
+            stored_raw.get("path") != str(raw_pkl)
+            or stored_raw.get("size") != int(raw_stat.st_size)
+            or stored_raw.get("mtime_ns") != int(raw_stat.st_mtime_ns)
+        ):
+            return False
+        script_path = Path(__file__).resolve()
+        stored_script = stored_identity["pipeline_script"]
+        if not isinstance(stored_script, dict):
+            return False
+        if stored_script.get("path") != str(script_path):
+            return False
+        raw_sha256 = sha256_file(raw_pkl)
+        raw_stat_after_hash = raw_pkl.stat()
+        if (
+            raw_stat_after_hash.st_size != raw_stat.st_size
+            or raw_stat_after_hash.st_mtime_ns != raw_stat.st_mtime_ns
+        ):
+            return False
+        return (
+            stored_raw.get("sha256") == raw_sha256
+            and stored_script.get("sha256") == sha256_file(script_path)
+        )
+    except (KeyError, OSError):
         return False
 
 
@@ -603,6 +663,23 @@ def split_008_recording_into_cube_streams(raw_008_pkl: Path, work_dir: Path) -> 
     cube_paths = [Path(str(v)).expanduser().resolve() for v in metadata.get("cube_paths", []) or []]
     if not cube_paths:
         raise ValueError(f"008 pkl header has no metadata.cube_paths: {raw_008_pkl}")
+    if PROCESS_008_CUBE_NAMES is not None:
+        requested_cube_names = set(PROCESS_008_CUBE_NAMES)
+        cube_path_by_name = {cube_name_from_path(path): path for path in cube_paths}
+        missing_cube_names = requested_cube_names - cube_path_by_name.keys()
+        if missing_cube_names:
+            raise ValueError(
+                "Requested 008 cubes are missing from metadata.cube_paths: "
+                f"{sorted(missing_cube_names)}"
+            )
+        cube_paths = [
+            cube_path_by_name[name]
+            for name in PROCESS_008_CUBE_NAMES
+        ]
+        print(
+            "[INFO] 008 cube filter: "
+            f"{[cube_name_from_path(path) for path in cube_paths]}"
+        )
     camera_name = identify_008_camera(header, offsets, raw_008_pkl)
     intrinsics_by_camera = metadata.get("intrinsics_yaml", {}) or {}
     if not isinstance(intrinsics_by_camera, dict) or camera_name not in intrinsics_by_camera:
@@ -873,6 +950,7 @@ def merge_final_pose_stream(
     keep_original_pose: bool,
     keep_pose_candidates: bool,
 ) -> Path:
+    processing_cache_identity = build_processing_cache_identity(raw_pkl)
     raw_header, raw_offsets, raw_footer = build_stream_index(raw_pkl)
     final_header, final_offsets, final_footer = build_stream_index(final_pose_pkl)
     if len(raw_offsets) != len(final_offsets):
@@ -893,6 +971,7 @@ def merge_final_pose_stream(
                 "created_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "source_raw_pkl": str(raw_pkl),
                 "source_final_pose_pkl": str(final_pose_pkl),
+                "processing_cache_identity": processing_cache_identity,
                 "raw_header": raw_header,
                 "raw_footer": raw_footer,
                 "final_pose_header": final_header,
@@ -1603,11 +1682,6 @@ def replay_008_install_numpy_pickle_compat() -> None:
             continue
         sys.modules.setdefault(f'numpy._core.{module_name}', module)
 replay_008_install_numpy_pickle_compat()
-
-def replay_008_load_demo008_module() -> Any:
-    raise RuntimeError(
-        "020 uses its embedded CV2 capture helpers directly; module loading is disabled."
-    )
 
 def replay_008_resolve_pkl_path(path_str: str | None) -> Path:
     if path_str is None:
@@ -2905,16 +2979,9 @@ def replay_008_main(args: Replay008ViewerConfig) -> None:
 
 
 # ---- RealSense recording and calibration helpers ----
-REALSENSE_THIS_FILE = Path(__file__).resolve()
-REALSENSE_APRILCUBE_ROOT = REALSENSE_THIS_FILE.parent.parent
-REALSENSE_THIRDPARTY_DIR = REALSENSE_APRILCUBE_ROOT.parent
-REALSENSE_PROJECT_ROOT = REALSENSE_THIRDPARTY_DIR.parent
-REALSENSE_RECORDER_UTILS_DIR = REALSENSE_PROJECT_ROOT / 'scripts' / 'utils'
 REALSENSE_DEFAULT_INTRINSICS_YAML = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_realsense_1280x720_0707_171032.yaml')
 REALSENSE_DEFAULT_CUBE_CFG = Path('/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cubes/cube_april_36h11_100_123_2x2x2_outer62p5mm')
-REALSENSE_WINDOW_NAME = 'RealSense D435 AprilCube'
 REALSENSE_PINHOLE_UNDISTORT_ALPHA = 0.0
-REALSENSE_RECORD_OUTPUT_DIR = REALSENSE_APRILCUBE_ROOT / 'recordings'
 
 def realsense_load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
     yaml_path = Path(path).expanduser().resolve()
@@ -2948,118 +3015,6 @@ def realsense_make_detector_input_vis(frame: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
     enhanced = preprocess_tag_image(gray)
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-
-def realsense_result_to_text(device_name: str, cube_name: str, result: dict[str, Any]) -> str:
-    if not result.get('success', False):
-        return f"[{device_name}][{cube_name}] cube not detected tags={int(result.get('n_tags', 0))}"
-    tvec = np.asarray(result['tvec'], dtype=np.float64).reshape(-1)
-    rot_mat, _ = cv2.Rodrigues(np.asarray(result['rvec'], dtype=np.float64).reshape(3, 1))
-    sy = float(np.sqrt(rot_mat[0, 0] * rot_mat[0, 0] + rot_mat[1, 0] * rot_mat[1, 0]))
-    if sy < 1e-06:
-        euler = np.array([np.arctan2(-rot_mat[1, 2], rot_mat[1, 1]), np.arctan2(-rot_mat[2, 0], sy), 0.0])
-    else:
-        euler = np.array([np.arctan2(rot_mat[2, 1], rot_mat[2, 2]), np.arctan2(-rot_mat[2, 0], sy), np.arctan2(rot_mat[1, 0], rot_mat[0, 0])])
-    euler_deg = np.degrees(euler)
-    faces = sorted(list(result.get('visible_faces', set())))
-    text = f"[{device_name}][{cube_name}] t=({tvec[0]:.1f},{tvec[1]:.1f},{tvec[2]:.1f})mm rot=({euler_deg[0]:.1f},{euler_deg[1]:.1f},{euler_deg[2]:.1f}) reproj={float(result.get('reproj_error', float('inf'))):.2f}px tags={int(result.get('n_tags', 0))} faces={faces}"
-    if result.get('single_tag_cfg_pose', False):
-        text += f" single_tag_cfg_pose(id={result.get('single_tag_id', '?')},face={result.get('single_tag_face', '?')})"
-    if result.get('predicted', False):
-        text += ' predicted'
-    return text
-
-def realsense_draw_text_panel(frame: np.ndarray, lines: list[str]) -> np.ndarray:
-    vis = frame.copy()
-    y = 24
-    for line in lines:
-        cv2.putText(vis, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
-        y += 24
-    cv2.putText(vis, 'press s start rec, p stop/save rec, q or ESC quit', (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
-    return vis
-
-def realsense_resize_if_needed(frame: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
-    target_w, target_h = image_size
-    h, w = frame.shape[:2]
-    if (w, h) == (target_w, target_h):
-        return frame
-    return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-class RealSenseRawFrameRecorder:
-
-    def __init__(self, output_dir: Path) -> None:
-        self.output_dir = Path(output_dir).expanduser()
-        self.path: Path | None = None
-        self._metadata: dict[str, Any] | None = None
-        self._frames: list[dict[str, Any]] = []
-        self.started_wall_time: str | None = None
-        self.started_monotonic: float | None = None
-
-    @property
-    def is_recording(self) -> bool:
-        return self._metadata is not None
-
-    @property
-    def frame_count(self) -> int:
-        return len(self._frames)
-
-    @property
-    def buffered_bytes(self) -> int:
-        return int(sum((frame['image_bgr'].nbytes for frame in self._frames)))
-
-    def start(self, metadata: dict[str, Any]) -> None:
-        if self.is_recording:
-            print(f'[INFO] Recording already active: {self.path}')
-            return
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime('%Y%m%d_%H%M%S')
-        self.path = self.output_dir / f'012_rs_raw_frames_{stamp}.pkl'
-        self.started_wall_time = time.strftime('%Y-%m-%d %H:%M:%S')
-        self.started_monotonic = time.perf_counter()
-        self._frames = []
-        self._metadata = dict(metadata)
-        print(f'[INFO] Started raw-frame memory buffering: {self.path}')
-
-    def write(self, *, device_name: str, loop_frame_idx: int, image_bgr: np.ndarray | None, capture_timestamp: float | None) -> None:
-        if not self.is_recording or image_bgr is None:
-            return
-        image_copy = np.array(image_bgr, copy=True)
-        self._frames.append({'type': 'frame', 'device_name': device_name, 'camera_name': device_name, 'loop_frame_idx': int(loop_frame_idx), 'capture_timestamp': None if capture_timestamp is None else float(capture_timestamp), 'write_monotonic': float(time.perf_counter()), 'shape': tuple((int(v) for v in image_copy.shape)), 'dtype': str(image_copy.dtype), 'image_bgr': image_copy})
-
-    def _print_save_progress(self, done: int, total: int) -> None:
-        width = 36
-        ratio = 1.0 if total <= 0 else done / total
-        filled = int(round(width * ratio))
-        bar = '#' * filled + '-' * (width - filled)
-        sys.stdout.write(f'\r[INFO] Saving PKL [{bar}] {done}/{total} frames')
-        sys.stdout.flush()
-        if done >= total:
-            sys.stdout.write('\n')
-            sys.stdout.flush()
-
-    def stop(self, reason: str='user_stop') -> None:
-        if not self.is_recording:
-            print('[INFO] Recording is not active.')
-            return
-        path = self.path
-        assert path is not None
-        assert self._metadata is not None
-        total_frames = self.frame_count
-        buffered_gb = self.buffered_bytes / 1024 ** 3
-        elapsed = time.perf_counter() - self.started_monotonic if self.started_monotonic is not None else 0.0
-        print(f'[INFO] Stopped raw-frame buffering: frames={total_frames} buffered={buffered_gb:.2f} GiB duration={elapsed:.2f}s')
-        print(f'[INFO] Writing PKL: {path}')
-        with path.open('wb') as f:
-            pickle.dump({'type': 'header', 'format': 'aprilcube_rs_raw_frame_stream_v1', 'created_wall_time': self.started_wall_time, 'metadata': self._metadata}, f, protocol=pickle.HIGHEST_PROTOCOL)
-            self._print_save_progress(0, total_frames)
-            for idx, frame_record in enumerate(self._frames, start=1):
-                pickle.dump(frame_record, f, protocol=pickle.HIGHEST_PROTOCOL)
-                if idx == total_frames or idx % 10 == 0:
-                    self._print_save_progress(idx, total_frames)
-            pickle.dump({'type': 'footer', 'reason': reason, 'frame_count': int(total_frames), 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}, f, protocol=pickle.HIGHEST_PROTOCOL)
-        self._frames = []
-        self._metadata = None
-        self.started_monotonic = None
-        print(f'[INFO] Saved raw-frame PKL recording: {path} frames={total_frames}')
 
 # ---- Strict AprilCube offline pose estimation ----
 STRICT_APRILCUBE_THIS_FILE = Path(__file__).resolve()
@@ -4230,46 +4185,6 @@ def deeptag_detection_robust_cluster_pose(raw_detections: list[tuple[int, np.nda
     selected = pose.get('detections', cluster_detections) or cluster_detections
     return (pose, selected, stats)
 
-def deeptag_detection_estimate_cube_pose_from_corners(detections: list[tuple[int, np.ndarray]], tag_corner_map: dict[int, np.ndarray], camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> dict[str, Any]:
-    obj_chunks: list[np.ndarray] = []
-    img_chunks: list[np.ndarray] = []
-    tag_ids: list[int] = []
-    for tag_id, corners_2d in detections:
-        corners_3d = tag_corner_map.get(int(tag_id))
-        if corners_3d is None:
-            continue
-        obj_chunks.append(np.asarray(corners_3d, dtype=np.float64).reshape(4, 3))
-        img_chunks.append(np.asarray(corners_2d, dtype=np.float64).reshape(4, 2))
-        tag_ids.append(int(tag_id))
-    if not obj_chunks:
-        return {'success': False, 'tag_ids': [], 'n_tags': 0, 'reproj_error': float('inf')}
-    obj = np.vstack(obj_chunks).astype(np.float64)
-    img = np.vstack(img_chunks).astype(np.float64)
-    if len(obj) < 4:
-        return {'success': False, 'tag_ids': tag_ids, 'n_tags': len(tag_ids), 'reproj_error': float('inf')}
-    try:
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(obj, img, camera_matrix, dist_coeffs, iterationsCount=300, reprojectionError=12.0, confidence=0.995, flags=cv2.SOLVEPNP_SQPNP)
-    except cv2.error:
-        ok = False
-        rvec = None
-        tvec = None
-        inliers = None
-    if not ok or rvec is None or tvec is None or (float(np.asarray(tvec).reshape(3)[2]) <= 0.0):
-        return {'success': False, 'tag_ids': tag_ids, 'n_tags': len(tag_ids), 'reproj_error': float('inf')}
-    if inliers is not None and len(inliers) >= 4:
-        idx = np.asarray(inliers, dtype=np.int32).reshape(-1)
-        try:
-            rvec, tvec = cv2.solvePnPRefineLM(obj[idx], img[idx], camera_matrix, dist_coeffs, rvec, tvec)
-        except cv2.error:
-            pass
-    projected, _ = cv2.projectPoints(obj, rvec, tvec, camera_matrix, dist_coeffs)
-    reproj = float(np.mean(np.linalg.norm(img - projected.reshape(-1, 2), axis=1)))
-    rot, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rot
-    transform[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
-    return {'success': True, 'tag_ids': tag_ids, 'n_tags': len(tag_ids), 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1).tolist(), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1).tolist(), 'T': transform.tolist(), 'reproj_error': reproj, 'n_inliers': 0 if inliers is None else int(len(inliers))}
-
 def deeptag_detection_draw_overlay(image_bgr: np.ndarray, runtime: dict[str, Any], detections: list[tuple[int, np.ndarray]], pose: dict[str, Any]) -> np.ndarray:
     result = {'success': bool(pose.get('success', False)), 'detections': detections, 'rvec': np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1) if pose.get('success', False) else None, 'tvec': np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1) if pose.get('success', False) else None, 'reproj_error': float(pose.get('reproj_error', float('inf'))), 'n_tags': int(pose.get('n_tags', 0)), 'visible_faces': set(pose.get('visible_faces', []) or []), 'predicted': False}
     vis = runtime['april_draw_detector'].draw_result(image_bgr.copy(), result)
@@ -4966,15 +4881,6 @@ def dense_deeptag_main(args: DenseDeepTagPoseConfig) -> None:
 
 
 # ---- Single-frame recovery primitives and benchmark ----
-POSE_RECOVERY_THIS_FILE = Path(__file__).resolve()
-POSE_RECOVERY_APRILCUBE_ROOT = POSE_RECOVERY_THIS_FILE.parent.parent
-POSE_RECOVERY_DEFAULT_RAW_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
-POSE_RECOVERY_DEFAULT_DEEPTAG_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/016_deeptag_robust_cluster_012_rs_raw_frames_20260710_214336.pkl'
-POSE_RECOVERY_DEFAULT_FUSED_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/021_fused_deeptag_dense_coverage_mintag2_aprilcube_strict_notagfix_mintag2.pkl'
-POSE_RECOVERY_DEFAULT_LOOSE_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/020_deeptag_dense_keypoints_pose_012_rs_raw_frames_20260710_214336_faceframe_alltags.pkl'
-POSE_RECOVERY_DEFAULT_APRIL_OLD_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl'
-POSE_RECOVERY_DEFAULT_OUTPUT_PKL = POSE_RECOVERY_APRILCUBE_ROOT / 'recordings/022_recovery_method_benchmark.pkl'
-
 @dataclass
 class RecoveryPoseCandidate:
     success: bool
@@ -5204,80 +5110,6 @@ def pose_recovery_pkl_pose_candidate(frame: dict[str, Any], method: str, frame_i
     if not pose.get('success', False) or n_tags < int(min_tags) or (not np.isfinite(reproj)) or (reproj > float(max_reproj)) or (pose.get('rvec') is None) or (pose.get('tvec') is None):
         return RecoveryPoseCandidate(False, method, frame_index, {}, [], reproj, failure_reason='candidate_not_usable')
     return RecoveryPoseCandidate(True, method, frame_index, dict(pose), [int(v) for v in pose.get('tag_ids', []) or []], reproj)
-
-def pose_recovery_main(args: RecoveryBenchmarkConfig) -> None:
-    script012 = None
-    raw_header, raw_offsets, _raw_footer = pose_recovery_build_stream_index(args.raw_pkl, {'aprilcube_rs_raw_frame_stream_v1', 'aprilcube_012_raw_with_pose_stream_v1'})
-    failed_header, failed_frames, failed_footer = pose_recovery_load_pose_records(args.failed_reference_pkl)
-    deeptag_header, deeptag_offsets, deeptag_footer = pose_recovery_build_stream_index(args.deeptag_pkl, {'deeptag_012_offline_stream_v1'})
-    loose_header, loose_frames, loose_footer = pose_recovery_load_pose_records(args.loose_candidate_pkl)
-    old_header, old_frames, old_footer = pose_recovery_load_pose_records(args.april_old_pkl)
-    metadata: dict[str, Any] = {}
-    if raw_header.get('format') == 'aprilcube_012_raw_with_pose_stream_v1':
-        metadata.update(raw_header.get('raw_header', {}).get('metadata', {}) or {})
-    metadata.update(raw_header.get('metadata', {}) or {})
-    cube_cfg = Path(metadata['cube_cfg']).expanduser().resolve()
-    config, face_id_sets = aprilcube.load_cube_config(str(cube_cfg / 'config.json' if cube_cfg.is_dir() else cube_cfg))
-    tag_corner_map = aprilcube.build_tag_corner_map(config)
-    valid_ids = set((int(v) for v in tag_corner_map))
-    calib = realsense_load_intrinsics_yaml(metadata.get('intrinsics_yaml'))
-    image_size = tuple((int(v) for v in metadata.get('image_size', calib['image_size'])))
-    undistort_pack = realsense_create_undistort_maps(calib, image_size) if bool(metadata.get('undistort_for_detection', True)) else None
-    camera_matrix = np.asarray(metadata.get('detection_camera_matrix', calib['K']), dtype=np.float64).reshape(3, 3)
-    dist_coeffs = np.asarray(metadata.get('detector_dist_coeffs', np.zeros(5)), dtype=np.float64).reshape(-1)
-    if undistort_pack is not None:
-        camera_matrix = np.asarray(metadata.get('detection_camera_matrix', undistort_pack[2]), dtype=np.float64).reshape(3, 3)
-        dist_coeffs = np.asarray(metadata.get('detector_dist_coeffs', np.zeros(5)), dtype=np.float64).reshape(-1)
-    failed_indices = [int(idx) for idx, frame in sorted(failed_frames.items()) if not bool(frame.get('pose', {}).get('success', False))]
-    if args.max_frames > 0:
-        failed_indices = failed_indices[:int(args.max_frames)]
-    raw_offset_by_frame = {int(pose_recovery_load_at(args.raw_pkl, offset).get('frame_index', idx)): int(offset) for idx, offset in enumerate(raw_offsets)}
-    deeptag_offset_by_frame = {int(pose_recovery_load_at(args.deeptag_pkl, offset).get('frame_index', idx)): int(offset) for idx, offset in enumerate(deeptag_offsets)}
-    results: dict[int, dict[str, Any]] = {}
-    method_success: dict[str, set[int]] = {'apriltag_preproc_sweep': set(), 'single_face_board': set(), 'deeptag_apriltag_cross_validated': set(), 'edge_checked_loose_candidates': set()}
-    for n, frame_index in enumerate(failed_indices, start=1):
-        raw = pose_recovery_load_at(args.raw_pkl, raw_offset_by_frame[frame_index])
-        image = np.asarray(raw['image_bgr'], dtype=np.uint8)
-        image = realsense_undistort_frame(image, undistort_pack)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        detections = pose_recovery_detect_sweep(gray, config=config, valid_ids=valid_ids)
-        deeptag = pose_recovery_load_at(args.deeptag_pkl, deeptag_offset_by_frame[frame_index])
-        candidates: dict[str, RecoveryPoseCandidate] = {}
-        candidates['apriltag_preproc_sweep'] = pose_recovery_solve_pose_from_detections(detections, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, method='apriltag_preproc_sweep', frame_index=frame_index, min_tags=int(args.min_tags), max_reproj=float(args.max_reproj))
-        candidates['single_face_board'] = pose_recovery_face_board_pose(detections, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, frame_index=frame_index, min_tags=int(args.min_tags), max_reproj=float(args.max_reproj))
-        candidates['deeptag_apriltag_cross_validated'] = pose_recovery_deeptag_cross_validated_pose(deeptag, detections, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, frame_index=frame_index, min_tags=int(args.min_tags), max_reproj=float(args.max_reproj))
-        edge_sources = [pose_recovery_pkl_pose_candidate(loose_frames.get(frame_index, {}), 'loose_deeptag_edge_checked', frame_index, int(args.min_tags), float(args.max_reproj)), pose_recovery_pkl_pose_candidate(old_frames.get(frame_index, {}), 'old_april_edge_checked', frame_index, int(args.min_tags), float(args.max_reproj))]
-        best_edge: RecoveryPoseCandidate | None = None
-        for cand in edge_sources:
-            if not cand.success:
-                continue
-            cand.edge_score = pose_recovery_edge_alignment_score(gray, cand.pose, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
-            if cand.edge_score >= float(args.edge_threshold) and (best_edge is None or (cand.edge_score, -cand.reproj_error) > (best_edge.edge_score or 0.0, -best_edge.reproj_error)):
-                best_edge = cand
-        candidates['edge_checked_loose_candidates'] = best_edge or RecoveryPoseCandidate(False, 'edge_checked_loose_candidates', frame_index, {}, [], float('inf'), failure_reason='no_edge_accepted_candidate')
-        frame_result: dict[str, Any] = {'frame_index': frame_index, 'detected_tag_ids': [int(v[0]) for v in detections], 'methods': {}}
-        for method, cand in candidates.items():
-            if cand.success and cand.edge_score is None:
-                cand.edge_score = pose_recovery_edge_alignment_score(gray, cand.pose, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
-            if cand.success:
-                method_success[method].add(frame_index)
-            frame_result['methods'][method] = {'success': bool(cand.success), 'failure_reason': cand.failure_reason, 'tag_ids': cand.tag_ids, 'n_tags': len(cand.tag_ids), 'reproj_error': cand.reproj_error, 'edge_score': cand.edge_score, 'pose_source': cand.pose.get('pose_source', cand.method) if cand.pose else cand.method}
-        results[frame_index] = frame_result
-        if n % 25 == 0 or n == len(failed_indices):
-            print(f'[INFO] processed failed frames {n}/{len(failed_indices)}')
-    summary: dict[str, Any] = {'failed_reference_pkl': str(args.failed_reference_pkl), 'failed_reference_footer': failed_footer, 'failed_frame_count': len(failed_indices), 'method_counts': {method: len(indices) for method, indices in method_success.items()}, 'method_frames': {method: sorted(indices) for method, indices in method_success.items()}, 'union_count': len(set().union(*method_success.values())) if method_success else 0, 'union_frames': sorted(set().union(*method_success.values())) if method_success else [], 'params': {'max_reproj': float(args.max_reproj), 'min_tags': int(args.min_tags), 'edge_threshold': float(args.edge_threshold)}}
-    args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
-    with args.output_pkl.open('wb') as f:
-        pickle.dump({'type': 'header', 'format': 'aprilcube_recovery_method_benchmark_v1', 'summary': summary, 'raw_header': raw_header, 'deeptag_header': deeptag_header, 'loose_footer': loose_footer, 'old_footer': old_footer}, f, protocol=pickle.HIGHEST_PROTOCOL)
-        for frame_index in sorted(results):
-            pickle.dump({'type': 'frame', **results[frame_index]}, f, protocol=pickle.HIGHEST_PROTOCOL)
-        pickle.dump({'type': 'footer', **summary}, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print('[RESULT] failed_frame_count', len(failed_indices))
-    for method, indices in method_success.items():
-        print('[RESULT]', method, len(indices))
-    print('[RESULT] union', summary['union_count'])
-    print(f'[INFO] saved {args.output_pkl}')
-
 
 # ---- Single-frame candidate fusion ----
 SINGLE_FRAME_FUSION_THIS_FILE = Path(__file__).resolve()
@@ -5858,7 +5690,14 @@ def temporal_completion_main(args: TemporalPoseCompletionConfig) -> None:
     valid_indices = [idx for idx in indices if bool(frames[idx].get('pose', {}).get('success', False))]
     failed_indices = [idx for idx in indices if idx not in valid_indices]
     if len(valid_indices) < 4:
-        raise RuntimeError('Need at least 4 valid poses for global temporal fill')
+        args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.input_pkl, args.output_pkl)
+        print(
+            '[WARN] Skipping global temporal fill: '
+            f'need at least 4 valid poses, got {len(valid_indices)}; '
+            f'copied input stream to {args.output_pkl}'
+        )
+        return
     x = np.asarray(valid_indices, dtype=np.float64)
     translations = np.vstack([np.asarray(frames[idx]['pose']['tvec'], dtype=np.float64).reshape(3) for idx in valid_indices])
     splines = [UnivariateSpline(x, translations[:, dim], k=3, s=float(args.translation_smooth)) for dim in range(3)]

@@ -16,6 +16,8 @@ DEFAULT_PKL = APRILCUBE_ROOT / "recordings" / "012_rs_raw_frames_20260710_214336
 SUPPORTED_FORMATS = {
     "aprilcube_012_offline_pose_vis_stream_v1",
     "aprilcube_012_raw_with_pose_stream_v1",
+    "aprilcube_012_raw_with_final_postprocessed_pose_stream_v1",
+    "aprilcube_raw_with_020_postprocessed_pose_stream_v1",
     "aprilcube_deeptag_fused_stream_v1",
     "deeptag_012_offline_stream_v1",
 }
