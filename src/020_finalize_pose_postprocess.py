@@ -7,8 +7,9 @@ The readable pipeline lives at the top of this file:
 2. Estimate strict AprilCube poses.
 3. Estimate DeepTag dense-keypoint poses.
 4. Fuse single-frame candidates using reprojection and edge gates.
-5. Recover hard frames with conservative RGB outline refinement.
-6. Fill the final gaps temporally and merge poses back into the raw stream.
+5. Reject temporally inconsistent single-frame poses before they become anchors.
+6. Recover hard frames with conservative RGB outline refinement.
+7. Fill the final gaps, smooth the cleaned trajectory, and merge it into the raw stream.
 
 The long copied helper implementations are kept at the bottom so this file can
 run by itself without launching or importing the old numbered stage scripts.
@@ -198,6 +199,10 @@ class DenseDeepTagPoseConfig:
     min_inlier_tag_fraction: float = 0.5
     coverage_check_min_raw_tags: int = 3
     max_required_inlier_tags: int = 4
+    require_validated_corner_order: bool = True
+    min_point_inlier_fraction: float = 0.25
+    min_per_tag_inlier_fraction: float = 0.25
+    min_per_tag_inlier_points: int = 12
     jpeg_quality: int = 90
     no_source_overlay: bool = False
 
@@ -231,10 +236,21 @@ class OutlinePoseRecoveryConfig:
     tag_anchor_weight: float = 1.8
     use_interp_if_edge: float = 0.64
     min_improvement: float = 0.03
-    max_translation_delta_mm: float = 35.0
+    max_translation_delta_mm: float = 18.0
     max_rotation_delta_deg: float = 12.0
     reject_loose_input: bool = True
     jpeg_quality: int = 90
+
+
+@dataclass(frozen=True)
+class TemporalOutlierRejectionConfig:
+    input_pkl: Path
+    output_pkl: Path
+    max_neighbor_gap: int = 12
+    rotation_residual_deg: float = 25.0
+    translation_residual_mm: float = 18.0
+    min_two_sided_rotation_jump_deg: float = 35.0
+    min_two_sided_translation_jump_mm: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -244,6 +260,21 @@ class TemporalPoseCompletionConfig:
     output_pkl: Path
     translation_smooth: float = 2400.0
     max_bracket_gap: int = 40
+    jpeg_quality: int = 90
+
+
+@dataclass(frozen=True)
+class TemporalPoseSmoothingConfig:
+    input_pkl: Path
+    raw_pkl: Path
+    output_pkl: Path
+    window_radius: int = 2
+    sigma_frames: float = 1.0
+    max_measured_translation_delta_mm: float = 4.0
+    max_measured_rotation_delta_deg: float = 4.0
+    max_filled_translation_delta_mm: float = 10.0
+    max_filled_rotation_delta_deg: float = 8.0
+    max_edge_score_drop: float = 0.04
     jpeg_quality: int = 90
 
 
@@ -320,6 +351,10 @@ def estimate_deeptag_dense_poses(
     min_inlier_tag_fraction: float,
     coverage_check_min_raw_tags: int,
     max_required_inlier_tags: int,
+    require_validated_corner_order: bool = True,
+    min_point_inlier_fraction: float = 0.25,
+    min_per_tag_inlier_fraction: float = 0.25,
+    min_per_tag_inlier_points: int = 12,
 ) -> None:
     print(f"[STAGE] dense DeepTag pose estimation min_tags={min_tags}", flush=True)
     dense_deeptag_main(DenseDeepTagPoseConfig(
@@ -332,6 +367,10 @@ def estimate_deeptag_dense_poses(
         min_inlier_tag_fraction=min_inlier_tag_fraction,
         coverage_check_min_raw_tags=coverage_check_min_raw_tags,
         max_required_inlier_tags=max_required_inlier_tags,
+        require_validated_corner_order=require_validated_corner_order,
+        min_point_inlier_fraction=min_point_inlier_fraction,
+        min_per_tag_inlier_fraction=min_per_tag_inlier_fraction,
+        min_per_tag_inlier_points=min_per_tag_inlier_points,
     ))
 
 
@@ -369,6 +408,14 @@ def recover_poses_from_outlines(
     ))
 
 
+def reject_temporal_pose_outliers(input_pkl: Path, output_pkl: Path) -> None:
+    print("[STAGE] reject temporal pose outliers", flush=True)
+    temporal_outlier_rejection_main(TemporalOutlierRejectionConfig(
+        input_pkl=input_pkl,
+        output_pkl=output_pkl,
+    ))
+
+
 def fill_remaining_poses_from_trajectory(
     input_pkl: Path,
     raw_pkl: Path,
@@ -376,6 +423,19 @@ def fill_remaining_poses_from_trajectory(
 ) -> None:
     print("[STAGE] global temporal fill", flush=True)
     temporal_completion_main(TemporalPoseCompletionConfig(
+        input_pkl=input_pkl,
+        raw_pkl=raw_pkl,
+        output_pkl=output_pkl,
+    ))
+
+
+def smooth_completed_pose_trajectory(
+    input_pkl: Path,
+    raw_pkl: Path,
+    output_pkl: Path,
+) -> None:
+    print("[STAGE] constrained temporal pose smoothing", flush=True)
+    temporal_pose_smoothing_main(TemporalPoseSmoothingConfig(
         input_pkl=input_pkl,
         raw_pkl=raw_pkl,
         output_pkl=output_pkl,
@@ -466,8 +526,10 @@ def process_012_recording(
     )
     deeptag_dense_loose_pkl = work_dir / f"loose_deeptag_dense_pose_{raw_pkl.stem}.pkl"
     fused_single_frame_pkl = work_dir / f"fused_single_frame_pose_{raw_pkl.stem}.pkl"
+    temporal_cleaned_pkl = work_dir / f"temporal_outlier_rejected_pose_{raw_pkl.stem}.pkl"
     outline_refine_pkl = work_dir / f"outline_recovered_pose_{raw_pkl.stem}.pkl"
-    final_pose_pkl = work_dir / f"temporally_completed_pose_{raw_pkl.stem}.pkl"
+    temporally_completed_pkl = work_dir / f"temporally_completed_pose_{raw_pkl.stem}.pkl"
+    final_pose_pkl = work_dir / f"temporally_smoothed_pose_{raw_pkl.stem}.pkl"
 
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -522,13 +584,22 @@ def process_012_recording(
         old_april_pkl=april_merged_pkl,
         output_pkl=fused_single_frame_pkl,
     )
-    recover_poses_from_outlines(
+    reject_temporal_pose_outliers(
         input_pkl=fused_single_frame_pkl,
+        output_pkl=temporal_cleaned_pkl,
+    )
+    recover_poses_from_outlines(
+        input_pkl=temporal_cleaned_pkl,
         raw_pkl=april_merged_pkl,
         output_pkl=outline_refine_pkl,
     )
     fill_remaining_poses_from_trajectory(
         input_pkl=outline_refine_pkl,
+        raw_pkl=april_merged_pkl,
+        output_pkl=temporally_completed_pkl,
+    )
+    smooth_completed_pose_trajectory(
+        input_pkl=temporally_completed_pkl,
         raw_pkl=april_merged_pkl,
         output_pkl=final_pose_pkl,
     )
@@ -4469,9 +4540,20 @@ def dense_deeptag_local_to_cube_affine(tag_corners_3d: np.ndarray, corner_order:
     affine_t, *_ = np.linalg.lstsq(local, target, rcond=None)
     return affine_t
 
-def dense_deeptag_dense_points_for_frame(frame: dict[str, Any], *, tag_corner_map: dict[int, np.ndarray], min_tags: int) -> tuple[np.ndarray, np.ndarray, list[int], dict[int, int], dict[str, Any]]:
+def dense_deeptag_dense_points_for_frame(
+    frame: dict[str, Any],
+    *,
+    tag_corner_map: dict[int, np.ndarray],
+    face_id_sets: dict[str, set[int]] | None = None,
+    min_tags: int,
+    require_validated_corner_order: bool = True,
+) -> tuple[np.ndarray, np.ndarray, list[int], dict[int, int], dict[str, Any]]:
     cluster_orders = frame.get('cluster_stats', {}).get('cluster_corner_orders', {}) or {}
-    cluster_orders = {int(k): str(v) for k, v in cluster_orders.items()}
+    cluster_orders = {
+        int(k): str(v)
+        for k, v in cluster_orders.items()
+        if str(v) in DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS
+    }
     order_votes: dict[str, int] = {}
     for order in cluster_orders.values():
         if order in DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS:
@@ -4484,17 +4566,41 @@ def dense_deeptag_dense_points_for_frame(frame: dict[str, Any], *, tag_corner_ma
         tag_id = int(decoded.get('tag_id', -1))
         if tag_id in tag_corner_map:
             decoded_by_id[tag_id] = decoded
+    decoded_tag_ids = sorted(decoded_by_id)
+    single_face_joint_ids: set[int] = set()
+    if require_validated_corner_order and not cluster_orders and face_id_sets:
+        face_candidates: list[tuple[int, str, set[int]]] = []
+        decoded_id_set = set(decoded_tag_ids)
+        for face_name, face_ids in face_id_sets.items():
+            matching = decoded_id_set & {int(v) for v in face_ids}
+            face_candidates.append((len(matching), str(face_name), matching))
+        face_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        if face_candidates and face_candidates[0][0] >= int(min_tags):
+            single_face_joint_ids = set(face_candidates[0][2])
+    individually_or_jointly_validated_ids = set(cluster_orders) | single_face_joint_ids
+    unvalidated_order_tag_ids = [
+        int(tag_id)
+        for tag_id in decoded_tag_ids
+        if int(tag_id) not in individually_or_jointly_validated_ids
+    ]
     obj_chunks: list[np.ndarray] = []
     img_chunks: list[np.ndarray] = []
     tag_ids: list[int] = []
     point_counts: dict[int, int] = {}
     for tag_id in sorted(decoded_by_id):
+        if (
+            require_validated_corner_order
+            and int(tag_id) not in individually_or_jointly_validated_ids
+        ):
+            continue
         decoded = decoded_by_id[tag_id]
         image_points = np.asarray(decoded.get('keypoints_in_images', []), dtype=np.float64).reshape(-1, 2)
         if image_points.shape[0] < 4:
             continue
         local_xy = dense_deeptag_dense_local_annotations(image_points.shape[0])
-        corner_order = cluster_orders.get(int(tag_id), dominant_order)
+        corner_order = cluster_orders.get(
+            int(tag_id), 'id' if int(tag_id) in single_face_joint_ids else dominant_order
+        )
         affine_t = dense_deeptag_local_to_cube_affine(tag_corner_map[tag_id], corner_order)
         object_points = np.c_[local_xy, np.ones(local_xy.shape[0], dtype=np.float64)] @ affine_t
         obj_chunks.append(object_points.astype(np.float64))
@@ -4502,8 +4608,37 @@ def dense_deeptag_dense_points_for_frame(frame: dict[str, Any], *, tag_corner_ma
         tag_ids.append(int(tag_id))
         point_counts[int(tag_id)] = int(image_points.shape[0])
     if len(tag_ids) < int(min_tags):
-        return (np.empty((0, 3), dtype=np.float64), np.empty((0, 2), dtype=np.float64), tag_ids, point_counts, {'reason': f'dense_tags_too_small:{len(tag_ids)}<{int(min_tags)}'})
-    return (np.vstack(obj_chunks), np.vstack(img_chunks), tag_ids, point_counts, {'cluster_corner_order_count': int(len(cluster_orders)), 'corner_order_fallback': dominant_order, 'used_fallback_order_tag_ids': [int(tag_id) for tag_id in tag_ids if int(tag_id) not in cluster_orders]})
+        validation_name = 'validated_order_tags' if require_validated_corner_order else 'tags'
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 2), dtype=np.float64),
+            tag_ids,
+            point_counts,
+            {
+                'reason': f'dense_{validation_name}_too_small:{len(tag_ids)}<{int(min_tags)}',
+                'point_order_validation': ('per_tag_cluster_or_single_face_joint_pnp' if require_validated_corner_order else 'dominant_fallback'),
+                'decoded_tag_ids': decoded_tag_ids,
+                'validated_order_tag_ids': sorted(individually_or_jointly_validated_ids),
+                'single_face_joint_order_tag_ids': sorted(single_face_joint_ids),
+                'rejected_unvalidated_order_tag_ids': unvalidated_order_tag_ids if require_validated_corner_order else [],
+            },
+        )
+    return (
+        np.vstack(obj_chunks),
+        np.vstack(img_chunks),
+        tag_ids,
+        point_counts,
+        {
+            'cluster_corner_order_count': int(len(cluster_orders)),
+            'point_order_validation': ('per_tag_cluster_or_single_face_joint_pnp' if require_validated_corner_order else 'dominant_fallback'),
+            'corner_order_fallback': None if require_validated_corner_order else dominant_order,
+            'used_fallback_order_tag_ids': [] if require_validated_corner_order else [int(tag_id) for tag_id in tag_ids if int(tag_id) not in cluster_orders],
+            'decoded_tag_ids': decoded_tag_ids,
+            'validated_order_tag_ids': sorted(individually_or_jointly_validated_ids),
+            'single_face_joint_order_tag_ids': sorted(single_face_joint_ids),
+            'rejected_unvalidated_order_tag_ids': unvalidated_order_tag_ids if require_validated_corner_order else [],
+        },
+    )
 
 def dense_deeptag_project_errors(object_points: np.ndarray, image_points: np.ndarray, rvec: np.ndarray, tvec: np.ndarray, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> np.ndarray:
     projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
@@ -4593,7 +4728,39 @@ def dense_deeptag_best_single_face_ippe_pose(face_points: np.ndarray, cube_point
     reproj, rvec, tvec = candidates[0]
     return (True, rvec, tvec, reproj, len(candidates))
 
-def dense_deeptag_solve_single_face_dense_pose(object_points: np.ndarray, image_points: np.ndarray, tag_ids: list[int], point_counts: dict[int, int], *, cube_config: Any, face_name: str, camera_matrix: np.ndarray, dist_coeffs: np.ndarray, max_reproj: float, point_reject_px: float, tag_reject_px: float, min_tags: int, min_inlier_tag_fraction: float, coverage_check_min_raw_tags: int, max_required_inlier_tags: int) -> dict[str, Any]:
+def dense_deeptag_required_inliers_for_tag(
+    point_count: int,
+    *,
+    min_fraction: float,
+    min_points: int,
+) -> int:
+    return min(
+        int(point_count),
+        max(4, int(min_points), int(np.ceil(float(point_count) * float(min_fraction)))),
+    )
+
+
+def dense_deeptag_solve_single_face_dense_pose(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    tag_ids: list[int],
+    point_counts: dict[int, int],
+    *,
+    cube_config: Any,
+    face_name: str,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    max_reproj: float,
+    point_reject_px: float,
+    tag_reject_px: float,
+    min_tags: int,
+    min_inlier_tag_fraction: float,
+    coverage_check_min_raw_tags: int,
+    max_required_inlier_tags: int,
+    min_point_inlier_fraction: float = 0.25,
+    min_per_tag_inlier_fraction: float = 0.25,
+    min_per_tag_inlier_points: int = 12,
+) -> dict[str, Any]:
     if object_points.shape[0] < 4:
         return {'success': False, 'failure_reason': 'dense_single_face_no_points', 'reproj_error': float('inf')}
     face_points = dense_deeptag_cube_points_to_face_points(cube_config, face_name, object_points)
@@ -4622,7 +4789,12 @@ def dense_deeptag_solve_single_face_dense_pose(object_points: np.ndarray, image_
             count = int(point_counts[int(tag_id)])
             end = start + count
             tag_active = active[start:end] & point_keep[start:end]
-            if int(tag_active.sum()) >= 4:
+            required_tag_points = dense_deeptag_required_inliers_for_tag(
+                count,
+                min_fraction=min_per_tag_inlier_fraction,
+                min_points=min_per_tag_inlier_points,
+            )
+            if int(tag_active.sum()) >= required_tag_points:
                 mean_err = float(np.mean(errors[start:end][tag_active]))
                 if mean_err <= float(tag_reject_px):
                     tag_keep_ids.add(int(tag_id))
@@ -4668,22 +4840,46 @@ def dense_deeptag_solve_single_face_dense_pose(object_points: np.ndarray, image_
     coverage_failure = dense_deeptag_inlier_tag_coverage_failure(tag_ids, used_ids, min_tags=min_tags, min_inlier_tag_fraction=min_inlier_tag_fraction, coverage_check_min_raw_tags=coverage_check_min_raw_tags, max_required_inlier_tags=max_required_inlier_tags)
     if coverage_failure:
         return {'success': False, 'failure_reason': coverage_failure, 'reproj_error': float('inf'), 'raw_reproj_error': reproj, 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
+    point_inlier_fraction = float(active.sum()) / max(float(object_points.shape[0]), 1.0)
+    if point_inlier_fraction < float(min_point_inlier_fraction):
+        return {'success': False, 'failure_reason': f'dense_single_face_point_retention_low:{point_inlier_fraction:.3f}<{float(min_point_inlier_fraction):.3f}', 'reproj_error': float('inf'), 'raw_reproj_error': reproj, 'n_points': int(active.sum()), 'n_points_raw': int(object_points.shape[0]), 'point_inlier_fraction': point_inlier_fraction, 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
     if not dense_deeptag_face_normals_ok(rvec, {face_name}):
         return {'success': False, 'failure_reason': 'dense_single_face_normal_away', 'reproj_error': float('inf'), 'raw_reproj_error': reproj}
     if len(used_ids) >= 2:
         quality_level = 'B'
-        quality_reason = f'dense_singleface_face_frame:{len(used_ids)}tags'
+        quality_reason = f'dense_singleface_face_frame:{len(used_ids)}tags;point_retention:{point_inlier_fraction:.2f}'
     else:
         quality_level = 'C'
         quality_reason = 'dense_singletag_face_frame'
-    return {'success': True, 'failure_reason': '', 'pose_source': 'deeptag_dense_keypoints_single_face_ippe_cfg_transform', 'quality_level': quality_level, 'quality_reason': quality_reason, 'pose_filled': False, 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': dense_deeptag_transform_from_rvec_tvec(rvec, tvec), 'reproj_error': reproj, 'n_points': int(active.sum()), 'n_points_raw': int(object_points.shape[0]), 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'visible_faces': {face_name}, 'single_face_name': face_name, 'single_face_ippe_candidates': int(candidate_count), 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
+    return {'success': True, 'failure_reason': '', 'pose_source': 'deeptag_dense_keypoints_single_face_ippe_cfg_transform', 'quality_level': quality_level, 'quality_reason': quality_reason, 'pose_filled': False, 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': dense_deeptag_transform_from_rvec_tvec(rvec, tvec), 'reproj_error': reproj, 'n_points': int(active.sum()), 'n_points_raw': int(object_points.shape[0]), 'point_inlier_fraction': point_inlier_fraction, 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'visible_faces': {face_name}, 'single_face_name': face_name, 'single_face_ippe_candidates': int(candidate_count), 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
 
-def dense_deeptag_solve_dense_pose(object_points: np.ndarray, image_points: np.ndarray, tag_ids: list[int], point_counts: dict[int, int], *, cube_config: Any, face_id_sets: dict[str, set[int]], camera_matrix: np.ndarray, dist_coeffs: np.ndarray, ransac_reproj: float, max_reproj: float, point_reject_px: float, tag_reject_px: float, min_tags: int, min_inlier_tag_fraction: float, coverage_check_min_raw_tags: int, max_required_inlier_tags: int) -> dict[str, Any]:
+def dense_deeptag_solve_dense_pose(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    tag_ids: list[int],
+    point_counts: dict[int, int],
+    *,
+    cube_config: Any,
+    face_id_sets: dict[str, set[int]],
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    ransac_reproj: float,
+    max_reproj: float,
+    point_reject_px: float,
+    tag_reject_px: float,
+    min_tags: int,
+    min_inlier_tag_fraction: float,
+    coverage_check_min_raw_tags: int,
+    max_required_inlier_tags: int,
+    min_point_inlier_fraction: float = 0.25,
+    min_per_tag_inlier_fraction: float = 0.25,
+    min_per_tag_inlier_points: int = 12,
+) -> dict[str, Any]:
     if object_points.shape[0] < 4:
         return {'success': False, 'failure_reason': 'dense_no_points', 'reproj_error': float('inf')}
     raw_visible_faces = dense_deeptag_visible_faces_for_ids(face_id_sets, tag_ids)
     if len(raw_visible_faces) == 1:
-        return dense_deeptag_solve_single_face_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=cube_config, face_name=next(iter(raw_visible_faces)), camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, max_reproj=max_reproj, point_reject_px=point_reject_px, tag_reject_px=tag_reject_px, min_tags=min_tags, min_inlier_tag_fraction=min_inlier_tag_fraction, coverage_check_min_raw_tags=coverage_check_min_raw_tags, max_required_inlier_tags=max_required_inlier_tags)
+        return dense_deeptag_solve_single_face_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=cube_config, face_name=next(iter(raw_visible_faces)), camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, max_reproj=max_reproj, point_reject_px=point_reject_px, tag_reject_px=tag_reject_px, min_tags=min_tags, min_inlier_tag_fraction=min_inlier_tag_fraction, coverage_check_min_raw_tags=coverage_check_min_raw_tags, max_required_inlier_tags=max_required_inlier_tags, min_point_inlier_fraction=min_point_inlier_fraction, min_per_tag_inlier_fraction=min_per_tag_inlier_fraction, min_per_tag_inlier_points=min_per_tag_inlier_points)
     try:
         ok, rvec, tvec, inliers = cv2.solvePnPRansac(object_points, image_points, camera_matrix, dist_coeffs, iterationsCount=300, reprojectionError=float(ransac_reproj), confidence=0.995, flags=cv2.SOLVEPNP_SQPNP)
     except cv2.error:
@@ -4716,7 +4912,12 @@ def dense_deeptag_solve_dense_pose(object_points: np.ndarray, image_points: np.n
             count = int(point_counts[int(tag_id)])
             end = start + count
             tag_active = active[start:end] & point_keep[start:end]
-            if int(tag_active.sum()) >= 4:
+            required_tag_points = dense_deeptag_required_inliers_for_tag(
+                count,
+                min_fraction=min_per_tag_inlier_fraction,
+                min_points=min_per_tag_inlier_points,
+            )
+            if int(tag_active.sum()) >= required_tag_points:
                 mean_err = float(np.mean(errors[start:end][tag_active]))
                 per_tag_mean[int(tag_id)] = mean_err
                 if mean_err <= float(tag_reject_px):
@@ -4764,19 +4965,22 @@ def dense_deeptag_solve_dense_pose(object_points: np.ndarray, image_points: np.n
     coverage_failure = dense_deeptag_inlier_tag_coverage_failure(tag_ids, used_ids, min_tags=min_tags, min_inlier_tag_fraction=min_inlier_tag_fraction, coverage_check_min_raw_tags=coverage_check_min_raw_tags, max_required_inlier_tags=max_required_inlier_tags)
     if coverage_failure:
         return {'success': False, 'failure_reason': coverage_failure, 'reproj_error': float('inf'), 'raw_reproj_error': reproj, 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
+    point_inlier_fraction = float(active.sum()) / max(float(object_points.shape[0]), 1.0)
+    if point_inlier_fraction < float(min_point_inlier_fraction):
+        return {'success': False, 'failure_reason': f'dense_point_retention_low:{point_inlier_fraction:.3f}<{float(min_point_inlier_fraction):.3f}', 'reproj_error': float('inf'), 'raw_reproj_error': reproj, 'n_points': int(active.sum()), 'n_points_raw': int(object_points.shape[0]), 'point_inlier_fraction': point_inlier_fraction, 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
     visible_faces = dense_deeptag_visible_faces_for_ids(face_id_sets, used_ids)
     if not dense_deeptag_face_normals_ok(rvec, visible_faces):
         return {'success': False, 'failure_reason': 'dense_face_normal_away', 'reproj_error': float('inf'), 'raw_reproj_error': reproj}
     if len(visible_faces) >= 2:
         quality_level = 'A'
-        quality_reason = f'dense_multiface:{len(visible_faces)}faces/{len(used_ids)}tags'
+        quality_reason = f'dense_multiface:{len(visible_faces)}faces/{len(used_ids)}tags;point_retention:{point_inlier_fraction:.2f}'
     elif len(used_ids) >= 2:
         quality_level = 'B'
-        quality_reason = f'dense_multitag_singleface:{len(used_ids)}tags'
+        quality_reason = f'dense_multitag_singleface:{len(used_ids)}tags;point_retention:{point_inlier_fraction:.2f}'
     else:
         quality_level = 'C'
         quality_reason = 'dense_single_tag_planar'
-    return {'success': True, 'failure_reason': '', 'pose_source': 'deeptag_dense_keypoints_all_point_pnp', 'quality_level': quality_level, 'quality_reason': quality_reason, 'pose_filled': False, 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': dense_deeptag_transform_from_rvec_tvec(rvec, tvec), 'reproj_error': reproj, 'n_points': int(active.sum()), 'n_points_raw': int(object_points.shape[0]), 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'visible_faces': visible_faces, 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
+    return {'success': True, 'failure_reason': '', 'pose_source': 'deeptag_dense_keypoints_all_point_pnp', 'quality_level': quality_level, 'quality_reason': quality_reason, 'pose_filled': False, 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': dense_deeptag_transform_from_rvec_tvec(rvec, tvec), 'reproj_error': reproj, 'n_points': int(active.sum()), 'n_points_raw': int(object_points.shape[0]), 'point_inlier_fraction': point_inlier_fraction, 'n_tags': int(len(used_ids)), 'tag_ids': used_ids, 'visible_faces': visible_faces, 'per_tag_reproj_error': per_tag_reproj, 'per_tag_inlier_points': per_tag_inliers, 'rejected_points': int(rejected_points), 'rejected_tags': rejected_tags}
 
 def dense_deeptag_sanitize_pose(pose: dict[str, Any]) -> dict[str, Any]:
     return dense_deeptag_to_json_compatible(pose)
@@ -4850,12 +5054,12 @@ def dense_deeptag_main(args: DenseDeepTagPoseConfig) -> None:
     total_points = 0
     t0 = time.perf_counter()
     with output_pkl.open('wb') as f:
-        pickle.dump({'type': 'header', 'format': 'deeptag_012_offline_stream_v1', 'source_pkl': str(input_pkl), 'source_footer': footer, 'metadata': {'script': str(DENSE_DEEPTAG_THIS_FILE), 'method': 'DeepTag dense keypoints; single-face frames use cfg face-frame IPPE then fixed face-to-cube transform; multiface frames use cube-frame all-point PnP; no temporal filter', 'cube_cfg': str(runtime['cube_cfg']), 'camera_matrix': runtime['camera_matrix'].tolist(), 'dist_coeffs': runtime['dist_coeffs'].tolist(), 'frame_count': int(len(offsets)), 'min_tags': int(args.min_tags), 'ransac_reproj': float(args.ransac_reproj), 'max_reproj': float(args.max_reproj), 'point_reject_px': float(args.point_reject_px), 'tag_reject_px': float(args.tag_reject_px), 'min_inlier_tag_fraction': float(args.min_inlier_tag_fraction), 'coverage_check_min_raw_tags': int(args.coverage_check_min_raw_tags), 'max_required_inlier_tags': int(args.max_required_inlier_tags), 'input_header': dense_deeptag_to_json_compatible(header)}}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump({'type': 'header', 'format': 'deeptag_012_offline_stream_v1', 'source_pkl': str(input_pkl), 'source_footer': footer, 'metadata': {'script': str(DENSE_DEEPTAG_THIS_FILE), 'method': 'DeepTag dense keypoints with per-tag validated point order and point-retention gates; single-face frames use cfg face-frame IPPE then fixed face-to-cube transform; multiface frames use cube-frame all-point PnP; no temporal filter', 'cube_cfg': str(runtime['cube_cfg']), 'camera_matrix': runtime['camera_matrix'].tolist(), 'dist_coeffs': runtime['dist_coeffs'].tolist(), 'frame_count': int(len(offsets)), 'min_tags': int(args.min_tags), 'ransac_reproj': float(args.ransac_reproj), 'max_reproj': float(args.max_reproj), 'point_reject_px': float(args.point_reject_px), 'tag_reject_px': float(args.tag_reject_px), 'min_inlier_tag_fraction': float(args.min_inlier_tag_fraction), 'coverage_check_min_raw_tags': int(args.coverage_check_min_raw_tags), 'max_required_inlier_tags': int(args.max_required_inlier_tags), 'require_validated_corner_order': bool(args.require_validated_corner_order), 'min_point_inlier_fraction': float(args.min_point_inlier_fraction), 'min_per_tag_inlier_fraction': float(args.min_per_tag_inlier_fraction), 'min_per_tag_inlier_points': int(args.min_per_tag_inlier_points), 'input_header': dense_deeptag_to_json_compatible(header)}}, f, protocol=pickle.HIGHEST_PROTOCOL)
         for out_idx, offset in enumerate(offsets):
             frame = dense_deeptag_load_at(input_pkl, offset)
-            object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(frame, tag_corner_map=runtime['tag_corner_map'], min_tags=int(args.min_tags))
+            object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(frame, tag_corner_map=runtime['tag_corner_map'], face_id_sets=runtime['face_id_sets'], min_tags=int(args.min_tags), require_validated_corner_order=bool(args.require_validated_corner_order))
             if object_points.shape[0] >= 4:
-                pose = dense_deeptag_solve_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=runtime['cube_config'], face_id_sets=runtime['face_id_sets'], camera_matrix=runtime['camera_matrix'], dist_coeffs=runtime['dist_coeffs'], ransac_reproj=float(args.ransac_reproj), max_reproj=float(args.max_reproj), point_reject_px=float(args.point_reject_px), tag_reject_px=float(args.tag_reject_px), min_tags=int(args.min_tags), min_inlier_tag_fraction=float(args.min_inlier_tag_fraction), coverage_check_min_raw_tags=int(args.coverage_check_min_raw_tags), max_required_inlier_tags=int(args.max_required_inlier_tags))
+                pose = dense_deeptag_solve_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=runtime['cube_config'], face_id_sets=runtime['face_id_sets'], camera_matrix=runtime['camera_matrix'], dist_coeffs=runtime['dist_coeffs'], ransac_reproj=float(args.ransac_reproj), max_reproj=float(args.max_reproj), point_reject_px=float(args.point_reject_px), tag_reject_px=float(args.tag_reject_px), min_tags=int(args.min_tags), min_inlier_tag_fraction=float(args.min_inlier_tag_fraction), coverage_check_min_raw_tags=int(args.coverage_check_min_raw_tags), max_required_inlier_tags=int(args.max_required_inlier_tags), min_point_inlier_fraction=float(args.min_point_inlier_fraction), min_per_tag_inlier_fraction=float(args.min_per_tag_inlier_fraction), min_per_tag_inlier_points=int(args.min_per_tag_inlier_points))
             else:
                 pose = {'success': False, 'failure_reason': str(dense_stats.get('reason', 'dense_no_points')), 'reproj_error': float('inf'), 'n_tags': len(tag_ids), 'tag_ids': tag_ids, 'pose_source': 'deeptag_dense_keypoints_all_point_pnp', 'pose_filled': False}
             pose['dense_stats'] = {**dense_stats, 'raw_tag_ids': tag_ids, 'raw_point_counts': point_counts}
@@ -5135,6 +5339,10 @@ def single_frame_fusion_finite_pose(pose: dict[str, Any], *, min_tags: int, max_
         return False
     if int(pose.get('n_tags', 0) or 0) < int(min_tags):
         return False
+    if int(pose.get('n_points_raw', 0) or 0) > 0:
+        point_fraction = float(pose.get('point_inlier_fraction', 0.0) or 0.0)
+        if point_fraction < 0.25:
+            return False
     if pose.get('rvec') is None or pose.get('tvec') is None:
         return False
     try:
@@ -5169,7 +5377,7 @@ def single_frame_fusion_failure_pose(reason: str) -> dict[str, Any]:
     return {'success': False, 'pose_source': 'fused_failed', 'quality_level': 'Z', 'quality_reason': reason, 'reproj_error': float('inf'), 'pose_filled': False, 'single_frame_only': True}
 
 def single_frame_fusion_minimal_pose(pose: dict[str, Any]) -> dict[str, Any]:
-    keys = {'success', 'failure_reason', 'n_tags', 'n_points', 'n_inliers', 'reproj_error', 'tag_ids', 'visible_faces', 'pose_source', 'pose_filled', 'quality_level', 'quality_reason', 'edge_score', 'rvec', 'tvec', 'T'}
+    keys = {'success', 'failure_reason', 'n_tags', 'n_points', 'n_points_raw', 'point_inlier_fraction', 'n_inliers', 'reproj_error', 'tag_ids', 'visible_faces', 'pose_source', 'pose_filled', 'quality_level', 'quality_reason', 'edge_score', 'rvec', 'tvec', 'T', 'per_tag_inlier_points', 'dense_stats'}
     return {key: copy.deepcopy(value) for key, value in pose.items() if key in keys}
 
 def single_frame_fusion_draw_overlay(bm: Any, script012: Any, draw_detector: Any, detect_frame: np.ndarray, pose: dict[str, Any], label: str, reason: str, quality: int) -> bytes:
@@ -5254,7 +5462,7 @@ def single_frame_fusion_apriltag_single_tag_pose(bm: Any, detections: list[tuple
     return best
 
 def single_frame_fusion_deeptag_single_tag_dense_pose(bm: Any, dense020: Any, deeptag_frame: dict[str, Any], gray: np.ndarray, *, config: Any, tag_corner_map: dict[int, np.ndarray], face_id_sets: dict[str, set[int]], camera_matrix: np.ndarray, dist_coeffs: np.ndarray, frame_index: int, max_reproj: float) -> Any:
-    object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(deeptag_frame, tag_corner_map=tag_corner_map, min_tags=1)
+    object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(deeptag_frame, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, min_tags=1)
     if object_points.shape[0] < 4:
         return RecoveryPoseCandidate(False, 'deeptag_single_tag_dense_pose', frame_index, {}, tag_ids, float('inf'), failure_reason=str(dense_stats.get('reason', 'dense_single_tag_no_points')))
     pose = dense_deeptag_solve_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=config, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, ransac_reproj=4.0, max_reproj=float(max_reproj), point_reject_px=8.0, tag_reject_px=8.0, min_tags=1, min_inlier_tag_fraction=0.0, coverage_check_min_raw_tags=999, max_required_inlier_tags=4)
@@ -5321,7 +5529,7 @@ def single_frame_fusion_main(args: SingleFrameFusionConfig) -> None:
             dt_pose = dt_frame.get('pose', {})
             ap_pose = ap_frame.get('pose', {})
             if single_frame_fusion_finite_pose(dt_pose, min_tags=int(args.min_tags), max_reproj=float(args.max_reproj)):
-                fused_pose = single_frame_fusion_copy_pose_with_stage(dt_pose, source='stage1_deeptag_dense_coverage_mintag2', quality_level='A', quality_reason=f"deeptag_dense_reproj:{float(dt_pose.get('reproj_error', float('inf'))):.2f}")
+                fused_pose = single_frame_fusion_copy_pose_with_stage(dt_pose, source='stage1_deeptag_dense_coverage_mintag2', quality_level=str(dt_pose.get('quality_level', 'B')), quality_reason=f"deeptag_dense_reproj:{float(dt_pose.get('reproj_error', float('inf'))):.2f};point_retention:{float(dt_pose.get('point_inlier_fraction', 0.0)):.2f}")
                 selected = 'stage1_deeptag'
             elif single_frame_fusion_finite_pose(ap_pose, min_tags=int(args.min_tags), max_reproj=float(args.max_reproj)):
                 fused_pose = single_frame_fusion_copy_pose_with_stage(ap_pose, source='stage2_aprilcube_strict_mintag2', quality_level='B', quality_reason=f"aprilcube_strict_reproj:{float(ap_pose.get('reproj_error', float('inf'))):.2f}")
@@ -5366,6 +5574,188 @@ def single_frame_fusion_main(args: SingleFrameFusionConfig) -> None:
     print(f'[INFO] saved {args.output_pkl}')
     print(f'[INFO] success={success_count}/{len(frame_indices)} quality_counts={quality_counts}')
     print(f'[INFO] source_counts={source_counts}')
+
+
+# ---- Bidirectional temporal outlier rejection ----
+TEMPORAL_OUTLIER_THIS_FILE = Path(__file__).resolve()
+
+
+def temporal_outlier_rotation_matrix(rvec: Any) -> np.ndarray:
+    rot, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    return rot
+
+
+def temporal_outlier_rotation_delta_deg(rvec_a: Any, rvec_b: Any) -> float:
+    rot_a = temporal_outlier_rotation_matrix(rvec_a)
+    rot_b = temporal_outlier_rotation_matrix(rvec_b)
+    cosine = np.clip((np.trace(rot_a.T @ rot_b) - 1.0) / 2.0, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def temporal_outlier_translation_delta_mm(tvec_a: Any, tvec_b: Any) -> float:
+    a = np.asarray(tvec_a, dtype=np.float64).reshape(3)
+    b = np.asarray(tvec_b, dtype=np.float64).reshape(3)
+    return float(np.linalg.norm(a - b))
+
+
+def temporal_outlier_interpolated_pose(
+    before_pose: dict[str, Any],
+    after_pose: dict[str, Any],
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    before_t = np.asarray(before_pose['tvec'], dtype=np.float64).reshape(3)
+    after_t = np.asarray(after_pose['tvec'], dtype=np.float64).reshape(3)
+    tvec = ((1.0 - alpha) * before_t + alpha * after_t).reshape(3, 1)
+    rotations = Rotation.from_matrix(np.stack([
+        temporal_outlier_rotation_matrix(before_pose['rvec']),
+        temporal_outlier_rotation_matrix(after_pose['rvec']),
+    ]))
+    rvec = Slerp([0.0, 1.0], rotations)([alpha]).as_rotvec()[0].reshape(3, 1)
+    return rvec, tvec
+
+
+def temporal_outlier_rejection_main(args: TemporalOutlierRejectionConfig) -> None:
+    header, frames, footer = pose_recovery_load_pose_records(args.input_pkl)
+    indices = sorted(frames)
+    valid_indices = [
+        idx
+        for idx in indices
+        if bool(frames[idx].get('pose', {}).get('success', False))
+        and frames[idx].get('pose', {}).get('rvec') is not None
+        and frames[idx].get('pose', {}).get('tvec') is not None
+    ]
+    rejected: dict[int, dict[str, Any]] = {}
+    for position, idx in enumerate(valid_indices):
+        if position == 0 or position + 1 >= len(valid_indices):
+            continue
+        before_idx = int(valid_indices[position - 1])
+        after_idx = int(valid_indices[position + 1])
+        before_gap = int(idx - before_idx)
+        after_gap = int(after_idx - idx)
+        if before_gap <= 0 or after_gap <= 0:
+            continue
+        if before_gap > int(args.max_neighbor_gap) or after_gap > int(args.max_neighbor_gap):
+            continue
+        before_pose = frames[before_idx]['pose']
+        pose = frames[idx]['pose']
+        after_pose = frames[after_idx]['pose']
+        bracket_gap = int(after_idx - before_idx)
+        alpha = float(idx - before_idx) / float(bracket_gap)
+        predicted_rvec, predicted_tvec = temporal_outlier_interpolated_pose(
+            before_pose,
+            after_pose,
+            alpha,
+        )
+        rotation_residual = temporal_outlier_rotation_delta_deg(pose['rvec'], predicted_rvec)
+        translation_residual = temporal_outlier_translation_delta_mm(pose['tvec'], predicted_tvec)
+        rotation_before = temporal_outlier_rotation_delta_deg(before_pose['rvec'], pose['rvec'])
+        rotation_after = temporal_outlier_rotation_delta_deg(pose['rvec'], after_pose['rvec'])
+        translation_before = temporal_outlier_translation_delta_mm(before_pose['tvec'], pose['tvec'])
+        translation_after = temporal_outlier_translation_delta_mm(pose['tvec'], after_pose['tvec'])
+        bracket_rotation = temporal_outlier_rotation_delta_deg(before_pose['rvec'], after_pose['rvec'])
+        bracket_translation = temporal_outlier_translation_delta_mm(before_pose['tvec'], after_pose['tvec'])
+        rotation_rate = bracket_rotation / max(float(bracket_gap), 1.0)
+        translation_rate = bracket_translation / max(float(bracket_gap), 1.0)
+        rotation_threshold = max(float(args.rotation_residual_deg), rotation_rate * 3.0 + 8.0)
+        translation_threshold = max(float(args.translation_residual_mm), translation_rate * 3.0 + 6.0)
+        rotation_outlier = (
+            rotation_residual > rotation_threshold
+            and min(rotation_before, rotation_after) > float(args.min_two_sided_rotation_jump_deg)
+        )
+        translation_outlier = (
+            translation_residual > translation_threshold
+            and min(translation_before, translation_after) > float(args.min_two_sided_translation_jump_mm)
+        )
+        if not rotation_outlier and not translation_outlier:
+            continue
+        rejected[int(idx)] = {
+            'rotation_outlier': bool(rotation_outlier),
+            'translation_outlier': bool(translation_outlier),
+            'rotation_residual_deg': float(rotation_residual),
+            'translation_residual_mm': float(translation_residual),
+            'rotation_before_deg': float(rotation_before),
+            'rotation_after_deg': float(rotation_after),
+            'translation_before_mm': float(translation_before),
+            'translation_after_mm': float(translation_after),
+            'rotation_threshold_deg': float(rotation_threshold),
+            'translation_threshold_mm': float(translation_threshold),
+            'before_frame': int(before_idx),
+            'after_frame': int(after_idx),
+            'bracket_rotation_deg': float(bracket_rotation),
+            'bracket_translation_mm': float(bracket_translation),
+        }
+    args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
+    quality_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    success_count = 0
+    with args.output_pkl.open('wb') as f:
+        out_header = copy.deepcopy(header)
+        out_header['created_wall_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        out_header['source_input_pkl'] = str(args.input_pkl.resolve())
+        out_header['metadata'] = {
+            **(out_header.get('metadata', {}) or {}),
+            'script': str(TEMPORAL_OUTLIER_THIS_FILE),
+            'method': 'reject two-sided SE(3) temporal spikes before outline recovery or interpolation',
+            'temporal_outlier_max_neighbor_gap': int(args.max_neighbor_gap),
+            'temporal_outlier_rotation_residual_deg': float(args.rotation_residual_deg),
+            'temporal_outlier_translation_residual_mm': float(args.translation_residual_mm),
+        }
+        pickle.dump(out_header, f, protocol=pickle.HIGHEST_PROTOCOL)
+        for idx in indices:
+            frame = copy.deepcopy(frames[idx])
+            if idx in rejected:
+                original_pose = copy.deepcopy(frame.get('pose', {}))
+                metrics = copy.deepcopy(rejected[idx])
+                frame['pose_temporal_outlier_original'] = original_pose
+                frame.setdefault('pose_candidates', {})['stage_temporal_outlier_rejection'] = {
+                    'success': False,
+                    'failure_reason': 'bidirectional_temporal_outlier',
+                    **metrics,
+                }
+                frame['pose'] = {
+                    'success': False,
+                    'failure_reason': 'bidirectional_temporal_outlier',
+                    'pose_source': 'fused_failed',
+                    'quality_level': 'Z',
+                    'quality_reason': (
+                        f"temporal_outlier;rot_residual:{metrics['rotation_residual_deg']:.1f};"
+                        f"trans_residual:{metrics['translation_residual_mm']:.1f};"
+                        f"bracket:{metrics['before_frame']}-{metrics['after_frame']}"
+                    ),
+                    'pose_filled': False,
+                    'single_frame_only': False,
+                    'temporal_outlier_rejected': True,
+                    'temporal_outlier_metrics': metrics,
+                    'reproj_error': float('inf'),
+                    'n_tags': 0,
+                    'tag_ids': [],
+                    'visible_faces': [],
+                }
+                frame['selected_stage'] = 'stage_temporal_outlier_rejection'
+            pose = frame.get('pose', {})
+            quality = str(pose.get('quality_level', 'Z'))
+            source = str(pose.get('pose_source', ''))
+            quality_counts[quality] = quality_counts.get(quality, 0) + 1
+            source_counts[source] = source_counts.get(source, 0) + 1
+            success_count += int(bool(pose.get('success', False)))
+            pickle.dump(frame, f, protocol=pickle.HIGHEST_PROTOCOL)
+        out_footer = {
+            'type': 'footer',
+            'frame_count': int(len(indices)),
+            'success_count': int(success_count),
+            'temporal_outlier_rejected_count': int(len(rejected)),
+            'temporal_outlier_rejected_frames': sorted((int(v) for v in rejected)),
+            'temporal_outlier_metrics': rejected,
+            'quality_counts': quality_counts,
+            'source_counts': source_counts,
+            'input_footer': footer,
+            'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        pickle.dump(out_footer, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'[INFO] saved {args.output_pkl}')
+    print(f'[INFO] temporal outliers rejected={len(rejected)} frames={sorted(rejected)}')
+    print(f'[INFO] success={success_count}/{len(indices)}')
 
 
 # ---- Temporal outline recovery ----
@@ -5764,6 +6154,387 @@ def temporal_completion_main(args: TemporalPoseCompletionConfig) -> None:
     print(f'[INFO] filled={len(filled)} frames={sorted(filled)}')
     print(f'[INFO] success={success_count}/{len(indices)}')
     print(f"[INFO] remaining_failed={out_footer['remaining_failed_frames']}")
+
+
+# ---- Constrained full-trajectory temporal smoothing ----
+TEMPORAL_SMOOTHING_THIS_FILE = Path(__file__).resolve()
+
+
+def temporal_smoothing_quality_weight(pose: dict[str, Any]) -> float:
+    quality_weight = {
+        'A': 4.0,
+        'B': 3.0,
+        'C': 2.0,
+        'D': 1.5,
+        'E': 1.3,
+        'F': 0.8,
+        'G': 1.2,
+        'H': 1.0,
+        'I': 1.0,
+        'T': 0.8,
+    }.get(str(pose.get('quality_level', '')), 1.0)
+    if bool(pose.get('pose_filled', False)):
+        quality_weight *= 0.65
+    return float(quality_weight)
+
+
+def temporal_smoothing_weighted_pose(
+    samples: list[tuple[int, dict[str, Any]]],
+    *,
+    target_idx: int,
+    sigma_frames: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    sigma = max(float(sigma_frames), 1e-6)
+    weights: list[float] = []
+    translations: list[np.ndarray] = []
+    quaternions: list[np.ndarray] = []
+    target_pose = next(pose for idx, pose in samples if int(idx) == int(target_idx))
+    reference_quat = Rotation.from_rotvec(
+        np.asarray(target_pose['rvec'], dtype=np.float64).reshape(3)
+    ).as_quat()
+    for idx, pose in samples:
+        distance = abs(int(idx) - int(target_idx))
+        weight = float(np.exp(-0.5 * (float(distance) / sigma) ** 2))
+        weight *= temporal_smoothing_quality_weight(pose)
+        if int(idx) == int(target_idx):
+            weight *= 2.0
+        quat = Rotation.from_rotvec(
+            np.asarray(pose['rvec'], dtype=np.float64).reshape(3)
+        ).as_quat()
+        if float(np.dot(quat, reference_quat)) < 0.0:
+            quat = -quat
+        weights.append(weight)
+        translations.append(np.asarray(pose['tvec'], dtype=np.float64).reshape(3))
+        quaternions.append(quat)
+    normalized_weights = np.asarray(weights, dtype=np.float64)
+    normalized_weights /= max(float(np.sum(normalized_weights)), 1e-12)
+    tvec = np.sum(
+        np.stack(translations, axis=0) * normalized_weights[:, None], axis=0
+    ).reshape(3, 1)
+    quat = np.sum(
+        np.stack(quaternions, axis=0) * normalized_weights[:, None], axis=0
+    )
+    quat /= max(float(np.linalg.norm(quat)), 1e-12)
+    rvec = Rotation.from_quat(quat).as_rotvec().reshape(3, 1)
+    return rvec, tvec, len(samples)
+
+
+def temporal_smoothing_limit_pose_delta(
+    source_pose: dict[str, Any],
+    candidate_rvec: np.ndarray,
+    candidate_tvec: np.ndarray,
+    *,
+    max_translation_delta_mm: float,
+    max_rotation_delta_deg: float,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    source_tvec = np.asarray(source_pose['tvec'], dtype=np.float64).reshape(3)
+    candidate_t = np.asarray(candidate_tvec, dtype=np.float64).reshape(3)
+    translation_delta = candidate_t - source_tvec
+    translation_norm = float(np.linalg.norm(translation_delta))
+    if translation_norm > float(max_translation_delta_mm) > 0.0:
+        candidate_t = source_tvec + translation_delta * (
+            float(max_translation_delta_mm) / translation_norm
+        )
+    source_rotation = Rotation.from_rotvec(
+        np.asarray(source_pose['rvec'], dtype=np.float64).reshape(3)
+    )
+    candidate_rotation = Rotation.from_rotvec(
+        np.asarray(candidate_rvec, dtype=np.float64).reshape(3)
+    )
+    relative_rotation = source_rotation.inv() * candidate_rotation
+    rotation_delta_deg = float(np.degrees(relative_rotation.magnitude()))
+    if rotation_delta_deg > float(max_rotation_delta_deg) > 0.0:
+        scale = float(max_rotation_delta_deg) / rotation_delta_deg
+        candidate_rotation = source_rotation * Rotation.from_rotvec(
+            relative_rotation.as_rotvec() * scale
+        )
+    limited_rvec = candidate_rotation.as_rotvec().reshape(3, 1)
+    limited_tvec = candidate_t.reshape(3, 1)
+    applied_translation = temporal_outlier_translation_delta_mm(
+        source_pose['tvec'], limited_tvec
+    )
+    applied_rotation = temporal_outlier_rotation_delta_deg(
+        source_pose['rvec'], limited_rvec
+    )
+    return limited_rvec, limited_tvec, applied_translation, applied_rotation
+
+
+def temporal_smoothing_blend_from_source(
+    source_pose: dict[str, Any],
+    target_rvec: np.ndarray,
+    target_tvec: np.ndarray,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    source_t = np.asarray(source_pose['tvec'], dtype=np.float64).reshape(3)
+    target_t = np.asarray(target_tvec, dtype=np.float64).reshape(3)
+    tvec = ((1.0 - alpha) * source_t + alpha * target_t).reshape(3, 1)
+    source_rotation = Rotation.from_rotvec(
+        np.asarray(source_pose['rvec'], dtype=np.float64).reshape(3)
+    )
+    target_rotation = Rotation.from_rotvec(
+        np.asarray(target_rvec, dtype=np.float64).reshape(3)
+    )
+    relative = source_rotation.inv() * target_rotation
+    rotation = source_rotation * Rotation.from_rotvec(relative.as_rotvec() * alpha)
+    return rotation.as_rotvec().reshape(3, 1), tvec
+
+
+def temporal_smoothing_draw_overlay(
+    draw_detector: Any,
+    detect_frame: np.ndarray,
+    pose: dict[str, Any],
+    quality: int,
+) -> bytes:
+    base = realsense_make_detector_input_vis(detect_frame)
+    result = {
+        'success': bool(pose.get('success', False)),
+        'detections': [],
+        'rvec': np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1),
+        'tvec': np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1),
+        'reproj_error': float(pose.get('reproj_error', float('inf'))),
+        'n_tags': int(pose.get('n_tags', 0) or 0),
+        'visible_faces': set(pose.get('visible_faces', []) or []),
+        'predicted': False,
+    }
+    vis = draw_detector.draw_result(base.copy(), result)
+    cv2.rectangle(vis, (8, 8), (1180, 66), (0, 0, 0), -1)
+    cv2.putText(
+        vis,
+        f"Constrained temporal smoothing: {pose.get('pose_source', '')}",
+        (18, 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        vis,
+        (
+            f"dt={float(pose.get('temporal_smoothing_translation_delta_mm', 0.0)):.2f}mm "
+            f"dr={float(pose.get('temporal_smoothing_rotation_delta_deg', 0.0)):.2f}deg "
+            f"edge={float(pose.get('temporal_smoothing_edge_after', 0.0)):.2f}"
+        ),
+        (18, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return temporal_completion_encode_bgr_jpeg(vis, quality)
+
+
+def temporal_pose_smoothing_main(args: TemporalPoseSmoothingConfig) -> None:
+    header, frames, footer = pose_recovery_load_pose_records(args.input_pkl)
+    raw_header, raw_offsets, raw_footer = pose_recovery_build_stream_index(
+        args.raw_pkl,
+        {'aprilcube_rs_raw_frame_stream_v1', 'aprilcube_012_raw_with_pose_stream_v1'},
+    )
+    metadata: dict[str, Any] = {}
+    if raw_header.get('format') == 'aprilcube_012_raw_with_pose_stream_v1':
+        metadata.update(raw_header.get('raw_header', {}).get('metadata', {}) or {})
+    metadata.update(raw_header.get('metadata', {}) or {})
+    cube_cfg = Path(metadata['cube_cfg']).expanduser().resolve()
+    config, _face_id_sets = aprilcube.load_cube_config(
+        str(cube_cfg / 'config.json' if cube_cfg.is_dir() else cube_cfg)
+    )
+    calib = realsense_load_intrinsics_yaml(metadata.get('intrinsics_yaml'))
+    image_size = tuple((int(v) for v in metadata.get('image_size', calib['image_size'])))
+    undistort_pack = (
+        realsense_create_undistort_maps(calib, image_size)
+        if bool(metadata.get('undistort_for_detection', True))
+        else None
+    )
+    camera_matrix = np.asarray(
+        metadata.get('detection_camera_matrix', calib['K']), dtype=np.float64
+    ).reshape(3, 3)
+    dist_coeffs = np.asarray(
+        metadata.get('detector_dist_coeffs', np.zeros(5)), dtype=np.float64
+    ).reshape(-1)
+    if undistort_pack is not None:
+        camera_matrix = np.asarray(
+            metadata.get('detection_camera_matrix', undistort_pack[2]),
+            dtype=np.float64,
+        ).reshape(3, 3)
+        dist_coeffs = np.asarray(
+            metadata.get('detector_dist_coeffs', np.zeros(5)), dtype=np.float64
+        ).reshape(-1)
+    raw_offset_by_frame = {
+        int(pose_recovery_load_at(args.raw_pkl, offset).get('frame_index', idx)): int(offset)
+        for idx, offset in enumerate(raw_offsets)
+    }
+    draw_detector = aprilcube.detector(
+        cube_cfg,
+        intrinsic_cfg=realsense_camera_matrix_to_intrinsic_dict(camera_matrix),
+        dist_coeffs=dist_coeffs,
+        enable_filter=False,
+        fast=True,
+    )
+    indices = sorted(frames)
+    source_poses = {idx: copy.deepcopy(frames[idx].get('pose', {})) for idx in indices}
+    if any((not bool(source_poses[idx].get('success', False))) for idx in indices):
+        failed = [idx for idx in indices if not bool(source_poses[idx].get('success', False))]
+        raise ValueError(f'Cannot smooth incomplete pose stream; failed frames={failed}')
+    smoothed_poses: dict[int, dict[str, Any]] = {}
+    smoothed_count = 0
+    edge_rejected_count = 0
+    for idx in indices:
+        source_pose = source_poses[idx]
+        samples = [
+            (neighbor_idx, source_poses[neighbor_idx])
+            for neighbor_idx in indices
+            if abs(int(neighbor_idx) - int(idx)) <= int(args.window_radius)
+        ]
+        candidate_rvec, candidate_tvec, source_count = temporal_smoothing_weighted_pose(
+            samples,
+            target_idx=int(idx),
+            sigma_frames=float(args.sigma_frames),
+        )
+        is_filled = bool(source_pose.get('pose_filled', False)) or str(
+            source_pose.get('quality_level', '')
+        ) in {'F', 'T'}
+        max_translation = (
+            float(args.max_filled_translation_delta_mm)
+            if is_filled
+            else float(args.max_measured_translation_delta_mm)
+        )
+        max_rotation = (
+            float(args.max_filled_rotation_delta_deg)
+            if is_filled
+            else float(args.max_measured_rotation_delta_deg)
+        )
+        candidate_rvec, candidate_tvec, _dt, _dr = temporal_smoothing_limit_pose_delta(
+            source_pose,
+            candidate_rvec,
+            candidate_tvec,
+            max_translation_delta_mm=max_translation,
+            max_rotation_delta_deg=max_rotation,
+        )
+        raw_record = pose_recovery_load_at(args.raw_pkl, raw_offset_by_frame[int(idx)])
+        image = np.asarray(raw_record['image_bgr'], dtype=np.uint8)
+        detect_frame = realsense_undistort_frame(image, undistort_pack)
+        gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
+        source_edge = pose_recovery_edge_alignment_score(
+            gray,
+            source_pose,
+            config=config,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+        )
+        blend = 1.0
+        candidate_pose = {'success': True, 'rvec': candidate_rvec, 'tvec': candidate_tvec}
+        candidate_edge = pose_recovery_edge_alignment_score(
+            gray,
+            candidate_pose,
+            config=config,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+        )
+        while (
+            candidate_edge < source_edge - float(args.max_edge_score_drop)
+            and blend > 0.125
+        ):
+            blend *= 0.5
+            candidate_rvec, candidate_tvec = temporal_smoothing_blend_from_source(
+                source_pose,
+                candidate_rvec,
+                candidate_tvec,
+                0.5,
+            )
+            candidate_pose = {'success': True, 'rvec': candidate_rvec, 'tvec': candidate_tvec}
+            candidate_edge = pose_recovery_edge_alignment_score(
+                gray,
+                candidate_pose,
+                config=config,
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+            )
+        edge_rejected = candidate_edge < source_edge - float(args.max_edge_score_drop)
+        if edge_rejected:
+            candidate_rvec = np.asarray(source_pose['rvec'], dtype=np.float64).reshape(3, 1)
+            candidate_tvec = np.asarray(source_pose['tvec'], dtype=np.float64).reshape(3, 1)
+            candidate_edge = float(source_edge)
+            edge_rejected_count += 1
+        translation_delta = temporal_outlier_translation_delta_mm(
+            source_pose['tvec'], candidate_tvec
+        )
+        rotation_delta = temporal_outlier_rotation_delta_deg(
+            source_pose['rvec'], candidate_rvec
+        )
+        smoothed = copy.deepcopy(source_pose)
+        smoothed['rvec'] = np.asarray(candidate_rvec, dtype=np.float64).reshape(3, 1)
+        smoothed['tvec'] = np.asarray(candidate_tvec, dtype=np.float64).reshape(3, 1)
+        smoothed['T'] = temporal_completion_make_pose_transform(
+            smoothed['rvec'], smoothed['tvec']
+        )
+        smoothed['temporal_smoothed'] = bool(
+            translation_delta > 1e-9 or rotation_delta > 1e-9
+        )
+        smoothed['temporal_smoothing_source_count'] = int(source_count)
+        smoothed['temporal_smoothing_window_radius'] = int(args.window_radius)
+        smoothed['temporal_smoothing_translation_delta_mm'] = float(translation_delta)
+        smoothed['temporal_smoothing_rotation_delta_deg'] = float(rotation_delta)
+        smoothed['temporal_smoothing_edge_before'] = float(source_edge)
+        smoothed['temporal_smoothing_edge_after'] = float(candidate_edge)
+        smoothed['temporal_smoothing_edge_rejected'] = bool(edge_rejected)
+        smoothed_poses[int(idx)] = smoothed
+        smoothed_count += int(bool(smoothed['temporal_smoothed']))
+    args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
+    with args.output_pkl.open('wb') as f:
+        out_header = copy.deepcopy(header)
+        out_header['created_wall_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        out_header['source_input_pkl'] = str(args.input_pkl.resolve())
+        out_header['source_raw_pkl'] = str(args.raw_pkl.resolve())
+        out_header['raw_footer'] = raw_footer
+        out_header['metadata'] = {
+            **(out_header.get('metadata', {}) or {}),
+            'script': str(TEMPORAL_SMOOTHING_THIS_FILE),
+            'method': 'quality-weighted symmetric SE(3) smoothing with per-frame motion caps and RGB edge-alignment guard',
+            'temporal_smoothing_window_radius': int(args.window_radius),
+            'temporal_smoothing_sigma_frames': float(args.sigma_frames),
+            'temporal_smoothing_max_measured_translation_delta_mm': float(args.max_measured_translation_delta_mm),
+            'temporal_smoothing_max_measured_rotation_delta_deg': float(args.max_measured_rotation_delta_deg),
+            'temporal_smoothing_max_filled_translation_delta_mm': float(args.max_filled_translation_delta_mm),
+            'temporal_smoothing_max_filled_rotation_delta_deg': float(args.max_filled_rotation_delta_deg),
+            'temporal_smoothing_max_edge_score_drop': float(args.max_edge_score_drop),
+        }
+        pickle.dump(out_header, f, protocol=pickle.HIGHEST_PROTOCOL)
+        for idx in indices:
+            frame = copy.deepcopy(frames[idx])
+            frame['pose_before_temporal_smoothing'] = copy.deepcopy(frame.get('pose', {}))
+            frame['pose'] = smoothed_poses[idx]
+            frame['pose_temporally_smoothed'] = copy.deepcopy(smoothed_poses[idx])
+            frame['selected_stage_before_temporal_smoothing'] = frame.get('selected_stage', '')
+            frame['selected_stage'] = 'stage12_constrained_temporal_smoothing'
+            raw_record = pose_recovery_load_at(args.raw_pkl, raw_offset_by_frame[int(idx)])
+            image = np.asarray(raw_record['image_bgr'], dtype=np.uint8)
+            detect_frame = realsense_undistort_frame(image, undistort_pack)
+            frame['overlay_jpeg'] = temporal_smoothing_draw_overlay(
+                draw_detector,
+                detect_frame,
+                smoothed_poses[idx],
+                int(args.jpeg_quality),
+            )
+            frame['overlay_format'] = 'jpeg_bgr'
+            frame['overlay_shape'] = tuple((int(v) for v in detect_frame.shape))
+            pickle.dump(frame, f, protocol=pickle.HIGHEST_PROTOCOL)
+        out_footer = {
+            'type': 'footer',
+            'frame_count': int(len(indices)),
+            'success_count': int(len(indices)),
+            'smoothed_count': int(smoothed_count),
+            'edge_rejected_count': int(edge_rejected_count),
+            'input_footer': footer,
+            'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        pickle.dump(out_footer, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'[INFO] saved {args.output_pkl}')
+    print(
+        f'[INFO] smoothed={smoothed_count}/{len(indices)} '
+        f'edge_rejected={edge_rejected_count}'
+    )
 
 
 def main() -> None:
