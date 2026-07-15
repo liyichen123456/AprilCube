@@ -47,7 +47,7 @@ def load_intrinsics_yaml(path: str | Path) -> dict[str, Any]:
 # ============================================================
 
 CAMERA_TO_PORT: dict[str, str] = {
-    "cam0": "4-9.4.4.1:1.0",
+    "cam0": "3-8:1.0",
 }
 
 CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
@@ -67,12 +67,12 @@ TAG_AXIS_LENGTH_SCALE = 0.8
 UNDISTORT_BEFORE_DETECTION = True
 
 CUBE_CFG_DIRS: list[Path] = [
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
-    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
+    THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_0_5_1x1x1_15mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
+    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
 ]
 
 CALIB_BY_CAMERA = {name: load_intrinsics_yaml(path) for name, path in CAMERA_TO_INTRINSICS_YAML.items()}

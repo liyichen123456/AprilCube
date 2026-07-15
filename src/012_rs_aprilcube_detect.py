@@ -381,8 +381,9 @@ def main() -> None:
         desired_height=image_size[1],
         desired_fps=args.fps,
         device_serials=device_serials,
-        align_to_color=True,
+        align_to_color=bool(args.show_depth),
         prefer_mjpeg=bool(args.prefer_mjpeg),
+        enable_depth=bool(args.show_depth),
         verbose=True,
     )
     if not manager.is_enabled():

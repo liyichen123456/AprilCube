@@ -65,7 +65,7 @@ CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_cam0_fisheye_2592x1944_0703_230535.yaml",  # 180 degree
 
     # fisheye middle finger yaml
-    # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_charuco_2592x1944_0705_180038.yaml",
+    # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_middle_finger_charuco_2592x1944_0705_180038.yaml",
 
     # pinehole middle finger yaml
     # "cam0": "/home/ps/RobotCamCalib1/outputs/intrinsics_cv2_apriltag_grid_1920x1080_0706_182725.yaml",
@@ -76,6 +76,9 @@ CAMERA_TO_INTRINSICS_YAML: dict[str, str] = {
     # IR 3MP f3.6mm
     # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_offline_eval_0708_150154_0708_150928/"
     #         "intrinsics_None_charuco_2592x1944_0708_150154_offline_filtered.yaml",
+
+    # f2.3mm / 2.6mm
+    # "cam1": "/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_scale0p25_2592x1944_0712_225925.yaml"
 }
 
 ACTIVE_CAMERA_NAMES: list[str] = ["cam1"]
@@ -96,8 +99,6 @@ CUBE_CFG_DIRS: list[Path] = [
     THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_10mm",
     THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_15mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_6_11_1x1x1_15mm",
-    # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_12_17_1x1x1_15mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_18_23_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_24_29_1x1x1_10mm",
     # THIRDPARTY_DIR / "aprilcube" / "cubes" / "cube_april_36h11_30_35_1x1x1_10mm",
@@ -877,7 +878,8 @@ def main() -> None:
             "recorded_image": "origin_frame_raw_bgr",
             "camera_to_port": {name: CAMERA_TO_PORT[name] for name in active_camera_names},
             "intrinsics_yaml": {
-                name: CAMERA_TO_INTRINSICS_YAML[name] for name in active_camera_names
+                name: str(Path(CAMERA_TO_INTRINSICS_YAML[name]).expanduser().resolve())
+                for name in active_camera_names
             },
             "opened_cameras": list(opened_names),
             "capture_size": tuple(int(v) for v in capture_size),
@@ -898,7 +900,7 @@ def main() -> None:
                 for name in active_camera_names
                 if use_undistort and is_fisheye_calib(calib_by_camera[name])
             },
-            "cube_paths": [str(path) for path in cube_paths],
+            "cube_paths": [str(Path(path).expanduser().resolve()) for path in cube_paths],
         }
 
         def handle_key(key: int) -> bool:
