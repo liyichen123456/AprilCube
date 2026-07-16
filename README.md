@@ -160,12 +160,12 @@ while True:
 
 | 脚本 | 用途 |
 | --- | --- |
-| `src/008_cv2_naive_aprilcube_detect_multi_cube.py` | 普通 OpenCV / 鱼眼相机多 cube 检测 |
+| `src/008_cv2_naive_aprilcube_detect.py` | 普通 OpenCV / 鱼眼相机多 cube 检测 |
 
 运行示例：
 
 ```bash
-python src/008_cv2_naive_aprilcube_detect_multi_cube.py
+python src/008_cv2_naive_aprilcube_detect.py
 ```
 
 CV2 脚本可读取 `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml` 这类 YAML 内参文件，字段包含 `image_size`、`K`、`dist`、`fx/fy/cx/cy` 和标定误差。
@@ -177,7 +177,7 @@ CV2 脚本可读取 `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml` 这类 YAML
 - `README.md`：中文项目说明。
 - `src/aprilcube/detect.py`：可视化线宽与 viser object frame / mesh / axes 控制更新。
 - `src/aprilcube_runtime.py`：AprilTag 原生 pose、时序 pose 与 cube pose 融合工具。
-- `src/008_cv2_naive_aprilcube_detect_multi_cube.py`：CV2 多 cube 实验脚本。
+- `src/008_cv2_naive_aprilcube_detect.py`：CV2 多 cube 实验脚本。
 - `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml`：DECXIN USB3 相机内参。
 - 新增的 `cube_april_*` 与 `aruco_cube_*` 模型目录：打印文件、配置、预览图与 MuJoCo mesh。
 
