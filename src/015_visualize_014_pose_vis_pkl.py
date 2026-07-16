@@ -68,6 +68,35 @@ def load_frame(path: Path, offset: int) -> dict[str, Any]:
     return obj
 
 
+def find_raw_image_stream(
+    pkl_path: Path,
+    header: dict[str, Any],
+    offsets: list[int],
+) -> tuple[Path, list[int]] | None:
+    first_frame = load_frame(pkl_path, offsets[0])
+    if isinstance(first_frame.get("image_bgr"), np.ndarray):
+        return pkl_path, offsets
+
+    for field in ("source_pkl", "source_raw_pkl"):
+        source_value = header.get(field)
+        if not source_value:
+            continue
+        source_path = Path(source_value).expanduser().resolve()
+        if not source_path.is_file() or source_path == pkl_path:
+            continue
+        try:
+            _source_header, source_offsets, _source_footer = build_stream_index(source_path)
+            source_first = load_frame(source_path, source_offsets[0])
+        except (OSError, ValueError, EOFError, pickle.UnpicklingError):
+            continue
+        if (
+            len(source_offsets) == len(offsets)
+            and isinstance(source_first.get("image_bgr"), np.ndarray)
+        ):
+            return source_path, source_offsets
+    return None
+
+
 def decode_jpeg_bgr(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, dtype=np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -163,6 +192,7 @@ def main() -> None:
     args = parse_args()
     pkl_path = Path(args.pkl_path).expanduser().resolve()
     header, offsets, footer = build_stream_index(pkl_path)
+    raw_image_stream = find_raw_image_stream(pkl_path, header, offsets)
 
     server = viser.ViserServer(host=args.host, port=int(args.port))
     server.scene.set_up_direction("-y")
@@ -203,6 +233,12 @@ def main() -> None:
             format="jpeg",
             jpeg_quality=80,
         )
+        raw_handle = server.gui.add_image(
+            np.zeros((120, 160, 3), dtype=np.uint8),
+            label="Original image_bgr (no overlay, before undistortion)",
+            format="jpeg",
+            jpeg_quality=80,
+        )
 
     pose_text = server.gui.add_markdown("")
     server.gui.add_markdown(
@@ -211,6 +247,7 @@ def main() -> None:
                 f"pkl: `{pkl_path}`",
                 f"frames: `{len(offsets)}`",
                 f"format: `{header.get('format', '')}`",
+                f"raw image source: `{raw_image_stream[0] if raw_image_stream else 'unavailable'}`",
                 f"footer: `{footer}`",
             ]
         )
@@ -221,6 +258,10 @@ def main() -> None:
 
     def render(idx: int) -> None:
         frame = load_frame(pkl_path, offsets[idx])
+        if raw_image_stream is not None:
+            raw_path, raw_offsets = raw_image_stream
+            raw_frame = load_frame(raw_path, raw_offsets[idx])
+            raw_handle.image = bgr_to_rgb(raw_frame["image_bgr"], int(args.max_width))
         overlay_bgr = decode_jpeg_bgr(frame["overlay_jpeg"])
         overlay_handle.image = bgr_to_rgb(overlay_bgr, int(args.max_width))
         update_cube(cube_handle, frame)
@@ -252,6 +293,10 @@ def main() -> None:
 
     render(frame_idx)
     print(f"[INFO] Loaded {pkl_path} frames={len(offsets)}")
+    print(
+        "[INFO] Raw image source: "
+        f"{raw_image_stream[0] if raw_image_stream else 'unavailable'}"
+    )
     print(f"[INFO] Viser server: http://localhost:{args.port}")
 
     while True:
