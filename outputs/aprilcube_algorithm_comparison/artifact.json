@@ -1,0 +1,1042 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "AprilCube 9 种历史算法与 020 的技术比较",
+    "description": "历史 benchmark、同输入重放、020 分阶段结果与多相机 QA 的技术比较。",
+    "generatedAt": "2026-07-17 01:28:47 +0800",
+    "charts": [
+      {
+        "id": "historical_measured_coverage",
+        "title": "历史 9 算法的实测覆盖率",
+        "subtitle": "2026-05-11，568 帧；有限重投影帧占比",
+        "showDescription": true,
+        "intent": "comparison",
+        "question": "历史 benchmark 中哪些算法真正输出了逐帧测量，而非仅维持成功状态？",
+        "rationale": "按算法排序的横向柱图最直接显示 alg_09 的成功率与实测率分离。",
+        "comparisonContext": {
+          "baseline": "同一 568 帧旧录制",
+          "denominator": "全部帧",
+          "grain": "算法",
+          "unit": "比例"
+        },
+        "type": "horizontalBar",
+        "dataset": "historical_algorithms",
+        "sourceId": "historical_benchmark",
+        "encodings": {
+          "x": {
+            "field": "method",
+            "type": "nominal",
+            "label": "算法"
+          },
+          "y": {
+            "field": "measured_rate",
+            "type": "quantitative",
+            "format": "percent",
+            "label": "实测覆盖率"
+          }
+        },
+        "valueFormat": "percent",
+        "layout": "full",
+        "labels": {
+          "values": "all"
+        },
+        "legend": {
+          "interactive": false,
+          "position": "bottom"
+        }
+      },
+      {
+        "id": "current_output_composition",
+        "title": "当前 205 帧录制的输出构成",
+        "subtitle": "直接测量、持有/补帧与失败的占比；同一原始图像流",
+        "showDescription": true,
+        "intent": "composition",
+        "question": "在当前 2×2×2 cube 录制上，各方案的输出由多少直接测量和多少持有或补帧组成？",
+        "rationale": "100% 堆叠横向柱图能避免把连续输出误读成连续测量。",
+        "comparisonContext": {
+          "baseline": "同一 205 帧 012 原始录制",
+          "denominator": "全部帧",
+          "grain": "算法或流水线阶段",
+          "unit": "比例"
+        },
+        "type": "horizontalStackedBar100",
+        "dataset": "current_composition",
+        "sourceId": "current_composition",
+        "encodings": {
+          "x": {
+            "field": "method",
+            "type": "nominal",
+            "label": "方案"
+          },
+          "y": {
+            "fields": [
+              "measured_rate",
+              "held_or_filled_rate",
+              "failed_rate"
+            ],
+            "type": "quantitative",
+            "format": "percent",
+            "label": "帧占比"
+          }
+        },
+        "valueFormat": "percent",
+        "layout": "full",
+        "legend": {
+          "interactive": false,
+          "position": "bottom",
+          "sort": "spec"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "historical_detail",
+        "title": "历史 benchmark 明细",
+        "subtitle": "旧 1×1×1 cube、568 帧；重投影只在相同 Pupil 角点口径内比较",
+        "showDescription": true,
+        "dataset": "historical_algorithms",
+        "defaultSort": {
+          "field": "measured_rate",
+          "direction": "desc"
+        },
+        "density": "dense",
+        "sourceId": "historical_benchmark",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "method",
+            "label": "算法",
+            "type": "text"
+          },
+          {
+            "field": "output_rate",
+            "label": "输出率",
+            "format": "percent"
+          },
+          {
+            "field": "measured_rate",
+            "label": "实测率",
+            "format": "percent"
+          },
+          {
+            "field": "hold_rate",
+            "label": "推定 hold",
+            "format": "percent"
+          },
+          {
+            "field": "reproj_mean_px",
+            "label": "均值重投影 px",
+            "format": "number"
+          },
+          {
+            "field": "translation_step_mean_mm",
+            "label": "平均位移步长 mm",
+            "format": "number"
+          },
+          {
+            "field": "rotation_step_mean_deg",
+            "label": "平均 RPY 步长 °",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "current_replay_detail",
+        "title": "当前录制的历史算法与 004 runtime 复测",
+        "subtitle": "同一 205 帧；重投影仅用于同检测器内部诊断",
+        "showDescription": true,
+        "dataset": "same_input_algorithms",
+        "defaultSort": {
+          "field": "measured_rate",
+          "direction": "desc"
+        },
+        "density": "dense",
+        "sourceId": "same_input_replay",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "method",
+            "label": "方案",
+            "type": "text"
+          },
+          {
+            "field": "output_rate",
+            "label": "输出率",
+            "format": "percent"
+          },
+          {
+            "field": "measured_rate",
+            "label": "实测率",
+            "format": "percent"
+          },
+          {
+            "field": "held_or_filled_rate",
+            "label": "hold/补帧",
+            "format": "percent"
+          },
+          {
+            "field": "longest_hold_or_fill",
+            "label": "最长连续 hold",
+            "format": "number"
+          },
+          {
+            "field": "reproj_mean_px",
+            "label": "均值重投影 px",
+            "format": "number"
+          },
+          {
+            "field": "translation_step_p95_mm",
+            "label": "P95 位移步长 mm",
+            "format": "number"
+          },
+          {
+            "field": "rotation_step_p95_deg",
+            "label": "P95 旋转步长 °",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "pipeline_stage_detail",
+        "title": "020 各阶段覆盖率",
+        "subtitle": "同一 205 帧；阶段顺序从 strict 检测到最终约束平滑",
+        "showDescription": true,
+        "dataset": "pipeline_020_stages",
+        "defaultSort": {
+          "field": "order",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "sourceId": "pipeline_020",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "order",
+            "label": "阶段",
+            "format": "number"
+          },
+          {
+            "field": "stage",
+            "label": "名称",
+            "type": "text"
+          },
+          {
+            "field": "output_rate",
+            "label": "输出率",
+            "format": "percent"
+          },
+          {
+            "field": "measured_rate",
+            "label": "实测率",
+            "format": "percent"
+          },
+          {
+            "field": "filled_rate",
+            "label": "补帧率",
+            "format": "percent"
+          },
+          {
+            "field": "translation_step_p95_mm",
+            "label": "P95 位移步长 mm",
+            "format": "number"
+          },
+          {
+            "field": "rotation_step_p95_deg",
+            "label": "P95 旋转步长 °",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "multicamera_qa_detail",
+        "title": "020 多相机、多 cube QA",
+        "subtitle": "2026-07-16，203 帧；不同 target 的成功率差异",
+        "showDescription": true,
+        "dataset": "pipeline_020_qa",
+        "defaultSort": {
+          "field": "output_rate",
+          "direction": "desc"
+        },
+        "density": "spacious",
+        "sourceId": "pipeline_020_qa",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "target",
+            "label": "target",
+            "type": "text"
+          },
+          {
+            "field": "camera",
+            "label": "camera",
+            "type": "text"
+          },
+          {
+            "field": "output_rate",
+            "label": "输出率",
+            "format": "percent"
+          },
+          {
+            "field": "measured_count",
+            "label": "有限重投影帧",
+            "format": "number"
+          },
+          {
+            "field": "reproj_mean_px_within_020",
+            "label": "020 内重投影 px",
+            "format": "number"
+          },
+          {
+            "field": "edge_alignment_mean",
+            "label": "边缘对齐均值",
+            "format": "number"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "historical_benchmark",
+        "label": "May 2026 nine-algorithm benchmark outputs",
+        "path": "analysis_results.json",
+        "query": {
+          "engine": "SQLite over reviewed Python-derived rows",
+          "language": "sql",
+          "sql": "SELECT method, full_method, output_rate, measured_rate, hold_rate,\n       reproj_mean_px, reproj_p95_px, translation_step_mean_mm,\n       rotation_step_mean_deg\nFROM historical_algorithms\nORDER BY method",
+          "description": "The notebook recomputes coverage and hold counts from metrics.json/poses.npz; this executed SQL selects the reviewed report rows.",
+          "tables_used": [
+            "outputs/aprilcube_pose_benchmark/recording_20260511_162011/compare_all_algorithms_metrics.json",
+            "outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_*/poses.npz"
+          ],
+          "metric_definitions": [
+            "output_rate = success frames / all frames",
+            "measured_rate = frames with finite reprojection / all frames",
+            "inferred hold = successful frame with non-finite reprojection; exact for alg_09 make_hold outputs"
+          ]
+        }
+      },
+      {
+        "id": "same_input_replay",
+        "label": "July 15 same-input replay of the historical algorithms and 004 runtimes",
+        "path": "aprilcube_algorithm_comparison.ipynb",
+        "query": {
+          "engine": "SQLite over reviewed Python-derived rows",
+          "language": "sql",
+          "sql": "SELECT method, full_method, output_rate, measured_rate,\n       held_or_filled_rate, failed_rate, longest_hold_or_fill,\n       reproj_mean_px, translation_step_p95_mm, rotation_step_p95_deg\nFROM same_input_algorithms\nORDER BY measured_rate DESC, method",
+          "description": "The notebook executes the 205-frame replay; this executed SQL selects the reviewed per-method report rows.",
+          "tables_used": [
+            "recordings/012_rs_raw_frames_20260715_192635.pkl",
+            "src/aprilcube_pose_benchmark/alg_01..09",
+            "src/004_cv2_alg_06_aprilcube_detect_multi_cube.py",
+            "src/004_cv2_alg_09_aprilcube_detect_multi_cube.py"
+          ],
+          "filters": [
+            "all 205 frames",
+            "historical algorithms: undistort + CLAHE 3.0/8x8",
+            "004 runtimes: undistort without CLAHE"
+          ],
+          "metric_definitions": [
+            "measured frame = success, not predicted/filled, finite reprojection",
+            "translation step = adjacent-frame Euclidean tvec distance in millimeters",
+            "rotation step = adjacent-frame SO(3) geodesic angle in degrees"
+          ]
+        }
+      },
+      {
+        "id": "current_composition",
+        "label": "July 15 same-input output composition including 020 stages",
+        "path": "aprilcube_algorithm_comparison.ipynb",
+        "query": {
+          "engine": "SQLite over reviewed Python-derived rows",
+          "language": "sql",
+          "sql": "SELECT method, full_method, output_rate, measured_rate,\n       held_or_filled_rate, failed_rate, longest_hold_or_fill,\n       reproj_mean_px, translation_step_p95_mm, rotation_step_p95_deg\nFROM current_composition\nORDER BY measured_rate DESC, method",
+          "description": "Executed selection of measured, held/filled, and failed shares after combining reviewed replay and 020 stage summaries.",
+          "tables_used": [
+            "current_composition"
+          ],
+          "metric_definitions": [
+            "measured_rate = fresh finite-reprojection measurements / all frames",
+            "held_or_filled_rate = predicted, interpolated, recovered, or trajectory-filled frames / all frames",
+            "failed_rate = unsuccessful frames / all frames"
+          ]
+        }
+      },
+      {
+        "id": "pipeline_020",
+        "label": "Saved 020 pipeline stages for the July 15 012 stream",
+        "path": "analysis_results.json",
+        "query": {
+          "engine": "SQLite over reviewed Python-derived rows",
+          "language": "sql",
+          "sql": "SELECT \"order\", stage, output_rate, measured_rate, filled_rate,\n       reproj_mean_px_within_020, translation_step_p95_mm,\n       rotation_step_p95_deg\nFROM pipeline_020_stages\nORDER BY \"order\";",
+          "description": "The notebook profiles each saved 020 stream; this executed SQL selects stage-level report rows.",
+          "tables_used": [
+            "recordings/020_work_current_012_20260715_192635/*.pkl",
+            "src/020_finalize_pose_postprocess.py"
+          ],
+          "metric_definitions": [
+            "filled frame = pose_filled true",
+            "measured frame = successful non-filled pose with finite stage reprojection"
+          ]
+        }
+      },
+      {
+        "id": "pipeline_020_qa",
+        "label": "July 16 multi-camera 020 QA report",
+        "path": "analysis_results.json",
+        "query": {
+          "engine": "SQLite over reviewed Python-derived rows",
+          "language": "sql",
+          "sql": "SELECT target, camera, output_rate, measured_count,\n       reproj_mean_px_within_020, edge_alignment_mean\nFROM pipeline_020_qa\nORDER BY output_rate DESC, target",
+          "description": "The notebook extracts per-target QA values; this executed SQL selects the reviewed report rows.",
+          "tables_used": [
+            "recordings/qa_multi_cam_record_0716_180451_020/qa_report.json"
+          ]
+        }
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# AprilCube 9 种历史算法与 020 的技术比较",
+        "layout": "full"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "body": "## 技术结论\n\n**离线最终 pose：选 `020`。** 在与 `020` 相同的当前 205 帧 2×2×2 cube 录制上，最终阶段输出 205/205；其中 154 帧（75.1%）有直接测量锚点，51 帧（24.9%）来自轮廓恢复、插值或全局时序补帧。它不是单一 PnP 算法，而是检测、候选融合、异常剔除、恢复和约束平滑的离线级联。\n\n**实时跟踪：不要把历史 `alg_09` 的 100% 当成 100% 检测。** 旧 benchmark 中它有 174/568 帧无有限重投影，属于持有旧 pose；在当前 205 帧复测中，`004_cv2_alg_09` 仅 34 帧（16.6%）是直接测量，142 帧（69.3%）在 hold，最长连续 hold 为 139 帧。\n\n**旧 1×1×1 数据内，`alg_03` 是更好的逐帧测量基线。** 它的均值重投影最低（7.85 px），实测覆盖 92.6%；但没有外部 6DoF 真值，因此不能证明绝对 pose 最准。\n\n**推荐架构：** 离线继续用完整 `020`；实时则抽取 `020` 的单帧 DeepTag dense + 候选门限部分，再接短时、有限 hold 的因果滤波器，而不是直接使用完整非因果 `020` 或无限 hold 的 `alg_09`。",
+        "layout": "full"
+      },
+      {
+        "id": "historical_heading",
+        "type": "markdown",
+        "body": "## 历史 `alg_09` 赢在连续输出，不是逐帧测量\n\n旧 benchmark 的大多数算法实测覆盖约 93%，`alg_09` 的输出率升到 100%，但实测覆盖反而降至 69.4%。因此原先“`alg_09` 成功率 100%”应改写为“69.4% 测量 + 30.6% hold”。这会显著压低表观运动步长，却可能在物体真实运动时长期输出陈旧 pose。",
+        "layout": "full",
+        "sourceId": "historical_benchmark"
+      },
+      {
+        "id": "historical_chart_block",
+        "type": "chart",
+        "chartId": "historical_measured_coverage",
+        "layout": "full"
+      },
+      {
+        "id": "historical_chart_interpretation",
+        "type": "markdown",
+        "body": "图中只画“有有限重投影的实测帧”。`alg_03` 在旧数据上兼顾较高实测覆盖和最低均值重投影；`alg_09` 则应被理解为带时序保持的连续轨迹策略，而不是更强的逐帧观测器。",
+        "layout": "full"
+      },
+      {
+        "id": "historical_table_block",
+        "type": "table",
+        "tableId": "historical_detail",
+        "layout": "full"
+      },
+      {
+        "id": "current_heading",
+        "type": "markdown",
+        "body": "## 在当前 2×2×2 cube 上，`020` 的优势来自 DeepTag 和分阶段恢复\n\n同输入复测显示，历史算法多数仍能返回数值，但出现 20–63 px 的均值重投影和大幅姿态跳变，说明它们从旧 1×1×1 配置迁移后并未保持几何一致性。`004_cv2_alg_06` 的严格门限只接受 11 个直接测量；`004_cv2_alg_09` 大部分时间依赖 hold。相比之下，`020` 的单帧融合阶段已有 75.6% 直接测量覆盖，最终再用显式标记的恢复/补帧补足到 100%。",
+        "layout": "full"
+      },
+      {
+        "id": "current_chart_block",
+        "type": "chart",
+        "chartId": "current_output_composition",
+        "layout": "full"
+      },
+      {
+        "id": "current_chart_interpretation",
+        "type": "markdown",
+        "body": "每根柱都把“直接测量”和“持有/恢复/补帧”拆开。`020_final_offline` 的 100% 中约四分之一依赖未来帧或轨迹恢复；它适合离线后处理，不适合直接作为实时控制算法。`020_fused_single_frame` 则是更合适的实时候选基础。",
+        "layout": "full"
+      },
+      {
+        "id": "current_table_block",
+        "type": "table",
+        "tableId": "current_replay_detail",
+        "layout": "full"
+      },
+      {
+        "id": "scope_definitions",
+        "type": "markdown",
+        "body": "## 比较范围与指标定义\n\n- **历史 cohort：** 2026-05-11，568 帧，`r_wrist`，旧 1×1×1 10 mm tag cube。\n- **同输入 cohort：** 2026-07-15，205 帧，D435，当前 2×2×2 outer-62.5 mm cube；9 个历史函数、两个 `004` runtime 和保存的 `020` 阶段都使用这份原始图像流。\n- **输出率：** 返回 `success=True` 的帧数除以全部帧数。\n- **实测率：** `success=True`、非 predicted/filled 且有有限重投影值的帧占比。\n- **hold/补帧率：** 使用上一 pose、插值、轮廓恢复或全局轨迹填充的帧占比。\n- **时序步长：** 相邻成功帧的 tvec 欧氏距离和 SO(3) 测地旋转角。旧 JSON 中的 rotation step 是 RPY 欧氏差，仅作原始 benchmark 审计字段。\n- **重投影：** 只在同一 detector/关键点口径内部比较。Pupil tag 外角点误差不能和 DeepTag dense 内部点误差横向排名。",
+        "layout": "full"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "body": "## 方法：保留原始路径，再增加同输入复测\n\n1. 从历史 `metrics.json` 和 `poses.npz` 复算输出、有限重投影覆盖和连续 hold。\n2. 将 9 个历史 `algorithm_fn` 在保存的 205 帧 012 原始流上重放；使用原 benchmark 的 undistort + CLAHE 参数。\n3. 同时运行 `004_cv2_alg_06` 和 `004_cv2_alg_09` runtime。后者直接导入历史 `alg_09`；前者虽然文件名含 alg06，实际是全 cube RANSAC/LM PnP、tag 异常点剔除、face-normal/temporal gate 和 Kalman filter，并不是历史 benchmark 的 alg06。\n4. 读取 `020` 每个已保存 stage 的逐帧 pose 和 footer，分别统计测量、恢复、补帧、跳变与来源。\n5. 用另一份 203 帧多相机 QA 检查是否能把单 cube 结论推广到其他 target。",
+        "layout": "full"
+      },
+      {
+        "id": "stage_heading",
+        "type": "markdown",
+        "body": "## `020` 的 100% 是可审计的逐级覆盖，而非隐式 hold\n\nStrict AprilCube 单独只覆盖 9.8%；DeepTag dense 提升到 73.2%；单帧融合达到 75.6%；时序异常剔除后保留 75.1% 测量；轮廓/插值恢复到 87.3%；全局补帧最终到 100%。这种来源标记比 `alg_09` 的笼统 success 更适合离线数据生产和质量审计。",
+        "layout": "full",
+        "sourceId": "pipeline_020"
+      },
+      {
+        "id": "stage_table_block",
+        "type": "table",
+        "tableId": "pipeline_stage_detail",
+        "layout": "full"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 限制、稳健性与不能下的结论\n\n**没有外部 ground truth。** 重投影低只表示与当前检测角点自洽；错误的 tag 对应、镜像解或平面 PnP 分支也可能取得低误差。当前结论不能替代平移/旋转真值误差。\n\n**`020` 是非因果离线算法。** Stage 10–12 使用前后帧、全局样条/Slerp 和对称窗口；它的覆盖率不能与实时延迟约束下的算法公平等同。\n\n**跨配置泛化仍不足。** 203 帧多相机 QA 中，`index_Q` 为 100%，`wrist_Q` 为 62.1%，而 `thumb_Q` 与 `middle_Q` 均为 0%。后续 provisional orientation/RGB flow 结果不是等价的 `020` 实测 pose。\n\n**同输入复测存在预处理差异。** 历史函数保留 CLAHE，`004` 保留无 CLAHE；这是对各自默认路径的测试，而不是只隔离 pose solver 的消融实验。",
+        "layout": "full"
+      },
+      {
+        "id": "qa_table_block",
+        "type": "table",
+        "tableId": "multicamera_qa_detail",
+        "layout": "full"
+      },
+      {
+        "id": "recommendations",
+        "type": "markdown",
+        "body": "## 建议的工程决策\n\n1. **离线录制后处理：继续使用完整 `020`**，并在下游始终保留 `pose_source`、`quality_level`、`pose_filled`，不要把填充帧当成等权真值。\n2. **实时路径：以 `020_fused_single_frame` 为起点**，保留 DeepTag dense、cross-validation、face-normal 和 reprojection/edge gate；替换 Stage 10–12 为短时因果滤波。\n3. **设置有限 hold：** 最多保持少量帧或固定毫秒数，超限明确输出 invalid；禁止 `alg_09` 式 139 帧无界持有。\n4. **旧 1×1×1 系统若必须选一个旧算法：选 `alg_03` 作为测量基线**，再单独设计短时滤波；不要按成功率选择 `alg_09`。\n5. **为每个 cube/camera 做独立验收：** `thumb_Q` 和 `middle_Q` 当前是阻断项，不能从 `index_Q` 的 100% 外推。",
+        "layout": "full"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 下一轮需要回答的问题\n\n- 用 motion capture、机器人正运动学或已测量外参生成 6DoF ground truth 后，哪种方案的平移/旋转 P50、P95 和最大误差最低？\n- 在相同 detector 角点输入下，只替换 solver，`alg_03`、`004_alg06` 与 `020` strict PnP 的差异还剩多少？\n- DeepTag dense 单帧阶段在目标 GPU 上的端到端延迟和吞吐是多少，能否满足实时控制？\n- 合理的最大 hold 时长是多少，超过后下游应停止控制、降级还是切换视觉源？\n- `thumb_Q`/`middle_Q` 的失败主要来自可见 tag 数、角点顺序、内参、cube cfg 还是视角/遮挡？",
+        "layout": "full"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-17 01:28:47 +0800",
+    "status": "ready",
+    "datasets": {
+      "historical_algorithms": [
+        {
+          "method": "alg_01",
+          "full_method": "alg_01_pupil_tag_pose_to_cube_pose_fuse",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 27.648184594133685,
+          "reproj_p95_px": 34.412945314757124,
+          "translation_step_mean_mm": 1.3993609087495218,
+          "rotation_step_mean_deg": 25.95511813979345
+        },
+        {
+          "method": "alg_02",
+          "full_method": "alg_02_pupil_all_tag_corners_to_cube_pnp_lm",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 8.885696434874532,
+          "reproj_p95_px": 17.24220712491677,
+          "translation_step_mean_mm": 19.151557958107254,
+          "rotation_step_mean_deg": 19.356233600748897
+        },
+        {
+          "method": "alg_03",
+          "full_method": "alg_03_pupil_all_tag_corners_to_cube_pnp_ransac_lm",
+          "output_rate": 0.926056338028169,
+          "measured_rate": 0.926056338028169,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 7.850817737367605,
+          "reproj_p95_px": 16.105335450201235,
+          "translation_step_mean_mm": 1.7891769942328895,
+          "rotation_step_mean_deg": 23.08341209434426
+        },
+        {
+          "method": "alg_04",
+          "full_method": "alg_04_pupil_per_face_corners_to_face_pnp_then_cube_fuse",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 9.31229990412353,
+          "reproj_p95_px": 18.90611431588017,
+          "translation_step_mean_mm": 1.578995503348401,
+          "rotation_step_mean_deg": 33.53988244179146
+        },
+        {
+          "method": "alg_05",
+          "full_method": "alg_05_pupil_single_face_temporal_else_multiface_cube_pnp",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 8.890663481085051,
+          "reproj_p95_px": 17.24220712491677,
+          "translation_step_mean_mm": 19.177994535236383,
+          "rotation_step_mean_deg": 18.49199652933076
+        },
+        {
+          "method": "alg_06",
+          "full_method": "alg_06_pupil_tag_pose_candidates_to_cube_consistency_select",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 10.126876161552643,
+          "reproj_p95_px": 28.80170515567127,
+          "translation_step_mean_mm": 4.382411439234634,
+          "rotation_step_mean_deg": 75.15046487224329
+        },
+        {
+          "method": "alg_07",
+          "full_method": "alg_07_pupil_cube_pnp_lm_then_se3_temporal_filter",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 12.415842002780428,
+          "reproj_p95_px": 22.011812264292235,
+          "translation_step_mean_mm": 8.462380130124792,
+          "rotation_step_mean_deg": 10.503533641447751
+        },
+        {
+          "method": "alg_08",
+          "full_method": "alg_08_hybrid_multiface_pnp_single_tag_ippe_temporal",
+          "output_rate": 0.9348591549295775,
+          "measured_rate": 0.9348591549295775,
+          "hold_rate": 0.0,
+          "reproj_mean_px": 8.913405899045546,
+          "reproj_p95_px": 17.24220712491677,
+          "translation_step_mean_mm": 19.187384778792776,
+          "rotation_step_mean_deg": 18.611900930584344
+        },
+        {
+          "method": "alg_09",
+          "full_method": "alg_09_cube_candidate_cluster_ransac_temporal_sanity",
+          "output_rate": 1.0,
+          "measured_rate": 0.6936619718309859,
+          "hold_rate": 0.30633802816901406,
+          "reproj_mean_px": 8.71247637139333,
+          "reproj_p95_px": 18.119336883044774,
+          "translation_step_mean_mm": 1.276227288127706,
+          "rotation_step_mean_deg": 11.991135933775912
+        }
+      ],
+      "same_input_algorithms": [
+        {
+          "method": "alg_01",
+          "full_method": "alg_01_pupil_tag_pose_to_cube_pose_fuse",
+          "output_rate": 0.8,
+          "measured_rate": 0.8,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.19999999999999996,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 51.89171132872198,
+          "translation_step_p95_mm": 18.924357959395913,
+          "rotation_step_p95_deg": 85.4265176599459
+        },
+        {
+          "method": "alg_02",
+          "full_method": "alg_02_pupil_all_tag_corners_to_cube_pnp_lm",
+          "output_rate": 0.8,
+          "measured_rate": 0.8,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.19999999999999996,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 30.76915957812581,
+          "translation_step_p95_mm": 210.3750276913565,
+          "rotation_step_p95_deg": 79.48562676630502
+        },
+        {
+          "method": "alg_04",
+          "full_method": "alg_04_pupil_per_face_corners_to_face_pnp_then_cube_fuse",
+          "output_rate": 0.8,
+          "measured_rate": 0.8,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.19999999999999996,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 33.79319022944676,
+          "translation_step_p95_mm": 204.58681361864063,
+          "rotation_step_p95_deg": 80.16504389401429
+        },
+        {
+          "method": "alg_05",
+          "full_method": "alg_05_pupil_single_face_temporal_else_multiface_cube_pnp",
+          "output_rate": 0.8,
+          "measured_rate": 0.8,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.19999999999999996,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 50.57218401062872,
+          "translation_step_p95_mm": 88.85611775006419,
+          "rotation_step_p95_deg": 61.644936728621396
+        },
+        {
+          "method": "alg_06",
+          "full_method": "alg_06_pupil_tag_pose_candidates_to_cube_consistency_select",
+          "output_rate": 0.8,
+          "measured_rate": 0.8,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.19999999999999996,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 63.071881863522876,
+          "translation_step_p95_mm": 67.27637311969096,
+          "rotation_step_p95_deg": 144.4053494927647
+        },
+        {
+          "method": "alg_07",
+          "full_method": "alg_07_pupil_cube_pnp_lm_then_se3_temporal_filter",
+          "output_rate": 0.8,
+          "measured_rate": 0.8,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.19999999999999996,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 53.03726725836751,
+          "translation_step_p95_mm": 134.18375659256057,
+          "rotation_step_p95_deg": 27.87513828607167
+        },
+        {
+          "method": "alg_08",
+          "full_method": "alg_08_hybrid_multiface_pnp_single_tag_ippe_temporal",
+          "output_rate": 0.1951219512195122,
+          "measured_rate": 0.1951219512195122,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.8048780487804879,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 24.27933012648635,
+          "translation_step_p95_mm": 1102.1627399042586,
+          "rotation_step_p95_deg": 162.95751708623726
+        },
+        {
+          "method": "004_cv2_alg_09",
+          "full_method": "004_cv2_alg_09_runtime",
+          "output_rate": 0.8585365853658536,
+          "measured_rate": 0.16585365853658537,
+          "held_or_filled_rate": 0.6926829268292682,
+          "failed_rate": 0.14146341463414636,
+          "longest_hold_or_fill": 139,
+          "reproj_mean_px": 53.51769378601343,
+          "translation_step_p95_mm": 7.30015815730234,
+          "rotation_step_p95_deg": 2.5890198899113694
+        },
+        {
+          "method": "alg_09",
+          "full_method": "alg_09_cube_candidate_cluster_ransac_temporal_sanity",
+          "output_rate": 0.8585365853658536,
+          "measured_rate": 0.16585365853658537,
+          "held_or_filled_rate": 0.6926829268292682,
+          "failed_rate": 0.14146341463414636,
+          "longest_hold_or_fill": 139,
+          "reproj_mean_px": 58.381288421936645,
+          "translation_step_p95_mm": 6.063302769238195,
+          "rotation_step_p95_deg": 2.1769259065530977
+        },
+        {
+          "method": "alg_03",
+          "full_method": "alg_03_pupil_all_tag_corners_to_cube_pnp_ransac_lm",
+          "output_rate": 0.06341463414634146,
+          "measured_rate": 0.06341463414634146,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.9365853658536585,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 20.379935714671653,
+          "translation_step_p95_mm": 61.37487607528976,
+          "rotation_step_p95_deg": 27.765780201273206
+        },
+        {
+          "method": "004_cv2_alg_06",
+          "full_method": "004_cv2_alg_06_runtime",
+          "output_rate": 0.07804878048780488,
+          "measured_rate": 0.05365853658536585,
+          "held_or_filled_rate": 0.024390243902439025,
+          "failed_rate": 0.9219512195121952,
+          "longest_hold_or_fill": 1,
+          "reproj_mean_px": 0.16527328290461216,
+          "translation_step_p95_mm": 5.698350653184425,
+          "rotation_step_p95_deg": 2.3241855012479498
+        }
+      ],
+      "current_composition": [
+        {
+          "method": "020_fused_single_frame",
+          "full_method": "020 fused single-frame stage",
+          "output_rate": 0.7560975609756098,
+          "measured_rate": 0.7560975609756098,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.24390243902439024,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 0.23331238286785222,
+          "translation_step_p95_mm": 11.635871766885497,
+          "rotation_step_p95_deg": 6.030637336578279
+        },
+        {
+          "method": "020_final_offline",
+          "full_method": "020 temporally smoothed final stage",
+          "output_rate": 1.0,
+          "measured_rate": 0.751219512195122,
+          "held_or_filled_rate": 0.24878048780487805,
+          "failed_rate": 0.0,
+          "longest_hold_or_fill": null,
+          "reproj_mean_px": 0.2249613027399848,
+          "translation_step_p95_mm": 19.837220183358056,
+          "rotation_step_p95_deg": 4.726947470165545
+        },
+        {
+          "method": "004_cv2_alg_09",
+          "full_method": "004_cv2_alg_09_runtime",
+          "output_rate": 0.8585365853658536,
+          "measured_rate": 0.16585365853658537,
+          "held_or_filled_rate": 0.6926829268292682,
+          "failed_rate": 0.14146341463414636,
+          "longest_hold_or_fill": 139,
+          "reproj_mean_px": 53.51769378601343,
+          "translation_step_p95_mm": 7.30015815730234,
+          "rotation_step_p95_deg": 2.5890198899113694
+        },
+        {
+          "method": "alg_09",
+          "full_method": "alg_09_cube_candidate_cluster_ransac_temporal_sanity",
+          "output_rate": 0.8585365853658536,
+          "measured_rate": 0.16585365853658537,
+          "held_or_filled_rate": 0.6926829268292682,
+          "failed_rate": 0.14146341463414636,
+          "longest_hold_or_fill": 139,
+          "reproj_mean_px": 58.381288421936645,
+          "translation_step_p95_mm": 6.063302769238195,
+          "rotation_step_p95_deg": 2.1769259065530977
+        },
+        {
+          "method": "alg_03",
+          "full_method": "alg_03_pupil_all_tag_corners_to_cube_pnp_ransac_lm",
+          "output_rate": 0.06341463414634146,
+          "measured_rate": 0.06341463414634146,
+          "held_or_filled_rate": 0.0,
+          "failed_rate": 0.9365853658536585,
+          "longest_hold_or_fill": 0,
+          "reproj_mean_px": 20.379935714671653,
+          "translation_step_p95_mm": 61.37487607528976,
+          "rotation_step_p95_deg": 27.765780201273206
+        },
+        {
+          "method": "004_cv2_alg_06",
+          "full_method": "004_cv2_alg_06_runtime",
+          "output_rate": 0.07804878048780488,
+          "measured_rate": 0.05365853658536585,
+          "held_or_filled_rate": 0.024390243902439025,
+          "failed_rate": 0.9219512195121952,
+          "longest_hold_or_fill": 1,
+          "reproj_mean_px": 0.16527328290461216,
+          "translation_step_p95_mm": 5.698350653184425,
+          "rotation_step_p95_deg": 2.3241855012479498
+        }
+      ],
+      "pipeline_020_stages": [
+        {
+          "order": 1,
+          "stage": "strict_aprilcube",
+          "output_rate": 0.0975609756097561,
+          "measured_rate": 0.0975609756097561,
+          "filled_rate": 0.0,
+          "reproj_mean_px_within_020": 0.4002156246475309,
+          "translation_step_p95_mm": 78.6566442472306,
+          "rotation_step_p95_deg": 17.709428272451877
+        },
+        {
+          "order": 2,
+          "stage": "strict_deeptag_dense",
+          "output_rate": 0.7317073170731707,
+          "measured_rate": 0.7317073170731707,
+          "filled_rate": 0.0,
+          "reproj_mean_px_within_020": 0.2763509552192222,
+          "translation_step_p95_mm": 12.604517467589455,
+          "rotation_step_p95_deg": 6.40744450694327
+        },
+        {
+          "order": 3,
+          "stage": "fused_single_frame",
+          "output_rate": 0.7560975609756098,
+          "measured_rate": 0.7560975609756098,
+          "filled_rate": 0.0,
+          "reproj_mean_px_within_020": 0.23331238286785222,
+          "translation_step_p95_mm": 11.635871766885497,
+          "rotation_step_p95_deg": 6.030637336578279
+        },
+        {
+          "order": 4,
+          "stage": "temporal_outlier_rejected",
+          "output_rate": 0.751219512195122,
+          "measured_rate": 0.751219512195122,
+          "filled_rate": 0.0,
+          "reproj_mean_px_within_020": 0.2249613027399848,
+          "translation_step_p95_mm": 11.380489698586064,
+          "rotation_step_p95_deg": 5.451751360623981
+        },
+        {
+          "order": 5,
+          "stage": "outline_recovered",
+          "output_rate": 0.8731707317073171,
+          "measured_rate": 0.751219512195122,
+          "filled_rate": 0.12195121951219512,
+          "reproj_mean_px_within_020": 0.2249613027399848,
+          "translation_step_p95_mm": 19.082488479811033,
+          "rotation_step_p95_deg": 7.443483037778791
+        },
+        {
+          "order": 6,
+          "stage": "temporally_completed",
+          "output_rate": 1.0,
+          "measured_rate": 0.751219512195122,
+          "filled_rate": 0.24878048780487805,
+          "reproj_mean_px_within_020": 0.2249613027399848,
+          "translation_step_p95_mm": 21.121860520839057,
+          "rotation_step_p95_deg": 6.532794554664815
+        },
+        {
+          "order": 7,
+          "stage": "temporally_smoothed_final",
+          "output_rate": 1.0,
+          "measured_rate": 0.751219512195122,
+          "filled_rate": 0.24878048780487805,
+          "reproj_mean_px_within_020": 0.2249613027399848,
+          "translation_step_p95_mm": 19.837220183358056,
+          "rotation_step_p95_deg": 4.726947470165545
+        }
+      ],
+      "pipeline_020_qa": [
+        {
+          "target": "index_Q",
+          "camera": "thumb_web_cam",
+          "output_rate": 1.0,
+          "measured_count": 201,
+          "reproj_mean_px_within_020": 0.8071724465413442,
+          "edge_alignment_mean": 0.45198842837892494
+        },
+        {
+          "target": "wrist_Q",
+          "camera": "d435",
+          "output_rate": 0.6206896551724138,
+          "measured_count": 28,
+          "reproj_mean_px_within_020": 0.7430729731320579,
+          "edge_alignment_mean": 0.723165803260417
+        },
+        {
+          "target": "middle_Q",
+          "camera": "middle_finger_cam",
+          "output_rate": 0.0,
+          "measured_count": 0,
+          "reproj_mean_px_within_020": null,
+          "edge_alignment_mean": null
+        },
+        {
+          "target": "thumb_Q",
+          "camera": "thumb_web_cam",
+          "output_rate": 0.0,
+          "measured_count": 0,
+          "reproj_mean_px_within_020": null,
+          "edge_alignment_mean": null
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "historical_benchmark",
+      "label": "May 2026 nine-algorithm benchmark outputs",
+      "path": "analysis_results.json",
+      "query": {
+        "engine": "SQLite over reviewed Python-derived rows",
+        "language": "sql",
+        "sql": "SELECT method, full_method, output_rate, measured_rate, hold_rate,\n       reproj_mean_px, reproj_p95_px, translation_step_mean_mm,\n       rotation_step_mean_deg\nFROM historical_algorithms\nORDER BY method",
+        "description": "The notebook recomputes coverage and hold counts from metrics.json/poses.npz; this executed SQL selects the reviewed report rows.",
+        "tables_used": [
+          "outputs/aprilcube_pose_benchmark/recording_20260511_162011/compare_all_algorithms_metrics.json",
+          "outputs/aprilcube_pose_benchmark/recording_20260511_162011/alg_*/poses.npz"
+        ],
+        "metric_definitions": [
+          "output_rate = success frames / all frames",
+          "measured_rate = frames with finite reprojection / all frames",
+          "inferred hold = successful frame with non-finite reprojection; exact for alg_09 make_hold outputs"
+        ]
+      }
+    },
+    {
+      "id": "same_input_replay",
+      "label": "July 15 same-input replay of the historical algorithms and 004 runtimes",
+      "path": "aprilcube_algorithm_comparison.ipynb",
+      "query": {
+        "engine": "SQLite over reviewed Python-derived rows",
+        "language": "sql",
+        "sql": "SELECT method, full_method, output_rate, measured_rate,\n       held_or_filled_rate, failed_rate, longest_hold_or_fill,\n       reproj_mean_px, translation_step_p95_mm, rotation_step_p95_deg\nFROM same_input_algorithms\nORDER BY measured_rate DESC, method",
+        "description": "The notebook executes the 205-frame replay; this executed SQL selects the reviewed per-method report rows.",
+        "tables_used": [
+          "recordings/012_rs_raw_frames_20260715_192635.pkl",
+          "src/aprilcube_pose_benchmark/alg_01..09",
+          "src/004_cv2_alg_06_aprilcube_detect_multi_cube.py",
+          "src/004_cv2_alg_09_aprilcube_detect_multi_cube.py"
+        ],
+        "filters": [
+          "all 205 frames",
+          "historical algorithms: undistort + CLAHE 3.0/8x8",
+          "004 runtimes: undistort without CLAHE"
+        ],
+        "metric_definitions": [
+          "measured frame = success, not predicted/filled, finite reprojection",
+          "translation step = adjacent-frame Euclidean tvec distance in millimeters",
+          "rotation step = adjacent-frame SO(3) geodesic angle in degrees"
+        ]
+      }
+    },
+    {
+      "id": "current_composition",
+      "label": "July 15 same-input output composition including 020 stages",
+      "path": "aprilcube_algorithm_comparison.ipynb",
+      "query": {
+        "engine": "SQLite over reviewed Python-derived rows",
+        "language": "sql",
+        "sql": "SELECT method, full_method, output_rate, measured_rate,\n       held_or_filled_rate, failed_rate, longest_hold_or_fill,\n       reproj_mean_px, translation_step_p95_mm, rotation_step_p95_deg\nFROM current_composition\nORDER BY measured_rate DESC, method",
+        "description": "Executed selection of measured, held/filled, and failed shares after combining reviewed replay and 020 stage summaries.",
+        "tables_used": [
+          "current_composition"
+        ],
+        "metric_definitions": [
+          "measured_rate = fresh finite-reprojection measurements / all frames",
+          "held_or_filled_rate = predicted, interpolated, recovered, or trajectory-filled frames / all frames",
+          "failed_rate = unsuccessful frames / all frames"
+        ]
+      }
+    },
+    {
+      "id": "pipeline_020",
+      "label": "Saved 020 pipeline stages for the July 15 012 stream",
+      "path": "analysis_results.json",
+      "query": {
+        "engine": "SQLite over reviewed Python-derived rows",
+        "language": "sql",
+        "sql": "SELECT \"order\", stage, output_rate, measured_rate, filled_rate,\n       reproj_mean_px_within_020, translation_step_p95_mm,\n       rotation_step_p95_deg\nFROM pipeline_020_stages\nORDER BY \"order\";",
+        "description": "The notebook profiles each saved 020 stream; this executed SQL selects stage-level report rows.",
+        "tables_used": [
+          "recordings/020_work_current_012_20260715_192635/*.pkl",
+          "src/020_finalize_pose_postprocess.py"
+        ],
+        "metric_definitions": [
+          "filled frame = pose_filled true",
+          "measured frame = successful non-filled pose with finite stage reprojection"
+        ]
+      }
+    },
+    {
+      "id": "pipeline_020_qa",
+      "label": "July 16 multi-camera 020 QA report",
+      "path": "analysis_results.json",
+      "query": {
+        "engine": "SQLite over reviewed Python-derived rows",
+        "language": "sql",
+        "sql": "SELECT target, camera, output_rate, measured_count,\n       reproj_mean_px_within_020, edge_alignment_mean\nFROM pipeline_020_qa\nORDER BY output_rate DESC, target",
+        "description": "The notebook extracts per-target QA values; this executed SQL selects the reviewed report rows.",
+        "tables_used": [
+          "recordings/qa_multi_cam_record_0716_180451_020/qa_report.json"
+        ]
+      }
+    }
+  ],
+  "package_info": {
+    "root": ".",
+    "manifestPath": "artifact.json",
+    "snapshotPath": "artifact.json"
+  }
+}
