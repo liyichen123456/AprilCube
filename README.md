@@ -1,6 +1,6 @@
 # aprilcube
 
-`aprilcube` 用于生成带 ArUco / AprilTag 标记的三维打印 cube / cuboid，并从相机图像中估计其 6DoF 位姿。当前仓库除了原始的生成与检测包，还包含 OAK / OpenCV 实时检测脚本、多 cube / 多相机 viser 可视化脚本，以及一组 AprilCube 位姿算法 benchmark。
+`aprilcube` 用于生成带 ArUco / AprilTag 标记的三维打印 cube / cuboid，并从相机图像中估计其 6DoF 位姿。当前仓库除了原始的生成与检测包，还包含 OpenCV 实时检测脚本、多 cube viser 可视化脚本，以及一组 AprilCube 位姿算法 benchmark。
 
 ![printing process](assets/printing_process.gif)
 
@@ -10,7 +10,7 @@
 - 输出与模型配套的 `config.json`，检测端可直接读取 tag ID、面朝向和三维角点。
 - 基于 OpenCV / AprilTag 检测结果估计 cube 在相机坐标系下的 6DoF 位姿。
 - 支持 Kalman / SE(3) 时序平滑、异步检测、世界坐标外参、viser 三维可视化。
-- 提供 OAK 相机、普通 OpenCV 相机、多 cube、多相机、世界坐标融合等实验脚本。
+- 提供普通 OpenCV 相机和多 cube 实时检测实验脚本。
 - 提供 `aprilcube_pose_benchmark`，用于离线比较多种 cube pose 估计算法。
 
 ## 目录结构
@@ -20,7 +20,7 @@
 ├── src/aprilcube/                    # 核心 Python 包：生成、检测、CLI
 ├── src/aprilcube_runtime.py          # AprilTag 原生检测 + cube pose 融合的运行时工具
 ├── src/aprilcube_pose_benchmark/     # 9 组离线位姿算法与评测/画图工具
-├── src/00*.py                        # OAK / CV2 / 多相机实时实验脚本
+├── src/00*.py                        # CV2 实时实验脚本
 ├── examples/                         # 简单 webcam 示例
 ├── models/                           # 原有生成模型
 ├── cube_april_* / aruco_cube_*        # 本地新增 cube 模型与打印文件
@@ -42,7 +42,7 @@ pip install -e .
 pip install pupil-apriltags viser trimesh scipy pyyaml
 ```
 
-OAK 相关脚本还依赖项目上层的相机工具，例如 `scripts/utils/recorder_oak_cam.py`、`recorder_cv2_cam.py` 和 `april_tag_detector.py`。这些脚本会把上层 `scripts/utils` 加入 `sys.path`。
+CV2 实时脚本还依赖项目上层的相机工具，例如 `scripts/utils/recorder_cv2_cam.py` 和 `april_tag_detector.py`。这些脚本会把上层 `scripts/utils` 加入 `sys.path`。
 
 ## 生成 cube
 
@@ -163,17 +163,9 @@ while True:
 
 | 脚本 | 用途 |
 | --- | --- |
-| `src/001_oak_aprilcube_detect_tag_visual.py` | OAK 单 cube AprilTag 检测与可视化 |
-| `src/002_oak_aprilcube_detect_tag_visual_temporal_pose.py` | OAK 单 cube，带 TemporalTagPoseEstimator |
-| `src/002_alg_006_oak_aprilcube_detect_tag_visual.py` | OAK 单 cube，使用 alg 06 逻辑 |
-| `src/002_1_visualize_saved_snapshot_pkl.py` | 回放保存的 pkl snapshot，并用 viser 可视化 |
-| `src/003_oak_aprilcube_detect_multi_cube.py` | OAK 多 cube 检测 |
 | `src/004_cv2_aprilcube_detect_multi_cube.py` | 普通 OpenCV 相机多 cube 检测 |
 | `src/004_cv2_alg_06_aprilcube_detect_multi_cube.py` | CV2 多 cube，使用 alg 06 |
 | `src/004_cv2_alg_09_aprilcube_detect_multi_cube.py` | CV2 多 cube，使用 alg 09 |
-| `src/005_oak_multicam_single_apriltag_viser.py` | 多 OAK 相机单 AprilTag 可视化 |
-| `src/006_oak_multicam_multicube_world_viser.py` | 多 OAK 相机、多 cube、世界坐标可视化 |
-| `src/007_oak_multicam_multicube_world_bundle_viser.py` | 多相机多 cube bundle 优化版本 |
 
 运行示例：
 
@@ -221,7 +213,7 @@ python src/aprilcube_pose_benchmark/run_all_algorithms_on_recording.py
 - `README.md`：中文项目说明。
 - `src/aprilcube/detect.py`：可视化线宽与 viser object frame / mesh / axes 控制更新。
 - `src/aprilcube_runtime.py`：AprilTag 原生 pose、时序 pose 与 cube pose 融合工具。
-- `src/00*.py`：OAK / CV2 / 多 cube / 多相机实验脚本。
+- `src/004*.py`：CV2 多 cube 实验脚本。
 - `src/aprilcube_pose_benchmark/`：离线算法评测框架与 9 组算法实现。
 - `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml`：DECXIN USB3 相机内参。
 - 新增的 `cube_april_*` 与 `aruco_cube_*` 模型目录：打印文件、配置、预览图与 MuJoCo mesh。
