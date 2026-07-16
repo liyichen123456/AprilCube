@@ -1,6 +1,6 @@
 # aprilcube
 
-`aprilcube` 用于生成带 ArUco / AprilTag 标记的三维打印 cube / cuboid，并从相机图像中估计其 6DoF 位姿。当前仓库除了原始的生成与检测包，还包含 OpenCV 实时检测脚本、多 cube viser 可视化脚本，以及一组 AprilCube 位姿算法 benchmark。
+`aprilcube` 用于生成带 ArUco / AprilTag 标记的三维打印 cube / cuboid，并从相机图像中估计其 6DoF 位姿。当前仓库除了原始的生成与检测包，还包含 OpenCV 实时检测脚本和多 cube viser 可视化脚本。
 
 ![printing process](assets/printing_process.gif)
 
@@ -11,7 +11,6 @@
 - 基于 OpenCV / AprilTag 检测结果估计 cube 在相机坐标系下的 6DoF 位姿。
 - 支持 Kalman / SE(3) 时序平滑、异步检测、世界坐标外参、viser 三维可视化。
 - 提供普通 OpenCV 相机和多 cube 实时检测实验脚本。
-- 提供 `aprilcube_pose_benchmark`，用于离线比较多种 cube pose 估计算法。
 
 ## 目录结构
 
@@ -19,13 +18,11 @@
 .
 ├── src/aprilcube/                    # 核心 Python 包：生成、检测、CLI
 ├── src/aprilcube_runtime.py          # AprilTag 原生检测 + cube pose 融合的运行时工具
-├── src/aprilcube_pose_benchmark/     # 9 组离线位姿算法与评测/画图工具
 ├── src/00*.py                        # CV2 实时实验脚本
 ├── examples/                         # 简单 webcam 示例
 ├── models/                           # 原有生成模型
 ├── cube_april_* / aruco_cube_*        # 本地新增 cube 模型与打印文件
-├── assets/                           # 图片、相机内参等资源
-└── outputs/                          # benchmark 输出结果，按需提交
+└── assets/                           # 图片、相机内参等资源
 ```
 
 ## 安装
@@ -36,7 +33,7 @@
 pip install -e .
 ```
 
-如果要运行实时检测、viser 可视化或 benchmark，通常还需要安装：
+如果要运行实时检测或 viser 可视化，通常还需要安装：
 
 ```bash
 pip install pupil-apriltags viser trimesh scipy pyyaml
@@ -164,47 +161,14 @@ while True:
 | 脚本 | 用途 |
 | --- | --- |
 | `src/004_cv2_aprilcube_detect_multi_cube.py` | 普通 OpenCV 相机多 cube 检测 |
-| `src/004_cv2_alg_06_aprilcube_detect_multi_cube.py` | CV2 多 cube，使用 alg 06 |
-| `src/004_cv2_alg_09_aprilcube_detect_multi_cube.py` | CV2 多 cube，使用 alg 09 |
 
 运行示例：
 
 ```bash
-python src/004_cv2_alg_09_aprilcube_detect_multi_cube.py
+python src/004_cv2_aprilcube_detect_multi_cube.py
 ```
 
 CV2 脚本可读取 `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml` 这类 YAML 内参文件，字段包含 `image_size`、`K`、`dist`、`fx/fy/cx/cy` 和标定误差。
-
-## benchmark
-
-`src/aprilcube_pose_benchmark` 用于离线评测不同 cube pose 解算策略。入口脚本：
-
-```bash
-python src/aprilcube_pose_benchmark/run_all_algorithms_on_recording.py
-```
-
-当前包含 9 组算法。它们的主要差异在于：直接使用 `pupil_apriltags` 给出的单 tag pose，还是只使用 tag 角点重新做 cube 级 PnP；是否把每个 face 分开求解；是否显式处理单个平面 tag 的 IPPE 二义性；以及是否使用上一帧位姿做时序筛选或保持。
-
-| 算法 | 核心输入 | 求解策略 | 主要特点 |
-| --- | --- | --- | --- |
-| `alg_01_pupil_tag_pose_to_cube_pose_fuse` | `pupil_apriltags` 原生 tag pose | 每个 tag 先独立估计 tag pose，再根据 tag 在 cube 上的固定外参反推 cube pose，最后融合多个 cube pose | 实现最直接，能利用 `pupil_apriltags` 自带 pose；但每个 tag 的平面 pose 二义性和噪声会先进入 cube pose，旋转跳变风险较高 |
-| `alg_02_pupil_all_tag_corners_to_cube_pnp_lm` | 所有可见 tag 的 2D 角点 | 把所有 tag 角点映射到 cube 坐标系，一次性做整体 cube PnP，并用 LM refine | 不依赖单 tag pose，几何约束统一；多 tag 可见时重投影误差较低，但没有 RANSAC，异常角点会直接影响解 |
-| `alg_03_pupil_all_tag_corners_to_cube_pnp_ransac_lm` | 所有可见 tag 的 2D 角点 | 先对整体 cube PnP 做 RANSAC 去异常点，再用 LM refine | 比 alg 02 更抗局部误检/坏角点；如果可见点太少或 RANSAC 剔除过多，成功率可能略低 |
-| `alg_04_pupil_per_face_corners_to_face_pnp_then_cube_fuse` | 按 face 分组后的 tag 角点 | 每个可见 face 单独做 PnP 得到 cube pose，再融合多个 face 的结果 | 保留 face 级局部一致性，适合分析不同面的贡献；但单 face 本质仍接近平面问题，旋转稳定性依赖融合质量 |
-| `alg_05_pupil_single_face_temporal_else_multiface_cube_pnp` | tag 角点 + 单 face 时序 tag pose | 只有一个 face 可见时走 `TemporalTagPoseEstimator` 的 tag pose 融合；两个及以上 face 可见时回到整体 cube PnP | 针对“只看到一面”的场景增强稳定性；多面时保持 alg 02 的整体几何约束，但模式切换处可能出现位姿风格差异 |
-| `alg_06_pupil_tag_pose_candidates_to_cube_consistency_select` | 单 tag 平面 pose 候选 | 每个 tag 保留多个 pose 候选，转换成 cube pose 后，通过 cube 间一致性选择最合理的一组 | 显式处理平面 tag 的多解问题，比直接信任原生 pose 更稳；依赖候选之间的一致性，多 tag 支撑越多越可靠 |
-| `alg_07_pupil_cube_pnp_lm_then_se3_temporal_filter` | 整体 cube PnP 结果 | 先运行 alg 02 风格的 cube PnP + LM，再对最终 cube 位姿做 SE(3) 低通滤波，`SE3_FILTER_ALPHA=0.35` | 明显压低帧间抖动；代价是会引入滞后，快速运动时重投影误差和真实位姿响应可能变差 |
-| `alg_08_hybrid_multiface_pnp_single_tag_ippe_temporal` | 多 face 角点 / 单 tag IPPE 候选 | 两个及以上 face 可见时用整体 cube PnP；只有单 tag 时用 IPPE 生成两个平面解，并用上一帧 cube pose + 重投影误差消歧 | 专门处理“多面可靠、单 tag 也不断轨”的情况；第一次只有单 tag 且没有上一帧参考时置信度低，不会用它初始化强时序 |
-| `alg_09_cube_candidate_cluster_ransac_temporal_sanity` | IPPE 候选 + cube PnP RANSAC 候选 + 上一帧 pose | 为每个 tag 生成 IPPE cube 候选，同时加入整体 RANSAC PnP 候选；对候选做旋转/平移聚类，选最大一致簇并加时序 sanity gate；失败时可 hold 上一帧 | 当前最完整也最保守：同时利用候选聚类、RANSAC 和时序约束，录制数据上成功率最高；参数更多，输出可能包含 `predicted=True` 的保持帧 |
-
-算法之间可以按复杂度理解为四条路线：
-
-- `alg_01`：信任单 tag pose，再做 cube 融合。
-- `alg_02` / `alg_03`：只信任角点，在 cube 层统一 PnP；`alg_03` 比 `alg_02` 多 RANSAC。
-- `alg_04` / `alg_05`：按可见 face 或单面/多面情况切换策略。
-- `alg_06` / `alg_08` / `alg_09`：围绕平面 tag 的多解二义性做候选选择；`alg_09` 额外加入聚类、RANSAC 候选、时序门限和 hold 机制。
-
-当前 `outputs/aprilcube_pose_benchmark/recording_20260511_162011` 中保存了一次 568 帧录制的评测结果。`alg_09` 在该记录上成功率为 100%，平均重投影误差约 `8.71 px`；其他多数算法成功率约 `93.5%`。
 
 ## 本次提交建议
 
@@ -213,11 +177,9 @@ python src/aprilcube_pose_benchmark/run_all_algorithms_on_recording.py
 - `README.md`：中文项目说明。
 - `src/aprilcube/detect.py`：可视化线宽与 viser object frame / mesh / axes 控制更新。
 - `src/aprilcube_runtime.py`：AprilTag 原生 pose、时序 pose 与 cube pose 融合工具。
-- `src/004*.py`：CV2 多 cube 实验脚本。
-- `src/aprilcube_pose_benchmark/`：离线算法评测框架与 9 组算法实现。
+- `src/004_cv2_aprilcube_detect_multi_cube.py`：CV2 多 cube 实验脚本。
 - `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml`：DECXIN USB3 相机内参。
 - 新增的 `cube_april_*` 与 `aruco_cube_*` 模型目录：打印文件、配置、预览图与 MuJoCo mesh。
-- `outputs/aprilcube_pose_benchmark/...`：如果希望保留此次 benchmark 图表和指标，可以提交；否则建议忽略。
 
 不建议直接提交：
 
