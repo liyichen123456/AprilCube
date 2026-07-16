@@ -34,12 +34,17 @@ from typing import Any
 import cv2
 import numpy as np
 import trimesh
-import viser
 import yaml
 from PIL import Image
 from scipy.interpolate import UnivariateSpline
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation, Slerp
+
+try:
+    import viser
+except ImportError:
+    # Batch-only callers do not need the optional Viser UI dependency.
+    viser = None
 
 APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = APRILCUBE_ROOT / "src"
@@ -67,8 +72,13 @@ from aprilcube.detect import (
     estimate_single_tag_cube_pose,
 )
 from fiducial_marker.unit_arucotag import UnitArucoTag
-from recorder_cv2_cam import CV2CameraManager
 from stag_decode.pose_estimator import get_fine_grid_points_anno
+
+try:
+    from recorder_cv2_cam import CV2CameraManager
+except ImportError:
+    # Camera capture/replay is not used by offline 012 batch processing.
+    CV2CameraManager = None
 
 preprocess_tag_image = _preprocess
 
@@ -502,6 +512,7 @@ def process_012_recording(
     raw_pkl: Path,
     output_pkl: Path,
     work_dir: Path,
+    merge_final_raw: bool = True,
 ) -> Path:
     raw_pkl = raw_pkl.expanduser().resolve()
     fmt = inspect_pkl_format(raw_pkl)
@@ -513,7 +524,7 @@ def process_012_recording(
 
     output_pkl = output_pkl.expanduser().resolve()
     work_dir = work_dir.expanduser().resolve()
-    if processed_output_matches_input(output_pkl, raw_pkl):
+    if merge_final_raw and processed_output_matches_input(output_pkl, raw_pkl):
         print(f"[INFO] Existing 020 output matches input; skip pose recompute: {output_pkl}")
         summarize_pose_stream(output_pkl, "pose")
         return output_pkl
@@ -603,6 +614,10 @@ def process_012_recording(
         raw_pkl=april_merged_pkl,
         output_pkl=final_pose_pkl,
     )
+
+    if not merge_final_raw:
+        summarize_pose_stream(final_pose_pkl, "pose")
+        return final_pose_pkl
 
     merge_final_pose_stream(
         raw_pkl=raw_pkl,
@@ -3050,7 +3065,9 @@ def replay_008_main(args: Replay008ViewerConfig) -> None:
 
 
 # ---- RealSense recording and calibration helpers ----
-REALSENSE_DEFAULT_INTRINSICS_YAML = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_realsense_1280x720_0707_171032.yaml')
+# D435 color stream (SDK S/N 244222070135), calibrated at the native
+# 1920x1080 resolution used by multi_cam_record_0716_180451.pkl.
+REALSENSE_DEFAULT_INTRINSICS_YAML = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_d435_color_charuco_1920x1080_0716_130910_offline_filtered.yaml')
 REALSENSE_DEFAULT_CUBE_CFG = Path('/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cubes/cube_april_36h11_100_123_2x2x2_outer62p5mm')
 REALSENSE_PINHOLE_UNDISTORT_ALPHA = 0.0
 
@@ -3071,6 +3088,25 @@ def realsense_create_undistort_maps(calib: dict[str, Any], image_size: tuple[int
     dist_coeffs = np.asarray(calib.get('dist', np.zeros(5)), dtype=np.float64).reshape(-1)
     if dist_coeffs.size == 0 or np.allclose(dist_coeffs, 0.0):
         return None
+    if cv2_capture_is_fisheye_calib(calib):
+        if dist_coeffs.size != 4:
+            raise ValueError(
+                f"Fisheye calibration requires 4 distortion coefficients, got {dist_coeffs.size}"
+            )
+        detection_camera_matrix = cv2_capture_compute_detection_camera_matrix(
+            calib,
+            image_size,
+            undistort_before_detection=True,
+        )
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+            camera_matrix,
+            dist_coeffs.reshape(4, 1),
+            np.eye(3, dtype=np.float64),
+            detection_camera_matrix,
+            image_size,
+            cv2.CV_16SC2,
+        )
+        return (map1, map2, detection_camera_matrix)
     detection_camera_matrix, _roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, image_size, REALSENSE_PINHOLE_UNDISTORT_ALPHA, image_size)
     detection_camera_matrix = np.asarray(detection_camera_matrix, dtype=np.float64).reshape(3, 3)
     map1, map2 = cv2.initUndistortRectifyMap(camera_matrix, dist_coeffs, np.eye(3, dtype=np.float64), detection_camera_matrix, image_size, cv2.CV_16SC2)
@@ -6376,7 +6412,13 @@ def temporal_pose_smoothing_main(args: TemporalPoseSmoothingConfig) -> None:
     source_poses = {idx: copy.deepcopy(frames[idx].get('pose', {})) for idx in indices}
     if any((not bool(source_poses[idx].get('success', False))) for idx in indices):
         failed = [idx for idx in indices if not bool(source_poses[idx].get('success', False))]
-        raise ValueError(f'Cannot smooth incomplete pose stream; failed frames={failed}')
+        args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.input_pkl, args.output_pkl)
+        print(
+            '[WARN] Skipping constrained temporal smoothing because the pose stream '
+            f'is incomplete; failed frames={failed}; copied input to {args.output_pkl}'
+        )
+        return
     smoothed_poses: dict[int, dict[str, Any]] = {}
     smoothed_count = 0
     edge_rejected_count = 0
