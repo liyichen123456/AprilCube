@@ -24,7 +24,7 @@ SUPPORTED_FORMATS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Visualize 014 offline pose visualization pkl with viser.")
+    parser = argparse.ArgumentParser(description="Visualize 013 offline pose result pkl with viser.")
     parser.add_argument("pkl_path", nargs="?", default=str(DEFAULT_PKL))
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8095)
@@ -33,12 +33,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_stream_index(path: Path) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
+def build_stream_index(
+    path: Path,
+    supported_formats: set[str] | None = None,
+) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
     offsets: list[int] = []
     footer: dict[str, Any] | None = None
+    allowed_formats = SUPPORTED_FORMATS if supported_formats is None else supported_formats
     with path.open("rb") as f:
         header = pickle.load(f)
-        if not isinstance(header, dict) or header.get("format") not in SUPPORTED_FORMATS:
+        if not isinstance(header, dict) or header.get("format") not in allowed_formats:
             raise ValueError(f"Unsupported pkl format: {header.get('format', None)}")
 
         while True:
@@ -66,6 +70,62 @@ def load_frame(path: Path, offset: int) -> dict[str, Any]:
     if not isinstance(obj, dict) or obj.get("type") != "frame":
         raise ValueError(f"Offset {offset} is not a frame record")
     return obj
+
+
+def find_raw_image_stream(
+    pkl_path: Path,
+    header: dict[str, Any],
+    offsets: list[int],
+) -> tuple[Path, list[int]] | None:
+    first_frame = load_frame(pkl_path, offsets[0])
+    if isinstance(first_frame.get("image_bgr"), np.ndarray):
+        return pkl_path, offsets
+
+    for field in ("source_pkl", "source_raw_pkl"):
+        source_value = header.get(field)
+        if not source_value:
+            continue
+        source_path = Path(source_value).expanduser().resolve()
+        if not source_path.is_file() or source_path == pkl_path:
+            continue
+        try:
+            _source_header, source_offsets, _source_footer = build_stream_index(
+                source_path,
+                SUPPORTED_FORMATS
+                | {
+                    "aprilcube_rs_raw_frame_stream_v1",
+                    "aprilcube_raw_frame_stream_v1",
+                },
+            )
+            source_first = load_frame(source_path, source_offsets[0])
+        except (OSError, ValueError, EOFError, pickle.UnpicklingError):
+            continue
+        if not isinstance(source_first.get("image_bgr"), np.ndarray):
+            continue
+        mapped_offsets: list[int] = []
+        for processed_offset in offsets:
+            processed_frame = load_frame(pkl_path, processed_offset)
+            source_offset = processed_frame.get(
+                "source_offset",
+                processed_frame.get("raw_source_offset", None),
+            )
+            if source_offset is None:
+                mapped_offsets = []
+                break
+            try:
+                source_frame = load_frame(source_path, int(source_offset))
+            except (OSError, ValueError, EOFError, pickle.UnpicklingError):
+                mapped_offsets = []
+                break
+            if not isinstance(source_frame.get("image_bgr"), np.ndarray):
+                mapped_offsets = []
+                break
+            mapped_offsets.append(int(source_offset))
+        if len(mapped_offsets) == len(offsets):
+            return source_path, mapped_offsets
+        if len(source_offsets) == len(offsets):
+            return source_path, source_offsets
+    return None
 
 
 def decode_jpeg_bgr(data: bytes) -> np.ndarray:
@@ -163,6 +223,7 @@ def main() -> None:
     args = parse_args()
     pkl_path = Path(args.pkl_path).expanduser().resolve()
     header, offsets, footer = build_stream_index(pkl_path)
+    raw_image_stream = find_raw_image_stream(pkl_path, header, offsets)
 
     server = viser.ViserServer(host=args.host, port=int(args.port))
     server.scene.set_up_direction("-y")
@@ -203,6 +264,12 @@ def main() -> None:
             format="jpeg",
             jpeg_quality=80,
         )
+        raw_handle = server.gui.add_image(
+            np.zeros((120, 160, 3), dtype=np.uint8),
+            label="Original image_bgr (no overlay, before undistortion)",
+            format="jpeg",
+            jpeg_quality=80,
+        )
 
     pose_text = server.gui.add_markdown("")
     server.gui.add_markdown(
@@ -211,6 +278,7 @@ def main() -> None:
                 f"pkl: `{pkl_path}`",
                 f"frames: `{len(offsets)}`",
                 f"format: `{header.get('format', '')}`",
+                f"raw image source: `{raw_image_stream[0] if raw_image_stream else 'unavailable'}`",
                 f"footer: `{footer}`",
             ]
         )
@@ -221,6 +289,10 @@ def main() -> None:
 
     def render(idx: int) -> None:
         frame = load_frame(pkl_path, offsets[idx])
+        if raw_image_stream is not None:
+            raw_path, raw_offsets = raw_image_stream
+            raw_frame = load_frame(raw_path, raw_offsets[idx])
+            raw_handle.image = bgr_to_rgb(raw_frame["image_bgr"], int(args.max_width))
         overlay_bgr = decode_jpeg_bgr(frame["overlay_jpeg"])
         overlay_handle.image = bgr_to_rgb(overlay_bgr, int(args.max_width))
         update_cube(cube_handle, frame)
@@ -252,6 +324,10 @@ def main() -> None:
 
     render(frame_idx)
     print(f"[INFO] Loaded {pkl_path} frames={len(offsets)}")
+    print(
+        "[INFO] Raw image source: "
+        f"{raw_image_stream[0] if raw_image_stream else 'unavailable'}"
+    )
     print(f"[INFO] Viser server: http://localhost:{args.port}")
 
     while True:

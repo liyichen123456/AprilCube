@@ -22,7 +22,7 @@ DEEPTAG_ROOT = APRILCUBE_ROOT / "thirdparty" / "deeptag-pytorch"
 SCRIPT_012_PATH = THIS_FILE.parent / "012_rs_aprilcube_detect.py"
 DEFAULT_INPUT_PKL = APRILCUBE_ROOT / "recordings" / "012_rs_raw_frames_20260710_214336.pkl"
 DEFAULT_MERGED_INPUT_PKL = APRILCUBE_ROOT / "recordings" / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
-DEFAULT_OUTPUT_PKL = APRILCUBE_ROOT / "recordings" / "016_deeptag_robust_cluster_012_rs_raw_frames_20260710_214336.pkl"
+DEFAULT_OUTPUT_PKL = APRILCUBE_ROOT / "recordings" / "015_deeptag_robust_cluster_012_rs_raw_frames_20260710_214336.pkl"
 
 if str(THIS_FILE.parent) not in sys.path:
     sys.path.insert(0, str(THIS_FILE.parent))
@@ -42,7 +42,7 @@ def load_script012_module() -> Any:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run DeepTag AprilTag detector on 012 raw-frame pkl.")
+    parser = argparse.ArgumentParser(description="Run standalone DeepTag pose estimation on a 012 raw-frame pkl.")
     parser.add_argument(
         "pkl_path",
         nargs="?",
@@ -626,6 +626,65 @@ def solve_pose_from_detections(
     return result
 
 
+def global_corner_order_pose(
+    raw_detections: list[tuple[int, np.ndarray]],
+    runtime: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], list[tuple[int, np.ndarray]], dict[str, Any]]:
+    """Try one shared corner order for all decoded tags as a conservative fallback."""
+
+    candidates: list[tuple[str, dict[str, Any], list[tuple[int, np.ndarray]]]] = []
+    for order_name in CORNER_ORDER_TRANSFORMS:
+        detections = apply_corner_order(raw_detections, order_name)
+        pose = solve_pose_from_detections(
+            detections,
+            runtime,
+            max_reproj=float(args.robust_max_reproj),
+        )
+        if finite_pose_success(pose):
+            candidates.append((order_name, pose, detections))
+
+    stats = {
+        "global_order_attempted": True,
+        "global_order_candidate_count": len(candidates),
+        "global_order_candidates": [
+            {
+                "corner_order": order_name,
+                "n_tags": int(pose.get("n_tags", 0) or 0),
+                "reproj_error": float(pose.get("reproj_error", float("inf"))),
+            }
+            for order_name, pose, _detections in candidates
+        ],
+    }
+    if not candidates:
+        return (
+            {
+                "success": False,
+                "failure_reason": "global_corner_order_pose_failed",
+                "detections": [],
+                "n_tags": 0,
+                "tag_ids": [],
+                "reproj_error": float("inf"),
+            },
+            [],
+            stats,
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            -int(item[1].get("n_tags", 0) or 0),
+            float(item[1].get("reproj_error", float("inf"))),
+        )
+    )
+    order_name, pose, detections = candidates[0]
+    pose = dict(pose)
+    pose["pose_source"] = "deeptag_global_corner_order_pose"
+    pose["pose_filled"] = False
+    pose["deeptag_corner_order"] = order_name
+    stats["global_order_selected"] = order_name
+    return pose, detections, stats
+
+
 def robust_cluster_pose(
     raw_detections: list[tuple[int, np.ndarray]],
     runtime: dict[str, Any],
@@ -666,18 +725,11 @@ def robust_cluster_pose(
             )
 
     if not candidates:
-        return (
-            {
-                "success": False,
-                "failure_reason": "robust_no_single_tag_candidates",
-                "detections": [],
-                "n_tags": 0,
-                "tag_ids": [],
-                "reproj_error": float("inf"),
-            },
-            [],
-            {"candidate_count": 0, "cluster_size": 0},
-        )
+        pose, detections, stats = global_corner_order_pose(raw_detections, runtime, args)
+        stats.update({"candidate_count": 0, "cluster_size": 0})
+        if not pose.get("success", False):
+            pose["failure_reason"] = "robust_no_single_tag_candidates;global_corner_order_pose_failed"
+        return pose, detections, stats
 
     best_cluster: list[dict[str, Any]] = []
     best_score: tuple[int, float, float] | None = None
@@ -707,18 +759,17 @@ def robust_cluster_pose(
             best_cluster = cluster
 
     if len(best_cluster) < int(args.robust_min_tags):
-        return (
+        pose, detections, stats = global_corner_order_pose(raw_detections, runtime, args)
+        stats.update(
             {
-                "success": False,
-                "failure_reason": f"robust_cluster_too_small:{len(best_cluster)}<{int(args.robust_min_tags)}",
-                "detections": [(item["tag_id"], item["corners"]) for item in best_cluster],
-                "n_tags": len(best_cluster),
-                "tag_ids": [int(item["tag_id"]) for item in best_cluster],
-                "reproj_error": float("inf"),
-            },
-            [(item["tag_id"], item["corners"]) for item in best_cluster],
-            {"candidate_count": len(candidates), "cluster_size": len(best_cluster)},
+                "candidate_count": len(candidates),
+                "cluster_size": len(best_cluster),
+                "cluster_failure_reason": (
+                    f"robust_cluster_too_small:{len(best_cluster)}<{int(args.robust_min_tags)}"
+                ),
+            }
         )
+        return pose, detections, stats
 
     seed = min(best_cluster, key=lambda item: item["reproj_error"])
     cluster_detections = [
@@ -732,6 +783,20 @@ def robust_cluster_pose(
         seed_tvec=seed["tvec"],
         max_reproj=float(args.robust_max_reproj),
     )
+    if not finite_pose_success(pose):
+        fallback_pose, fallback_detections, fallback_stats = global_corner_order_pose(
+            raw_detections,
+            runtime,
+            args,
+        )
+        fallback_stats.update(
+            {
+                "candidate_count": len(candidates),
+                "cluster_size": len(best_cluster),
+                "cluster_failure_reason": str(pose.get("failure_reason", "cluster_pose_failed")),
+            }
+        )
+        return fallback_pose, fallback_detections, fallback_stats
     pose["pose_source"] = "deeptag_robust_pose_cluster"
     pose["pose_filled"] = False
     pose["robust_candidate_count"] = int(len(candidates))

@@ -15,7 +15,7 @@ import viser
 from PIL import Image
 
 THIS_FILE = Path(__file__).resolve()
-DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect_multi_cube.py"
+DEMO_008_PATH = THIS_FILE.parent / "008_cv2_naive_aprilcube_detect.py"
 ASSETS_DIR = THIS_FILE.parent.parent / "assets"
 OBJ_MESH_SCALE = 0.001
 
@@ -572,7 +572,7 @@ def process_detections_with_face_frame_solver(
     tag_detections: list[tuple[int, np.ndarray]],
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Use the 011-only face-frame solver without changing other entry points."""
+    """Use the 009 replay face-frame solver without changing other entry points."""
     from aprilcube import detect as detect_mod
 
     original_solver = detect_mod.estimate_single_tag_cube_pose
@@ -2714,13 +2714,13 @@ def main() -> None:
         "+ per-cube process_detections(), sequential over PKL frames."
     )
     print(
-        "[INFO] 011 single-tag face-frame solver: "
+        "[INFO] 009 single-tag face-frame solver: "
         f"max_reproj={SINGLE_TAG_FACE_FRAME_MAX_REPROJ_PX:.1f}px "
         f"tie={SINGLE_TAG_FACE_FRAME_REPROJ_TIE_PX:.1f}px "
         f"lm_refine={SINGLE_TAG_FACE_FRAME_LM_REFINE}."
     )
     print(
-        "[INFO] 011 offline temporal postprocess: "
+        "[INFO] 009 offline temporal postprocess: "
         f"enabled={temporal_postprocess_enabled}."
     )
     if RECOMPUTE_POSE:
@@ -3011,7 +3011,7 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) != 1:
         raise SystemExit(
-            "011 no longer accepts command-line arguments; edit the User macros "
+            "009 does not accept command-line arguments; edit the User macros "
             "at the top of this script."
         )
     main()

@@ -8,8 +8,14 @@ The readable pipeline lives at the top of this file:
 3. Estimate DeepTag dense-keypoint poses.
 4. Fuse single-frame candidates using reprojection and edge gates.
 5. Reject temporally inconsistent single-frame poses before they become anchors.
-6. Recover hard frames with conservative RGB outline refinement.
-7. Fill the final gaps, smooth the cleaned trajectory, and merge it into the raw stream.
+6. Recover short gaps with embedded bidirectional RGB flow and tag-corner PnP.
+7. Recover remaining hard frames with conservative RGB outline refinement.
+8. Fill only short bracketed gaps and apply final timestamp-domain SE(3) smoothing.
+9. Retarget the three fingertip cubes to the Wuji left hand with a 4-point
+   per-finger objective and joint velocity/acceleration/jerk regularization.
+10. Solve xArm7 + Wuji full-body IK, enforce hardware trajectory limits, and
+    atomically write one ``<raw-stem>_post_progress.pkl`` containing poses,
+    raw images, overlays, and all qpos fields.
 
 The long copied helper implementations are kept at the bottom so this file can
 run by itself without launching or importing the old numbered stage scripts.
@@ -34,12 +40,16 @@ from typing import Any
 import cv2
 import numpy as np
 import trimesh
-import viser
 import yaml
 from PIL import Image
-from scipy.interpolate import UnivariateSpline
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation, Slerp
+
+try:
+    import viser
+except ImportError:
+    # Batch-only callers do not need the optional Viser UI dependency.
+    viser = None
 
 APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = APRILCUBE_ROOT / "src"
@@ -67,8 +77,13 @@ from aprilcube.detect import (
     estimate_single_tag_cube_pose,
 )
 from fiducial_marker.unit_arucotag import UnitArucoTag
-from recorder_cv2_cam import CV2CameraManager
 from stag_decode.pose_estimator import get_fine_grid_points_anno
+
+try:
+    from recorder_cv2_cam import CV2CameraManager
+except ImportError:
+    # Camera capture/replay is not used by offline 012 batch processing.
+    CV2CameraManager = None
 
 preprocess_tag_image = _preprocess
 
@@ -221,6 +236,8 @@ class SingleFrameFusionConfig:
     edge_threshold: float = 0.45
     single_tag_edge_threshold: float = 0.60
     single_tag_max_reproj: float = 1.0
+    preferred_single_tag_id: int | None = None
+    prefer_deeptag_single_tag: bool = False
     jpeg_quality: int = 90
 
 
@@ -254,12 +271,51 @@ class TemporalOutlierRejectionConfig:
 
 
 @dataclass(frozen=True)
+class AdjacentRgbFlowRecoveryConfig:
+    """Conservative adjacent-frame RGB recovery embedded in the 020 pipeline.
+
+    This replaces the former middle-leading and wrist-bidirectional repair
+    scripts.  It scans every short failed run automatically, propagates from
+    both reliable boundaries, and accepts a pose only after forward/backward
+    LK, homography, PnP, motion, and RGB cube-edge gates pass.
+    """
+
+    input_pkl: Path
+    raw_pkl: Path
+    output_pkl: Path
+    target_name: str = "cube_Q"
+    max_gap_frames: int = 5
+    max_features: int = 500
+    feature_quality: float = 0.005
+    feature_min_distance: float = 4.0
+    min_features: int = 40
+    lk_window: int = 41
+    lk_levels: int = 5
+    max_fb_error: float = 1.5
+    max_fb_median_px: float = 0.75
+    min_good_tracks: int = 30
+    homography_ransac_px: float = 2.5
+    min_homography_inliers: int = 20
+    min_homography_inlier_ratio: float = 0.20
+    max_homography_median_px: float = 1.5
+    max_current_tag_agreement_px: float = 12.0
+    max_flow_corner_reproj_px: float = 4.0
+    max_translation_delta_mm: float = 8.0
+    max_rotation_delta_deg: float = 12.0
+    min_edge_score: float = 0.04
+    allow_missing_current_tag: bool = True
+    min_tag_corners_inside: int = 4
+    feature_mask_scale: float = 1.0
+
+
+@dataclass(frozen=True)
 class TemporalPoseCompletionConfig:
     input_pkl: Path
     raw_pkl: Path
     output_pkl: Path
-    translation_smooth: float = 2400.0
-    max_bracket_gap: int = 40
+    # Only fill an isolated/very short miss bracketed by reliable detections.
+    # A gap of 3 covers two missing frames between two measured anchors.
+    max_bracket_gap: int = 3
     jpeg_quality: int = 90
 
 
@@ -268,8 +324,10 @@ class TemporalPoseSmoothingConfig:
     input_pkl: Path
     raw_pkl: Path
     output_pkl: Path
-    window_radius: int = 2
+    window_radius: int = 4
     sigma_frames: float = 1.0
+    window_seconds: float = 0.18
+    sigma_seconds: float = 0.075
     max_measured_translation_delta_mm: float = 4.0
     max_measured_rotation_delta_deg: float = 4.0
     max_filled_translation_delta_mm: float = 10.0
@@ -382,6 +440,11 @@ def fuse_single_frame_pose_candidates(
     loose_deeptag_pkl: Path,
     old_april_pkl: Path,
     output_pkl: Path,
+    *,
+    single_tag_edge_threshold: float = 0.60,
+    single_tag_max_reproj: float = 1.0,
+    preferred_single_tag_id: int | None = None,
+    prefer_deeptag_single_tag: bool = False,
 ) -> None:
     print("[STAGE] fuse single-frame pose candidates", flush=True)
     single_frame_fusion_main(SingleFrameFusionConfig(
@@ -392,6 +455,10 @@ def fuse_single_frame_pose_candidates(
         loose_deeptag_pkl=loose_deeptag_pkl,
         old_april_pkl=old_april_pkl,
         output_pkl=output_pkl,
+        single_tag_edge_threshold=float(single_tag_edge_threshold),
+        single_tag_max_reproj=float(single_tag_max_reproj),
+        preferred_single_tag_id=preferred_single_tag_id,
+        prefer_deeptag_single_tag=bool(prefer_deeptag_single_tag),
     ))
 
 
@@ -416,12 +483,63 @@ def reject_temporal_pose_outliers(input_pkl: Path, output_pkl: Path) -> None:
     ))
 
 
+def recover_poses_with_adjacent_rgb_flow(
+    input_pkl: Path,
+    raw_pkl: Path,
+    output_pkl: Path,
+    *,
+    target_name: str | None,
+) -> None:
+    """Recover only short failed runs using adjacent RGB optical flow.
+
+    The embedded stage subsumes the former one-frame middle recovery and
+    fixed-anchor wrist recovery utilities.  No frame numbers or recording
+    paths are hard-coded; every short gap is discovered from the pose stream.
+    """
+
+    target = str(target_name or "cube_Q")
+    # The middle-finger shell supplies fewer stable edge features, while the
+    # larger wrist cube tolerates a slightly larger adjacent-frame motion.
+    if target == "middle_Q":
+        policy = dict(
+            min_features=60,
+            min_good_tracks=40,
+            max_translation_delta_mm=6.0,
+            max_rotation_delta_deg=10.0,
+        )
+    elif target == "wrist_Q":
+        policy = dict(
+            min_features=20,
+            min_good_tracks=12,
+            max_translation_delta_mm=15.0,
+            max_rotation_delta_deg=20.0,
+            min_edge_score=0.0,
+        )
+    else:
+        policy = dict(
+            min_features=40,
+            min_good_tracks=30,
+            max_translation_delta_mm=8.0,
+            max_rotation_delta_deg=12.0,
+        )
+    print(f"[STAGE] adjacent bidirectional RGB-flow recovery target={target}", flush=True)
+    adjacent_rgb_flow_recovery_main(
+        AdjacentRgbFlowRecoveryConfig(
+            input_pkl=input_pkl,
+            raw_pkl=raw_pkl,
+            output_pkl=output_pkl,
+            target_name=target,
+            **policy,
+        )
+    )
+
+
 def fill_remaining_poses_from_trajectory(
     input_pkl: Path,
     raw_pkl: Path,
     output_pkl: Path,
 ) -> None:
-    print("[STAGE] global temporal fill", flush=True)
+    print("[STAGE] short local bracket interpolation", flush=True)
     temporal_completion_main(TemporalPoseCompletionConfig(
         input_pkl=input_pkl,
         raw_pkl=raw_pkl,
@@ -502,8 +620,24 @@ def process_012_recording(
     raw_pkl: Path,
     output_pkl: Path,
     work_dir: Path,
+    merge_final_raw: bool = True,
+    single_tag_edge_threshold: float = 0.60,
+    single_tag_max_reproj: float = 1.0,
+    preferred_single_tag_id: int | None = None,
+    prefer_deeptag_single_tag: bool = False,
+    enable_temporal_outline_recovery: bool = True,
+    enable_adjacent_rgb_flow_recovery: bool = True,
+    target_name: str | None = None,
 ) -> Path:
     raw_pkl = raw_pkl.expanduser().resolve()
+    if target_name == "middle_Q":
+        # Former middle_Q repair behavior is now an intrinsic target policy:
+        # prefer the physical tag-2 observation, use the DeepTag single-face
+        # candidate before AprilTag stage8, and forbid long-range outline fill.
+        if preferred_single_tag_id is None:
+            preferred_single_tag_id = 2
+        prefer_deeptag_single_tag = True
+        enable_temporal_outline_recovery = False
     fmt = inspect_pkl_format(raw_pkl)
     if fmt not in SUPPORTED_012_INPUT_PKL_FORMATS:
         raise ValueError(
@@ -513,7 +647,7 @@ def process_012_recording(
 
     output_pkl = output_pkl.expanduser().resolve()
     work_dir = work_dir.expanduser().resolve()
-    if processed_output_matches_input(output_pkl, raw_pkl):
+    if merge_final_raw and processed_output_matches_input(output_pkl, raw_pkl):
         print(f"[INFO] Existing 020 output matches input; skip pose recompute: {output_pkl}")
         summarize_pose_stream(output_pkl, "pose")
         return output_pkl
@@ -527,6 +661,7 @@ def process_012_recording(
     deeptag_dense_loose_pkl = work_dir / f"loose_deeptag_dense_pose_{raw_pkl.stem}.pkl"
     fused_single_frame_pkl = work_dir / f"fused_single_frame_pose_{raw_pkl.stem}.pkl"
     temporal_cleaned_pkl = work_dir / f"temporal_outlier_rejected_pose_{raw_pkl.stem}.pkl"
+    rgb_flow_recovered_pkl = work_dir / f"adjacent_rgb_flow_recovered_pose_{raw_pkl.stem}.pkl"
     outline_refine_pkl = work_dir / f"outline_recovered_pose_{raw_pkl.stem}.pkl"
     temporally_completed_pkl = work_dir / f"temporally_completed_pose_{raw_pkl.stem}.pkl"
     final_pose_pkl = work_dir / f"temporally_smoothed_pose_{raw_pkl.stem}.pkl"
@@ -583,16 +718,34 @@ def process_012_recording(
         loose_deeptag_pkl=deeptag_dense_loose_pkl,
         old_april_pkl=april_merged_pkl,
         output_pkl=fused_single_frame_pkl,
+        single_tag_edge_threshold=float(single_tag_edge_threshold),
+        single_tag_max_reproj=float(single_tag_max_reproj),
+        preferred_single_tag_id=preferred_single_tag_id,
+        prefer_deeptag_single_tag=bool(prefer_deeptag_single_tag),
     )
     reject_temporal_pose_outliers(
         input_pkl=fused_single_frame_pkl,
         output_pkl=temporal_cleaned_pkl,
     )
-    recover_poses_from_outlines(
-        input_pkl=temporal_cleaned_pkl,
-        raw_pkl=april_merged_pkl,
-        output_pkl=outline_refine_pkl,
-    )
+    if enable_adjacent_rgb_flow_recovery:
+        recover_poses_with_adjacent_rgb_flow(
+            input_pkl=temporal_cleaned_pkl,
+            raw_pkl=april_merged_pkl,
+            output_pkl=rgb_flow_recovered_pkl,
+            target_name=target_name,
+        )
+    else:
+        print("[STAGE] skip adjacent RGB-flow recovery", flush=True)
+        shutil.copy2(temporal_cleaned_pkl, rgb_flow_recovered_pkl)
+    if enable_temporal_outline_recovery:
+        recover_poses_from_outlines(
+            input_pkl=rgb_flow_recovered_pkl,
+            raw_pkl=april_merged_pkl,
+            output_pkl=outline_refine_pkl,
+        )
+    else:
+        print("[STAGE] skip long-range temporal outline recovery", flush=True)
+        shutil.copy2(rgb_flow_recovered_pkl, outline_refine_pkl)
     fill_remaining_poses_from_trajectory(
         input_pkl=outline_refine_pkl,
         raw_pkl=april_merged_pkl,
@@ -603,6 +756,10 @@ def process_012_recording(
         raw_pkl=april_merged_pkl,
         output_pkl=final_pose_pkl,
     )
+
+    if not merge_final_raw:
+        summarize_pose_stream(final_pose_pkl, "pose")
+        return final_pose_pkl
 
     merge_final_pose_stream(
         raw_pkl=raw_pkl,
@@ -3050,7 +3207,9 @@ def replay_008_main(args: Replay008ViewerConfig) -> None:
 
 
 # ---- RealSense recording and calibration helpers ----
-REALSENSE_DEFAULT_INTRINSICS_YAML = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_realsense_1280x720_0707_171032.yaml')
+# D435 color stream (SDK S/N 244222070135), calibrated at the native
+# 1920x1080 resolution used by multi_cam_record_0716_180451.pkl.
+REALSENSE_DEFAULT_INTRINSICS_YAML = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_d435_color_charuco_1920x1080_0716_130910_offline_filtered.yaml')
 REALSENSE_DEFAULT_CUBE_CFG = Path('/home/ps/project/ConSensV2Lab/thirdparty/aprilcube/cubes/cube_april_36h11_100_123_2x2x2_outer62p5mm')
 REALSENSE_PINHOLE_UNDISTORT_ALPHA = 0.0
 
@@ -3071,6 +3230,25 @@ def realsense_create_undistort_maps(calib: dict[str, Any], image_size: tuple[int
     dist_coeffs = np.asarray(calib.get('dist', np.zeros(5)), dtype=np.float64).reshape(-1)
     if dist_coeffs.size == 0 or np.allclose(dist_coeffs, 0.0):
         return None
+    if cv2_capture_is_fisheye_calib(calib):
+        if dist_coeffs.size != 4:
+            raise ValueError(
+                f"Fisheye calibration requires 4 distortion coefficients, got {dist_coeffs.size}"
+            )
+        detection_camera_matrix = cv2_capture_compute_detection_camera_matrix(
+            calib,
+            image_size,
+            undistort_before_detection=True,
+        )
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+            camera_matrix,
+            dist_coeffs.reshape(4, 1),
+            np.eye(3, dtype=np.float64),
+            detection_camera_matrix,
+            image_size,
+            cv2.CV_16SC2,
+        )
+        return (map1, map2, detection_camera_matrix)
     detection_camera_matrix, _roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, image_size, REALSENSE_PINHOLE_UNDISTORT_ALPHA, image_size)
     detection_camera_matrix = np.asarray(detection_camera_matrix, dtype=np.float64).reshape(3, 3)
     map1, map2 = cv2.initUndistortRectifyMap(camera_matrix, dist_coeffs, np.eye(3, dtype=np.float64), detection_camera_matrix, image_size, cv2.CV_16SC2)
@@ -4547,7 +4725,13 @@ def dense_deeptag_dense_points_for_frame(
     face_id_sets: dict[str, set[int]] | None = None,
     min_tags: int,
     require_validated_corner_order: bool = True,
+    unclustered_corner_order: str = 'rot180',
 ) -> tuple[np.ndarray, np.ndarray, list[int], dict[int, int], dict[str, Any]]:
+    if str(unclustered_corner_order) not in DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS:
+        raise ValueError(
+            f'Unsupported unclustered DeepTag corner order: {unclustered_corner_order}'
+        )
+    unclustered_corner_order = str(unclustered_corner_order)
     cluster_orders = frame.get('cluster_stats', {}).get('cluster_corner_orders', {}) or {}
     cluster_orders = {
         int(k): str(v)
@@ -4558,7 +4742,11 @@ def dense_deeptag_dense_points_for_frame(
     for order in cluster_orders.values():
         if order in DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS:
             order_votes[order] = order_votes.get(order, 0) + 1
-    dominant_order = max(order_votes.items(), key=lambda item: item[1])[0] if order_votes else 'id'
+    dominant_order = (
+        max(order_votes.items(), key=lambda item: item[1])[0]
+        if order_votes
+        else unclustered_corner_order
+    )
     decoded_by_id: dict[int, dict[str, Any]] = {}
     for decoded in frame.get('decoded_tags', []) or []:
         if not decoded.get('is_valid', False):
@@ -4599,7 +4787,10 @@ def dense_deeptag_dense_points_for_frame(
             continue
         local_xy = dense_deeptag_dense_local_annotations(image_points.shape[0])
         corner_order = cluster_orders.get(
-            int(tag_id), 'id' if int(tag_id) in single_face_joint_ids else dominant_order
+            int(tag_id),
+            unclustered_corner_order
+            if int(tag_id) in single_face_joint_ids
+            else dominant_order,
         )
         affine_t = dense_deeptag_local_to_cube_affine(tag_corner_map[tag_id], corner_order)
         object_points = np.c_[local_xy, np.ones(local_xy.shape[0], dtype=np.float64)] @ affine_t
@@ -4617,6 +4808,7 @@ def dense_deeptag_dense_points_for_frame(
             {
                 'reason': f'dense_{validation_name}_too_small:{len(tag_ids)}<{int(min_tags)}',
                 'point_order_validation': ('per_tag_cluster_or_single_face_joint_pnp' if require_validated_corner_order else 'dominant_fallback'),
+                'unclustered_corner_order': unclustered_corner_order,
                 'decoded_tag_ids': decoded_tag_ids,
                 'validated_order_tag_ids': sorted(individually_or_jointly_validated_ids),
                 'single_face_joint_order_tag_ids': sorted(single_face_joint_ids),
@@ -4631,6 +4823,7 @@ def dense_deeptag_dense_points_for_frame(
         {
             'cluster_corner_order_count': int(len(cluster_orders)),
             'point_order_validation': ('per_tag_cluster_or_single_face_joint_pnp' if require_validated_corner_order else 'dominant_fallback'),
+            'unclustered_corner_order': unclustered_corner_order,
             'corner_order_fallback': None if require_validated_corner_order else dominant_order,
             'used_fallback_order_tag_ids': [] if require_validated_corner_order else [int(tag_id) for tag_id in tag_ids if int(tag_id) not in cluster_orders],
             'decoded_tag_ids': decoded_tag_ids,
@@ -5047,6 +5240,14 @@ def dense_deeptag_main(args: DenseDeepTagPoseConfig) -> None:
     if args.max_frames > 0:
         offsets = offsets[:int(args.max_frames)]
     runtime = dense_deeptag_make_runtime(header)
+    unclustered_corner_order = str(
+        runtime['metadata'].get('corner_order', 'rot180')
+    )
+    if unclustered_corner_order not in DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS:
+        raise ValueError(
+            'DeepTag input metadata has unsupported corner_order: '
+            f'{unclustered_corner_order}'
+        )
     source_path, source_offsets, script012, undistort_pack = dense_deeptag_make_source_frame_loader(header)
     output_pkl = Path(args.output_pkl).expanduser().resolve()
     output_pkl.parent.mkdir(parents=True, exist_ok=True)
@@ -5054,10 +5255,10 @@ def dense_deeptag_main(args: DenseDeepTagPoseConfig) -> None:
     total_points = 0
     t0 = time.perf_counter()
     with output_pkl.open('wb') as f:
-        pickle.dump({'type': 'header', 'format': 'deeptag_012_offline_stream_v1', 'source_pkl': str(input_pkl), 'source_footer': footer, 'metadata': {'script': str(DENSE_DEEPTAG_THIS_FILE), 'method': 'DeepTag dense keypoints with per-tag validated point order and point-retention gates; single-face frames use cfg face-frame IPPE then fixed face-to-cube transform; multiface frames use cube-frame all-point PnP; no temporal filter', 'cube_cfg': str(runtime['cube_cfg']), 'camera_matrix': runtime['camera_matrix'].tolist(), 'dist_coeffs': runtime['dist_coeffs'].tolist(), 'frame_count': int(len(offsets)), 'min_tags': int(args.min_tags), 'ransac_reproj': float(args.ransac_reproj), 'max_reproj': float(args.max_reproj), 'point_reject_px': float(args.point_reject_px), 'tag_reject_px': float(args.tag_reject_px), 'min_inlier_tag_fraction': float(args.min_inlier_tag_fraction), 'coverage_check_min_raw_tags': int(args.coverage_check_min_raw_tags), 'max_required_inlier_tags': int(args.max_required_inlier_tags), 'require_validated_corner_order': bool(args.require_validated_corner_order), 'min_point_inlier_fraction': float(args.min_point_inlier_fraction), 'min_per_tag_inlier_fraction': float(args.min_per_tag_inlier_fraction), 'min_per_tag_inlier_points': int(args.min_per_tag_inlier_points), 'input_header': dense_deeptag_to_json_compatible(header)}}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump({'type': 'header', 'format': 'deeptag_012_offline_stream_v1', 'source_pkl': str(input_pkl), 'source_footer': footer, 'metadata': {'script': str(DENSE_DEEPTAG_THIS_FILE), 'method': 'DeepTag dense keypoints with per-tag validated point order and point-retention gates; single-face frames use cfg face-frame IPPE then fixed face-to-cube transform; multiface frames use cube-frame all-point PnP; no temporal filter', 'cube_cfg': str(runtime['cube_cfg']), 'camera_matrix': runtime['camera_matrix'].tolist(), 'dist_coeffs': runtime['dist_coeffs'].tolist(), 'frame_count': int(len(offsets)), 'min_tags': int(args.min_tags), 'ransac_reproj': float(args.ransac_reproj), 'max_reproj': float(args.max_reproj), 'point_reject_px': float(args.point_reject_px), 'tag_reject_px': float(args.tag_reject_px), 'min_inlier_tag_fraction': float(args.min_inlier_tag_fraction), 'coverage_check_min_raw_tags': int(args.coverage_check_min_raw_tags), 'max_required_inlier_tags': int(args.max_required_inlier_tags), 'require_validated_corner_order': bool(args.require_validated_corner_order), 'unclustered_corner_order': unclustered_corner_order, 'min_point_inlier_fraction': float(args.min_point_inlier_fraction), 'min_per_tag_inlier_fraction': float(args.min_per_tag_inlier_fraction), 'min_per_tag_inlier_points': int(args.min_per_tag_inlier_points), 'input_header': dense_deeptag_to_json_compatible(header)}}, f, protocol=pickle.HIGHEST_PROTOCOL)
         for out_idx, offset in enumerate(offsets):
             frame = dense_deeptag_load_at(input_pkl, offset)
-            object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(frame, tag_corner_map=runtime['tag_corner_map'], face_id_sets=runtime['face_id_sets'], min_tags=int(args.min_tags), require_validated_corner_order=bool(args.require_validated_corner_order))
+            object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(frame, tag_corner_map=runtime['tag_corner_map'], face_id_sets=runtime['face_id_sets'], min_tags=int(args.min_tags), require_validated_corner_order=bool(args.require_validated_corner_order), unclustered_corner_order=unclustered_corner_order)
             if object_points.shape[0] >= 4:
                 pose = dense_deeptag_solve_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=runtime['cube_config'], face_id_sets=runtime['face_id_sets'], camera_matrix=runtime['camera_matrix'], dist_coeffs=runtime['dist_coeffs'], ransac_reproj=float(args.ransac_reproj), max_reproj=float(args.max_reproj), point_reject_px=float(args.point_reject_px), tag_reject_px=float(args.tag_reject_px), min_tags=int(args.min_tags), min_inlier_tag_fraction=float(args.min_inlier_tag_fraction), coverage_check_min_raw_tags=int(args.coverage_check_min_raw_tags), max_required_inlier_tags=int(args.max_required_inlier_tags), min_point_inlier_fraction=float(args.min_point_inlier_fraction), min_per_tag_inlier_fraction=float(args.min_per_tag_inlier_fraction), min_per_tag_inlier_points=int(args.min_per_tag_inlier_points))
             else:
@@ -5439,9 +5640,17 @@ def single_frame_fusion_tag_center_multiface_pose(bm: Any, detections: list[tupl
     pose = {'success': True, 'pose_source': 'tag_center_multiface_pnp', 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': pose_recovery_pose_transform(rvec, tvec), 'reproj_error': reproj, 'n_tags': len(used_ids), 'tag_ids': used_ids, 'visible_faces': sorted(used_faces), 'pose_filled': False, 'reproj_metric': 'tag_center_mean_px'}
     return RecoveryPoseCandidate(True, 'tag_center_multiface_pnp', frame_index, pose, used_ids, reproj)
 
-def single_frame_fusion_apriltag_single_tag_pose(bm: Any, detections: list[tuple[int, np.ndarray]], gray: np.ndarray, *, config: Any, tag_corner_map: dict[int, np.ndarray], face_id_sets: dict[str, set[int]], camera_matrix: np.ndarray, dist_coeffs: np.ndarray, frame_index: int, max_reproj: float) -> Any:
+def single_frame_fusion_apriltag_single_tag_pose(bm: Any, detections: list[tuple[int, np.ndarray]], gray: np.ndarray, *, config: Any, tag_corner_map: dict[int, np.ndarray], face_id_sets: dict[str, set[int]], camera_matrix: np.ndarray, dist_coeffs: np.ndarray, frame_index: int, max_reproj: float, preferred_tag_id: int | None = None) -> Any:
     best: Any | None = None
-    for tag_id, corners in detections:
+    ordered_detections = sorted(
+        detections,
+        key=lambda item: (
+            0
+            if preferred_tag_id is not None and int(item[0]) == int(preferred_tag_id)
+            else 1
+        ),
+    )
+    for tag_id, corners in ordered_detections:
         try:
             ok, rvec, tvec, reproj, _inliers, meta = estimate_single_tag_cube_pose([(int(tag_id), np.asarray(corners, dtype=np.float64).reshape(4, 2))], tag_corner_map, face_id_sets, camera_matrix, dist_coeffs, allow_corner_rotations=not bool(config.tag_pattern_mirrored))
         except cv2.error:
@@ -5455,14 +5664,25 @@ def single_frame_fusion_apriltag_single_tag_pose(bm: Any, detections: list[tuple
         pose = {'success': True, 'pose_source': 'apriltag_single_tag_cfg_pose', 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': pose_recovery_pose_transform(rvec, tvec), 'reproj_error': float(reproj), 'n_tags': 1, 'tag_ids': [tag_id], 'visible_faces': [str(face_name)] if face_name else [], 'pose_filled': False, 'single_tag_cfg_pose': True, 'single_tag_meta': meta}
         edge_score = pose_recovery_edge_alignment_score(gray, pose, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
         candidate = RecoveryPoseCandidate(True, 'apriltag_single_tag_cfg_pose', frame_index, pose, [tag_id], float(reproj), edge_score=edge_score)
-        if best is None or (candidate.edge_score, -candidate.reproj_error) > (best.edge_score or 0.0, -best.reproj_error):
+        candidate_priority = int(
+            preferred_tag_id is not None and int(tag_id) == int(preferred_tag_id)
+        )
+        best_priority = (
+            -1
+            if best is None
+            else int(
+                preferred_tag_id is not None
+                and int(best.tag_ids[0]) == int(preferred_tag_id)
+            )
+        )
+        if best is None or (candidate_priority, candidate.edge_score, -candidate.reproj_error) > (best_priority, best.edge_score or 0.0, -best.reproj_error):
             best = candidate
     if best is None:
         return RecoveryPoseCandidate(False, 'apriltag_single_tag_cfg_pose', frame_index, {}, [], float('inf'), failure_reason='no_single_tag_cfg_candidate')
     return best
 
-def single_frame_fusion_deeptag_single_tag_dense_pose(bm: Any, dense020: Any, deeptag_frame: dict[str, Any], gray: np.ndarray, *, config: Any, tag_corner_map: dict[int, np.ndarray], face_id_sets: dict[str, set[int]], camera_matrix: np.ndarray, dist_coeffs: np.ndarray, frame_index: int, max_reproj: float) -> Any:
-    object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(deeptag_frame, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, min_tags=1)
+def single_frame_fusion_deeptag_single_tag_dense_pose(bm: Any, dense020: Any, deeptag_frame: dict[str, Any], gray: np.ndarray, *, config: Any, tag_corner_map: dict[int, np.ndarray], face_id_sets: dict[str, set[int]], camera_matrix: np.ndarray, dist_coeffs: np.ndarray, frame_index: int, max_reproj: float, unclustered_corner_order: str = 'rot180', preferred_tag_id: int | None = None) -> Any:
+    object_points, image_points, tag_ids, point_counts, dense_stats = dense_deeptag_dense_points_for_frame(deeptag_frame, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, min_tags=1, unclustered_corner_order=unclustered_corner_order)
     if object_points.shape[0] < 4:
         return RecoveryPoseCandidate(False, 'deeptag_single_tag_dense_pose', frame_index, {}, tag_ids, float('inf'), failure_reason=str(dense_stats.get('reason', 'dense_single_tag_no_points')))
     pose = dense_deeptag_solve_dense_pose(object_points, image_points, tag_ids, point_counts, cube_config=config, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, ransac_reproj=4.0, max_reproj=float(max_reproj), point_reject_px=8.0, tag_reject_px=8.0, min_tags=1, min_inlier_tag_fraction=0.0, coverage_check_min_raw_tags=999, max_required_inlier_tags=4)
@@ -5473,6 +5693,10 @@ def single_frame_fusion_deeptag_single_tag_dense_pose(bm: Any, dense020: Any, de
         return RecoveryPoseCandidate(False, 'deeptag_single_tag_dense_pose', frame_index, {}, used_ids, float(pose.get('reproj_error', float('inf'))), failure_reason=f'dense_single_tag_used_count:{len(used_ids)}')
     pose = copy.deepcopy(pose)
     pose['pose_source'] = 'deeptag_single_tag_dense_pose'
+    pose['preferred_single_tag_id'] = preferred_tag_id
+    pose['preferred_single_tag_used'] = bool(
+        preferred_tag_id is not None and used_ids == [int(preferred_tag_id)]
+    )
     pose['dense_stats'] = {**dense_stats, 'raw_tag_ids': tag_ids, 'raw_point_counts': point_counts}
     edge_score = pose_recovery_edge_alignment_score(gray, pose, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
     return RecoveryPoseCandidate(True, 'deeptag_single_tag_dense_pose', frame_index, pose, used_ids, float(pose.get('reproj_error', float('inf'))), edge_score=edge_score)
@@ -5485,6 +5709,16 @@ def single_frame_fusion_main(args: SingleFrameFusionConfig) -> None:
     dt_header, dt_frames, dt_footer = pose_recovery_load_pose_records(args.deeptag_pose_pkl)
     ap_header, ap_frames, ap_footer = pose_recovery_load_pose_records(args.april_strict_pkl)
     deeptag_raw_header, deeptag_raw_offsets, deeptag_raw_footer = pose_recovery_build_stream_index(args.deeptag_raw_pkl, {'deeptag_012_offline_stream_v1'})
+    unclustered_corner_order = str(
+        (deeptag_raw_header.get('metadata', {}) or {}).get(
+            'corner_order', 'rot180'
+        )
+    )
+    if unclustered_corner_order not in DENSE_DEEPTAG_CORNER_ORDER_TRANSFORMS:
+        raise ValueError(
+            'DeepTag input metadata has unsupported corner_order: '
+            f'{unclustered_corner_order}'
+        )
     loose_header, loose_frames, loose_footer = pose_recovery_load_pose_records(args.loose_deeptag_pkl)
     old_header, old_frames, old_footer = pose_recovery_load_pose_records(args.old_april_pkl)
     metadata: dict[str, Any] = {}
@@ -5515,7 +5749,7 @@ def single_frame_fusion_main(args: SingleFrameFusionConfig) -> None:
     args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     with args.output_pkl.open('wb') as f:
-        pickle.dump({'type': 'header', 'format': 'aprilcube_deeptag_fused_stream_v1', 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'source_raw_pkl': str(args.raw_pkl.resolve()), 'source_deeptag_pose_pkl': str(args.deeptag_pose_pkl.resolve()), 'source_april_strict_pkl': str(args.april_strict_pkl.resolve()), 'source_deeptag_raw_pkl': str(args.deeptag_raw_pkl.resolve()), 'source_loose_deeptag_pkl': str(args.loose_deeptag_pkl.resolve()), 'source_old_april_pkl': str(args.old_april_pkl.resolve()), 'raw_footer': raw_footer, 'deeptag_footer': dt_footer, 'april_footer': ap_footer, 'deeptag_raw_footer': deeptag_raw_footer, 'loose_footer': loose_footer, 'old_footer': old_footer, 'metadata': {'script': str(SINGLE_FRAME_FUSION_THIS_FILE), 'method': 'single-frame cascade: DeepTag coverage/min-tag2, strict AprilCube, tag-center multiface PnP, face board, AprilTag preprocessing sweep, DeepTag-AprilTag cross validation, edge-checked loose candidates; no temporal filter or fill', 'frame_count': len(frame_indices), 'min_tags': int(args.min_tags), 'max_reproj': float(args.max_reproj), 'edge_threshold': float(args.edge_threshold), 'single_tag_edge_threshold': float(args.single_tag_edge_threshold), 'single_tag_max_reproj': float(args.single_tag_max_reproj)}}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump({'type': 'header', 'format': 'aprilcube_deeptag_fused_stream_v1', 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'source_raw_pkl': str(args.raw_pkl.resolve()), 'source_deeptag_pose_pkl': str(args.deeptag_pose_pkl.resolve()), 'source_april_strict_pkl': str(args.april_strict_pkl.resolve()), 'source_deeptag_raw_pkl': str(args.deeptag_raw_pkl.resolve()), 'source_loose_deeptag_pkl': str(args.loose_deeptag_pkl.resolve()), 'source_old_april_pkl': str(args.old_april_pkl.resolve()), 'raw_footer': raw_footer, 'deeptag_footer': dt_footer, 'april_footer': ap_footer, 'deeptag_raw_footer': deeptag_raw_footer, 'loose_footer': loose_footer, 'old_footer': old_footer, 'metadata': {'script': str(SINGLE_FRAME_FUSION_THIS_FILE), 'method': 'single-frame cascade with optional preferred single-tag DeepTag priority; no temporal filter or fill', 'frame_count': len(frame_indices), 'min_tags': int(args.min_tags), 'max_reproj': float(args.max_reproj), 'edge_threshold': float(args.edge_threshold), 'single_tag_edge_threshold': float(args.single_tag_edge_threshold), 'single_tag_max_reproj': float(args.single_tag_max_reproj), 'preferred_single_tag_id': args.preferred_single_tag_id, 'prefer_deeptag_single_tag': bool(args.prefer_deeptag_single_tag), 'unclustered_corner_order': unclustered_corner_order}}, f, protocol=pickle.HIGHEST_PROTOCOL)
         for out_idx, frame_index in enumerate(frame_indices):
             dt_frame = dt_frames[frame_index]
             ap_frame = ap_frames[frame_index]
@@ -5546,7 +5780,10 @@ def single_frame_fusion_main(args: SingleFrameFusionConfig) -> None:
                     cand.edge_score = pose_recovery_edge_alignment_score(gray, cand.pose, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
                     if cand.edge_score >= float(args.edge_threshold) and (best_edge is None or (cand.edge_score, -cand.reproj_error) > (best_edge.edge_score or 0.0, -best_edge.reproj_error)):
                         best_edge = cand
-                stage_candidates.extend([('stage7_edge_checked_loose_candidate', 'G', best_edge or RecoveryPoseCandidate(False, 'edge_checked_loose_candidates', int(frame_index), {}, [], float('inf'), failure_reason='no_edge_accepted_candidate')), ('stage8_apriltag_single_tag_cfg_edge', 'H', single_frame_fusion_apriltag_single_tag_pose(bm, detections, gray, config=config, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, frame_index=int(frame_index), max_reproj=float(args.single_tag_max_reproj))), ('stage9_deeptag_single_tag_dense_edge', 'I', single_frame_fusion_deeptag_single_tag_dense_pose(bm, dense020, deeptag_raw, gray, config=config, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, frame_index=int(frame_index), max_reproj=float(args.single_tag_max_reproj)))])
+                stage8 = ('stage8_apriltag_single_tag_cfg_edge', 'H', single_frame_fusion_apriltag_single_tag_pose(bm, detections, gray, config=config, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, frame_index=int(frame_index), max_reproj=float(args.single_tag_max_reproj), preferred_tag_id=args.preferred_single_tag_id))
+                stage9 = ('stage9_deeptag_single_tag_dense_edge', 'I', single_frame_fusion_deeptag_single_tag_dense_pose(bm, dense020, deeptag_raw, gray, config=config, tag_corner_map=tag_corner_map, face_id_sets=face_id_sets, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs, frame_index=int(frame_index), max_reproj=float(args.single_tag_max_reproj), unclustered_corner_order=unclustered_corner_order, preferred_tag_id=args.preferred_single_tag_id))
+                stage_candidates.append(('stage7_edge_checked_loose_candidate', 'G', best_edge or RecoveryPoseCandidate(False, 'edge_checked_loose_candidates', int(frame_index), {}, [], float('inf'), failure_reason='no_edge_accepted_candidate')))
+                stage_candidates.extend([stage9, stage8] if args.prefer_deeptag_single_tag else [stage8, stage9])
                 pose_candidates['recovery_detected_tag_ids'] = [int(v[0]) for v in detections]
                 fused_pose = single_frame_fusion_failure_pose('no_single_frame_method_accepted')
                 for source, quality, candidate in stage_candidates:
@@ -6023,7 +6260,7 @@ def outline_recovery_main(args: OutlinePoseRecoveryConfig) -> None:
     print(f"[INFO] remaining_failed={out_footer['remaining_failed_frames']}")
 
 
-# ---- Global temporal fill ----
+# ---- Short local bracket interpolation ----
 TEMPORAL_COMPLETION_THIS_FILE = Path(__file__).resolve()
 TEMPORAL_COMPLETION_APRILCUBE_ROOT = TEMPORAL_COMPLETION_THIS_FILE.parent.parent
 TEMPORAL_COMPLETION_DEFAULT_INPUT_PKL = TEMPORAL_COMPLETION_APRILCUBE_ROOT / 'recordings/024_temporal_outline_refine_recovery_conservative_fixed.pkl'
@@ -6051,7 +6288,7 @@ def temporal_completion_draw_overlay(script012: Any, draw_detector: Any, detect_
     result = {'success': bool(pose.get('success', False)), 'detections': [], 'rvec': np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1) if pose.get('success', False) else None, 'tvec': np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1) if pose.get('success', False) else None, 'reproj_error': float(pose.get('reproj_error', float('inf'))), 'n_tags': int(pose.get('n_tags', 0) or 0), 'visible_faces': set(pose.get('visible_faces', []) or []), 'predicted': False}
     vis = draw_detector.draw_result(base.copy(), result)
     cv2.rectangle(vis, (8, 8), (1180, 66), (0, 0, 0), -1)
-    cv2.putText(vis, f"Global temporal fill: {pose.get('pose_source', '')}", (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(vis, f"Local bracket interpolation: {pose.get('pose_source', '')}", (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(vis, str(pose.get('quality_reason', ''))[:120], (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
     return temporal_completion_encode_bgr_jpeg(vis, quality)
 
@@ -6079,20 +6316,15 @@ def temporal_completion_main(args: TemporalPoseCompletionConfig) -> None:
     indices = sorted(frames)
     valid_indices = [idx for idx in indices if bool(frames[idx].get('pose', {}).get('success', False))]
     failed_indices = [idx for idx in indices if idx not in valid_indices]
-    if len(valid_indices) < 4:
+    if len(valid_indices) < 2:
         args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(args.input_pkl, args.output_pkl)
         print(
-            '[WARN] Skipping global temporal fill: '
-            f'need at least 4 valid poses, got {len(valid_indices)}; '
+            '[WARN] Skipping local bracket interpolation: '
+            f'need at least 2 valid poses, got {len(valid_indices)}; '
             f'copied input stream to {args.output_pkl}'
         )
         return
-    x = np.asarray(valid_indices, dtype=np.float64)
-    translations = np.vstack([np.asarray(frames[idx]['pose']['tvec'], dtype=np.float64).reshape(3) for idx in valid_indices])
-    splines = [UnivariateSpline(x, translations[:, dim], k=3, s=float(args.translation_smooth)) for dim in range(3)]
-    rotations = Rotation.from_matrix(np.stack([temporal_completion_rotation_from_rvec(frames[idx]['pose']['rvec']) for idx in valid_indices], axis=0))
-    slerp = Slerp(x, rotations)
     filled: dict[int, dict[str, Any]] = {}
     rejected: dict[int, str] = {}
     for idx in failed_indices:
@@ -6106,14 +6338,41 @@ def temporal_completion_main(args: TemporalPoseCompletionConfig) -> None:
         if gap > int(args.max_bracket_gap):
             rejected[idx] = f'bracket_gap_too_large:{gap}>{int(args.max_bracket_gap)}'
             continue
-        tvec = np.array([spline(float(idx)) for spline in splines], dtype=np.float64).reshape(3, 1)
-        rvec = slerp([float(idx)]).as_rotvec()[0].reshape(3, 1).astype(np.float64)
+        prev_timestamp = frames[prev_idx].get('capture_timestamp', None)
+        current_timestamp = frames[idx].get('capture_timestamp', None)
+        next_timestamp = frames[next_idx].get('capture_timestamp', None)
+        use_capture_time = all(
+            value is not None and np.isfinite(float(value))
+            for value in (prev_timestamp, current_timestamp, next_timestamp)
+        ) and float(next_timestamp) > float(prev_timestamp)
+        if use_capture_time:
+            alpha = (
+                (float(current_timestamp) - float(prev_timestamp))
+                / (float(next_timestamp) - float(prev_timestamp))
+            )
+            interpolation_clock = 'capture_timestamp'
+        else:
+            alpha = float(idx - prev_idx) / float(next_idx - prev_idx)
+            interpolation_clock = 'frame_index'
+        if not (0.0 < alpha < 1.0):
+            rejected[idx] = f'invalid_interpolation_alpha:{alpha:.6f}'
+            continue
+        prev_pose = frames[prev_idx]['pose']
+        next_pose = frames[next_idx]['pose']
+        prev_tvec = np.asarray(prev_pose['tvec'], dtype=np.float64).reshape(3)
+        next_tvec = np.asarray(next_pose['tvec'], dtype=np.float64).reshape(3)
+        tvec = ((1.0 - alpha) * prev_tvec + alpha * next_tvec).reshape(3, 1)
+        endpoint_rotations = Rotation.from_matrix(np.stack([
+            temporal_completion_rotation_from_rvec(prev_pose['rvec']),
+            temporal_completion_rotation_from_rvec(next_pose['rvec']),
+        ], axis=0))
+        rvec = Slerp([0.0, 1.0], endpoint_rotations)([alpha]).as_rotvec()[0].reshape(3, 1).astype(np.float64)
         raw_record = pose_recovery_load_at(args.raw_pkl, raw_offset_by_frame[int(idx)])
         image = np.asarray(raw_record['image_bgr'], dtype=np.uint8)
         detect_frame = realsense_undistort_frame(image, undistort_pack)
         gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
         edge_score = pose_recovery_edge_alignment_score(gray, {'success': True, 'rvec': rvec, 'tvec': tvec}, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
-        filled[idx] = {'success': True, 'pose_source': 'stage11_global_temporal_filter_fill', 'quality_level': 'F', 'quality_reason': f'global_temporal_fill;bracket:{prev_idx}-{next_idx};gap:{gap};edge:{edge_score:.2f}', 'pose_filled': True, 'temporal_filter_fill': True, 'single_frame_only': False, 'rvec': rvec, 'tvec': tvec, 'T': temporal_completion_make_pose_transform(rvec, tvec), 'reproj_error': float('nan'), 'n_tags': 0, 'tag_ids': [], 'visible_faces': [], 'edge_score': float(edge_score), 'prev_success_frame': int(prev_idx), 'next_success_frame': int(next_idx), 'bracket_gap': int(gap), 'translation_smooth': float(args.translation_smooth)}
+        filled[idx] = {'success': True, 'pose_source': 'stage11_local_bracket_se3_interpolation', 'quality_level': 'F', 'quality_reason': f'local_bracket_se3_interpolation;bracket:{prev_idx}-{next_idx};gap:{gap};alpha:{alpha:.4f};clock:{interpolation_clock};edge:{edge_score:.2f}', 'pose_filled': True, 'temporal_filter_fill': True, 'local_temporal_interpolation': True, 'single_frame_only': False, 'rvec': rvec, 'tvec': tvec, 'T': temporal_completion_make_pose_transform(rvec, tvec), 'reproj_error': float('nan'), 'n_tags': 0, 'tag_ids': [], 'visible_faces': [], 'edge_score': float(edge_score), 'prev_success_frame': int(prev_idx), 'next_success_frame': int(next_idx), 'bracket_gap': int(gap), 'interpolation_alpha': float(alpha), 'interpolation_clock': interpolation_clock}
     args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
     quality_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
@@ -6124,7 +6383,7 @@ def temporal_completion_main(args: TemporalPoseCompletionConfig) -> None:
         out_header['source_input_pkl'] = str(args.input_pkl.resolve())
         out_header['source_raw_pkl'] = str(args.raw_pkl.resolve())
         out_header['raw_footer'] = raw_footer
-        out_header['metadata'] = {**(out_header.get('metadata', {}) or {}), 'script': str(TEMPORAL_COMPLETION_THIS_FILE), 'method': 'fill only remaining failed frames from whole-sequence temporal pose trajectory', 'translation_smooth': float(args.translation_smooth), 'max_bracket_gap': int(args.max_bracket_gap)}
+        out_header['metadata'] = {**(out_header.get('metadata', {}) or {}), 'script': str(TEMPORAL_COMPLETION_THIS_FILE), 'method': 'fill only short missing runs by local bracketed translation interpolation and rotation SLERP', 'max_bracket_gap': int(args.max_bracket_gap)}
         pickle.dump(out_header, f, protocol=pickle.HIGHEST_PROTOCOL)
         for idx in indices:
             frame = copy.deepcopy(frames[idx])
@@ -6134,7 +6393,7 @@ def temporal_completion_main(args: TemporalPoseCompletionConfig) -> None:
                 detect_frame = realsense_undistort_frame(image, undistort_pack)
                 frame['pose_original'] = copy.deepcopy(frame.get('pose', {}))
                 frame['pose'] = filled[idx]
-                frame['selected_stage'] = 'stage11_global_temporal_filter_fill'
+                frame['selected_stage'] = 'stage11_local_bracket_se3_interpolation'
                 frame['overlay_jpeg'] = temporal_completion_draw_overlay(script012, draw_detector, detect_frame, filled[idx], int(args.jpeg_quality))
                 frame['overlay_format'] = 'jpeg_bgr'
                 frame['overlay_shape'] = tuple((int(v) for v in detect_frame.shape))
@@ -6169,8 +6428,11 @@ def temporal_smoothing_quality_weight(pose: dict[str, Any]) -> float:
         'E': 1.3,
         'F': 0.8,
         'G': 1.2,
-        'H': 1.0,
-        'I': 1.0,
+        # A planar AprilTag/IPPE pose is useful as a fallback but is less
+        # stable than the dense DeepTag estimate on the near-frontal middle
+        # finger view.
+        'H': 0.7,
+        'I': 2.0,
         'T': 0.8,
     }.get(str(pose.get('quality_level', '')), 1.0)
     if bool(pose.get('pose_filled', False)):
@@ -6179,21 +6441,34 @@ def temporal_smoothing_quality_weight(pose: dict[str, Any]) -> float:
 
 
 def temporal_smoothing_weighted_pose(
-    samples: list[tuple[int, dict[str, Any]]],
+    samples: list[tuple[int, float | None, dict[str, Any]]],
     *,
     target_idx: int,
+    target_timestamp: float | None,
     sigma_frames: float,
+    sigma_seconds: float,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    sigma = max(float(sigma_frames), 1e-6)
+    frame_sigma = max(float(sigma_frames), 1e-6)
+    time_sigma = max(float(sigma_seconds), 1e-6)
     weights: list[float] = []
     translations: list[np.ndarray] = []
     quaternions: list[np.ndarray] = []
-    target_pose = next(pose for idx, pose in samples if int(idx) == int(target_idx))
+    target_pose = next(pose for idx, _timestamp, pose in samples if int(idx) == int(target_idx))
     reference_quat = Rotation.from_rotvec(
         np.asarray(target_pose['rvec'], dtype=np.float64).reshape(3)
     ).as_quat()
-    for idx, pose in samples:
-        distance = abs(int(idx) - int(target_idx))
+    for idx, timestamp, pose in samples:
+        if (
+            target_timestamp is not None
+            and timestamp is not None
+            and np.isfinite(float(target_timestamp))
+            and np.isfinite(float(timestamp))
+        ):
+            distance = abs(float(timestamp) - float(target_timestamp))
+            sigma = time_sigma
+        else:
+            distance = abs(int(idx) - int(target_idx))
+            sigma = frame_sigma
         weight = float(np.exp(-0.5 * (float(distance) / sigma) ** 2))
         weight *= temporal_smoothing_quality_weight(pose)
         if int(idx) == int(target_idx):
@@ -6374,23 +6649,47 @@ def temporal_pose_smoothing_main(args: TemporalPoseSmoothingConfig) -> None:
     )
     indices = sorted(frames)
     source_poses = {idx: copy.deepcopy(frames[idx].get('pose', {})) for idx in indices}
+    capture_timestamps = {
+        idx: (
+            float(frames[idx]['capture_timestamp'])
+            if frames[idx].get('capture_timestamp') is not None
+            and np.isfinite(float(frames[idx]['capture_timestamp']))
+            else None
+        )
+        for idx in indices
+    }
     if any((not bool(source_poses[idx].get('success', False))) for idx in indices):
         failed = [idx for idx in indices if not bool(source_poses[idx].get('success', False))]
-        raise ValueError(f'Cannot smooth incomplete pose stream; failed frames={failed}')
+        args.output_pkl.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.input_pkl, args.output_pkl)
+        print(
+            '[WARN] Skipping constrained temporal smoothing because the pose stream '
+            f'is incomplete; failed frames={failed}; copied input to {args.output_pkl}'
+        )
+        return
     smoothed_poses: dict[int, dict[str, Any]] = {}
     smoothed_count = 0
     edge_rejected_count = 0
     for idx in indices:
         source_pose = source_poses[idx]
+        target_timestamp = capture_timestamps[idx]
         samples = [
-            (neighbor_idx, source_poses[neighbor_idx])
+            (neighbor_idx, capture_timestamps[neighbor_idx], source_poses[neighbor_idx])
             for neighbor_idx in indices
             if abs(int(neighbor_idx) - int(idx)) <= int(args.window_radius)
+            and (
+                target_timestamp is None
+                or capture_timestamps[neighbor_idx] is None
+                or abs(float(capture_timestamps[neighbor_idx]) - float(target_timestamp))
+                <= float(args.window_seconds)
+            )
         ]
         candidate_rvec, candidate_tvec, source_count = temporal_smoothing_weighted_pose(
             samples,
             target_idx=int(idx),
+            target_timestamp=target_timestamp,
             sigma_frames=float(args.sigma_frames),
+            sigma_seconds=float(args.sigma_seconds),
         )
         is_filled = bool(source_pose.get('pose_filled', False)) or str(
             source_pose.get('quality_level', '')
@@ -6494,6 +6793,8 @@ def temporal_pose_smoothing_main(args: TemporalPoseSmoothingConfig) -> None:
             'method': 'quality-weighted symmetric SE(3) smoothing with per-frame motion caps and RGB edge-alignment guard',
             'temporal_smoothing_window_radius': int(args.window_radius),
             'temporal_smoothing_sigma_frames': float(args.sigma_frames),
+            'temporal_smoothing_window_seconds': float(args.window_seconds),
+            'temporal_smoothing_sigma_seconds': float(args.sigma_seconds),
             'temporal_smoothing_max_measured_translation_delta_mm': float(args.max_measured_translation_delta_mm),
             'temporal_smoothing_max_measured_rotation_delta_deg': float(args.max_measured_rotation_delta_deg),
             'temporal_smoothing_max_filled_translation_delta_mm': float(args.max_filled_translation_delta_mm),
@@ -6537,16 +6838,5815 @@ def temporal_pose_smoothing_main(args: TemporalPoseSmoothingConfig) -> None:
     )
 
 
-def main() -> None:
-    if len(sys.argv) > 1:
-        raise SystemExit("020_finalize_pose_postprocess.py does not accept CLI args; edit constants at the top.")
+def adjacent_rgb_flow_pose_valid(pose: dict[str, Any]) -> bool:
+    if not bool(pose.get("success", False)):
+        return False
+    try:
+        values = np.r_[
+            np.asarray(pose["rvec"], dtype=np.float64).reshape(3),
+            np.asarray(pose["tvec"], dtype=np.float64).reshape(3),
+        ]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.all(np.isfinite(values)))
 
-    fmt = inspect_pkl_format(INPUT_PKL.expanduser().resolve())
+
+def adjacent_rgb_flow_rotation_delta_deg(first: Any, second: Any) -> float:
+    first_matrix = pose_recovery_rotation_from_rvec(first)
+    second_matrix = pose_recovery_rotation_from_rvec(second)
+    relative = second_matrix @ first_matrix.T
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def adjacent_rgb_flow_best_quad_agreement(first: np.ndarray, second: np.ndarray) -> float:
+    first = np.asarray(first, dtype=np.float64).reshape(4, 2)
+    second = np.asarray(second, dtype=np.float64).reshape(4, 2)
+    errors: list[float] = []
+    for candidate in (second, second[::-1]):
+        for shift in range(4):
+            shifted = np.roll(candidate, shift, axis=0)
+            errors.append(float(np.mean(np.linalg.norm(first - shifted, axis=1))))
+    return min(errors)
+
+
+def adjacent_rgb_flow_runtime(raw_header: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if raw_header.get("format") == "aprilcube_012_raw_with_pose_stream_v1":
+        metadata.update(raw_header.get("raw_header", {}).get("metadata", {}) or {})
+    metadata.update(raw_header.get("metadata", {}) or {})
+    cube_cfg = Path(metadata["cube_cfg"]).expanduser().resolve()
+    config_path = cube_cfg / "config.json" if cube_cfg.is_dir() else cube_cfg
+    config, face_id_sets = aprilcube.load_cube_config(str(config_path))
+    tag_corner_map = aprilcube.build_tag_corner_map(config)
+    calib = realsense_load_intrinsics_yaml(metadata.get("intrinsics_yaml"))
+    image_size = tuple(int(value) for value in metadata.get("image_size", calib["image_size"]))
+    undistort_pack = (
+        realsense_create_undistort_maps(calib, image_size)
+        if bool(metadata.get("undistort_for_detection", True))
+        else None
+    )
+    default_matrix = undistort_pack[2] if undistort_pack is not None else calib["K"]
+    camera_matrix = np.asarray(
+        metadata.get("detection_camera_matrix", default_matrix), dtype=np.float64
+    ).reshape(3, 3)
+    dist_coeffs = np.asarray(
+        metadata.get("detector_dist_coeffs", np.zeros(5)), dtype=np.float64
+    ).reshape(-1)
+    return {
+        "metadata": metadata,
+        "image_size": image_size,
+        "undistort_pack": undistort_pack,
+        "camera_matrix": camera_matrix,
+        "dist_coeffs": dist_coeffs,
+        "config": config,
+        "face_id_sets": face_id_sets,
+        "tag_corner_map": tag_corner_map,
+    }
+
+
+def adjacent_rgb_flow_detection_frame(image: np.ndarray, runtime: dict[str, Any]) -> np.ndarray:
+    width, height = runtime["image_size"]
+    if image.shape[:2] != (height, width):
+        raise ValueError(
+            f"RGB-flow raw image is {image.shape[1]}x{image.shape[0]}, "
+            f"expected {width}x{height}"
+        )
+    return realsense_undistort_frame(image, runtime["undistort_pack"])
+
+
+def adjacent_rgb_flow_select_anchor_tag(
+    pose: dict[str, Any], runtime: dict[str, Any]
+) -> tuple[int, np.ndarray, np.ndarray]:
+    tag_corner_map = runtime["tag_corner_map"]
+    tag_ids = [
+        int(value)
+        for value in (pose.get("tag_ids", []) or pose.get("detected_tag_ids", []) or [])
+        if int(value) in tag_corner_map
+    ]
+    if not tag_ids:
+        raise RuntimeError("RGB-flow anchor has no cube tag identity")
+    rvec = np.asarray(pose["rvec"], dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(pose["tvec"], dtype=np.float64).reshape(3, 1)
+    candidates: list[tuple[float, int, np.ndarray, np.ndarray]] = []
+    for tag_id in sorted(set(tag_ids)):
+        object_points = np.asarray(tag_corner_map[tag_id], dtype=np.float64).reshape(4, 3)
+        quad, _ = cv2.projectPoints(
+            object_points,
+            rvec,
+            tvec,
+            runtime["camera_matrix"],
+            runtime["dist_coeffs"],
+        )
+        quad = quad.reshape(4, 2).astype(np.float32)
+        area = abs(float(cv2.contourArea(quad)))
+        candidates.append((area, tag_id, object_points, quad))
+    _area, tag_id, object_points, quad = max(candidates, key=lambda item: item[0])
+    return tag_id, object_points, quad
+
+
+def adjacent_rgb_flow_recover_pair(
+    *,
+    anchor_image: np.ndarray,
+    target_image: np.ndarray,
+    anchor_pose: dict[str, Any],
+    anchor_frame: int,
+    target_frame: int,
+    runtime: dict[str, Any],
+    config: AdjacentRgbFlowRecoveryConfig,
+) -> dict[str, Any]:
+    tag_id, object_points, anchor_quad = adjacent_rgb_flow_select_anchor_tag(
+        anchor_pose, runtime
+    )
+    anchor_gray = cv2.cvtColor(anchor_image, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
+    mask = np.zeros_like(anchor_gray)
+    center = anchor_quad.mean(axis=0, keepdims=True)
+    feature_quad = center + float(config.feature_mask_scale) * (anchor_quad - center)
+    cv2.fillConvexPoly(mask, np.rint(feature_quad).astype(np.int32), 255)
+    anchor_points = cv2.goodFeaturesToTrack(
+        anchor_gray,
+        maxCorners=int(config.max_features),
+        qualityLevel=float(config.feature_quality),
+        minDistance=float(config.feature_min_distance),
+        mask=mask,
+        blockSize=5,
+    )
+    if anchor_points is None or len(anchor_points) < int(config.min_features):
+        count = 0 if anchor_points is None else len(anchor_points)
+        raise RuntimeError(f"not_enough_anchor_features:{count}<{config.min_features}")
+    lk = {
+        "winSize": (int(config.lk_window), int(config.lk_window)),
+        "maxLevel": int(config.lk_levels),
+        "criteria": (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            50,
+            0.001,
+        ),
+    }
+    target_points, forward_status, _ = cv2.calcOpticalFlowPyrLK(
+        anchor_gray, target_gray, anchor_points, None, **lk
+    )
+    if target_points is None or forward_status is None:
+        raise RuntimeError("forward_lk_failed")
+    backward_points, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+        target_gray, anchor_gray, target_points, None, **lk
+    )
+    if backward_points is None or backward_status is None:
+        raise RuntimeError("backward_lk_failed")
+    anchor_xy = anchor_points.reshape(-1, 2)
+    target_xy = target_points.reshape(-1, 2)
+    backward_xy = backward_points.reshape(-1, 2)
+    fb_error = np.linalg.norm(anchor_xy - backward_xy, axis=1)
+    good = (
+        (forward_status.reshape(-1) > 0)
+        & (backward_status.reshape(-1) > 0)
+        & np.isfinite(target_xy).all(axis=1)
+        & np.isfinite(fb_error)
+        & (fb_error <= float(config.max_fb_error))
+    )
+    good_count = int(good.sum())
+    if good_count < int(config.min_good_tracks):
+        raise RuntimeError(f"not_enough_consistent_tracks:{good_count}<{config.min_good_tracks}")
+    homography, inlier_values = cv2.findHomography(
+        anchor_xy[good], target_xy[good], cv2.RANSAC, float(config.homography_ransac_px)
+    )
+    if homography is None or inlier_values is None:
+        raise RuntimeError("homography_failed")
+    inliers = inlier_values.reshape(-1).astype(bool)
+    inlier_count = int(inliers.sum())
+    inlier_ratio = float(inlier_count / max(good_count, 1))
+    if inlier_count < int(config.min_homography_inliers):
+        raise RuntimeError(
+            f"not_enough_homography_inliers:{inlier_count}<{config.min_homography_inliers}"
+        )
+    if inlier_ratio < float(config.min_homography_inlier_ratio):
+        raise RuntimeError(
+            f"homography_inlier_ratio:{inlier_ratio:.3f}<{config.min_homography_inlier_ratio:.3f}"
+        )
+    predicted_tracks = cv2.perspectiveTransform(
+        anchor_xy[good].reshape(-1, 1, 2), homography
+    ).reshape(-1, 2)
+    residuals = np.linalg.norm(predicted_tracks - target_xy[good], axis=1)
+    homography_median = float(np.median(residuals[inliers]))
+    fb_median = float(np.median(fb_error[good]))
+    if homography_median > float(config.max_homography_median_px):
+        raise RuntimeError("homography_residual_too_high")
+    if fb_median > float(config.max_fb_median_px):
+        raise RuntimeError("forward_backward_residual_too_high")
+    target_quad = cv2.perspectiveTransform(
+        anchor_quad.reshape(-1, 1, 2), homography
+    ).reshape(4, 2)
+    height, width = target_gray.shape[:2]
+    corners_inside = int(
+        np.sum(
+            (target_quad[:, 0] >= 0.0)
+            & (target_quad[:, 0] < width)
+            & (target_quad[:, 1] >= 0.0)
+            & (target_quad[:, 1] < height)
+        )
+    )
+    if corners_inside < int(config.min_tag_corners_inside):
+        raise RuntimeError("propagated_tag_outside_image")
+    detections = pose_recovery_detect_sweep(
+        target_gray,
+        config=runtime["config"],
+        valid_ids=set(int(value) for value in runtime["tag_corner_map"]),
+    )
+    detected_by_id = {
+        int(detected_id): np.asarray(corners, dtype=np.float64).reshape(4, 2)
+        for detected_id, corners in detections
+    }
+    current_detected = tag_id in detected_by_id
+    if not current_detected and not bool(config.allow_missing_current_tag):
+        raise RuntimeError(f"current_frame_missing_tag:{tag_id}")
+    agreement = (
+        adjacent_rgb_flow_best_quad_agreement(target_quad, detected_by_id[tag_id])
+        if current_detected
+        else float("nan")
+    )
+    if current_detected and agreement > float(config.max_current_tag_agreement_px):
+        raise RuntimeError("current_tag_flow_disagreement")
+    anchor_rvec = np.asarray(anchor_pose["rvec"], dtype=np.float64).reshape(3, 1)
+    anchor_tvec = np.asarray(anchor_pose["tvec"], dtype=np.float64).reshape(3, 1)
+    ok, rvec, tvec = cv2.solvePnP(
+        object_points,
+        target_quad.astype(np.float64),
+        runtime["camera_matrix"],
+        runtime["dist_coeffs"],
+        anchor_rvec.copy(),
+        anchor_tvec.copy(),
+        True,
+        cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok or float(np.asarray(tvec).reshape(3)[2]) <= 0.0:
+        raise RuntimeError("tracked_corner_pnp_failed")
+    try:
+        rvec, tvec = cv2.solvePnPRefineLM(
+            object_points,
+            target_quad.astype(np.float64),
+            runtime["camera_matrix"],
+            runtime["dist_coeffs"],
+            rvec,
+            tvec,
+        )
+    except cv2.error:
+        pass
+    projected, _ = cv2.projectPoints(
+        object_points,
+        rvec,
+        tvec,
+        runtime["camera_matrix"],
+        runtime["dist_coeffs"],
+    )
+    flow_reprojection = float(
+        np.mean(np.linalg.norm(projected.reshape(4, 2) - target_quad, axis=1))
+    )
+    translation_delta = float(
+        np.linalg.norm(np.asarray(tvec).reshape(3) - anchor_tvec.reshape(3))
+    )
+    rotation_delta = adjacent_rgb_flow_rotation_delta_deg(anchor_rvec, rvec)
+    provisional = {"success": True, "rvec": rvec, "tvec": tvec}
+    edge_score = float(
+        pose_recovery_edge_alignment_score(
+            target_gray,
+            provisional,
+            config=runtime["config"],
+            camera_matrix=runtime["camera_matrix"],
+            dist_coeffs=runtime["dist_coeffs"],
+        )
+    )
+    if flow_reprojection > float(config.max_flow_corner_reproj_px):
+        raise RuntimeError("flow_corner_reprojection_too_high")
+    if translation_delta > float(config.max_translation_delta_mm):
+        raise RuntimeError("adjacent_translation_too_large")
+    if rotation_delta > float(config.max_rotation_delta_deg):
+        raise RuntimeError("adjacent_rotation_too_large")
+    if edge_score < float(config.min_edge_score):
+        raise RuntimeError("rgb_cube_edge_score_too_low")
+    visible_faces = sorted(
+        pose_recovery_visible_faces_for_ids(runtime["face_id_sets"], [tag_id])
+    )
+    return {
+        "success": True,
+        "failure_reason": "",
+        "pose_source": "stage10_adjacent_bidirectional_rgb_flow_tag_pnp",
+        "quality_level": "T",
+        "quality_reason": (
+            f"anchor:{anchor_frame};tag:{tag_id};tracks:{good_count};"
+            f"inliers:{inlier_count};fb:{fb_median:.3f}px;H:{homography_median:.3f}px;"
+            f"edge:{edge_score:.3f};dt:{translation_delta:.3f}mm;dr:{rotation_delta:.3f}deg"
+        ),
+        "pose_filled": True,
+        "predicted": True,
+        "temporal_recovery": True,
+        "single_frame_only": False,
+        "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+        "T": pose_recovery_pose_transform(rvec, tvec),
+        "reproj_error": flow_reprojection,
+        "reproj_metric": "optical_flow_propagated_tag_corner_mean_px",
+        "n_tags": 1,
+        "tag_ids": [tag_id],
+        "visible_faces": visible_faces,
+        "edge_score": edge_score,
+        "flow_anchor_frame": int(anchor_frame),
+        "flow_target_frame": int(target_frame),
+        "flow_anchor_pose_source": str(anchor_pose.get("pose_source", "")),
+        "flow_good_track_count": good_count,
+        "flow_homography_inlier_count": inlier_count,
+        "flow_homography_inlier_ratio": inlier_ratio,
+        "flow_fb_median_px": fb_median,
+        "flow_homography_median_px": homography_median,
+        "flow_current_tag_corner_agreement_px": agreement,
+        "flow_translation_delta_mm": translation_delta,
+        "flow_rotation_delta_deg": rotation_delta,
+        "current_frame_tag_anchor_used": current_detected,
+    }
+
+
+def adjacent_rgb_flow_failed_runs(
+    frames: dict[int, dict[str, Any]]
+) -> list[list[int]]:
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for index in sorted(frames):
+        if adjacent_rgb_flow_pose_valid(frames[index].get("pose", {}) or {}):
+            if current:
+                runs.append(current)
+                current = []
+        else:
+            current.append(index)
+    if current:
+        runs.append(current)
+    return runs
+
+
+def adjacent_rgb_flow_recovery_main(config: AdjacentRgbFlowRecoveryConfig) -> None:
+    header, frames, footer = pose_recovery_load_pose_records(config.input_pkl)
+    raw_header, raw_offsets, raw_footer = pose_recovery_build_stream_index(
+        config.raw_pkl,
+        {"aprilcube_rs_raw_frame_stream_v1", "aprilcube_012_raw_with_pose_stream_v1"},
+    )
+    runtime = adjacent_rgb_flow_runtime(raw_header)
+    raw_offsets_by_frame = {
+        int(pose_recovery_load_at(config.raw_pkl, offset).get("frame_index", position)): int(
+            offset
+        )
+        for position, offset in enumerate(raw_offsets)
+    }
+    image_cache: dict[int, np.ndarray] = {}
+
+    def image_for(index: int) -> np.ndarray:
+        if index not in image_cache:
+            raw = pose_recovery_load_at(config.raw_pkl, raw_offsets_by_frame[index])
+            image_cache[index] = adjacent_rgb_flow_detection_frame(
+                np.asarray(raw["image_bgr"], dtype=np.uint8), runtime
+            )
+        return image_cache[index]
+
+    recovered: dict[int, dict[str, Any]] = {}
+    rejected: dict[int, list[str]] = {}
+    for run in adjacent_rgb_flow_failed_runs(frames):
+        if len(run) > int(config.max_gap_frames):
+            for index in run:
+                rejected.setdefault(index, []).append(
+                    f"gap_too_long:{len(run)}>{config.max_gap_frames}"
+                )
+            continue
+        remaining = set(run)
+        while remaining:
+            proposals: dict[int, list[dict[str, Any]]] = {}
+            left_target = min(remaining)
+            left_anchor = left_target - 1
+            if left_anchor in frames and adjacent_rgb_flow_pose_valid(
+                frames[left_anchor].get("pose", {}) or {}
+            ):
+                try:
+                    proposals.setdefault(left_target, []).append(
+                        adjacent_rgb_flow_recover_pair(
+                            anchor_image=image_for(left_anchor),
+                            target_image=image_for(left_target),
+                            anchor_pose=frames[left_anchor]["pose"],
+                            anchor_frame=left_anchor,
+                            target_frame=left_target,
+                            runtime=runtime,
+                            config=config,
+                        )
+                    )
+                except Exception as exc:
+                    rejected.setdefault(left_target, []).append(f"left:{exc}")
+            right_target = max(remaining)
+            right_anchor = right_target + 1
+            if right_anchor in frames and adjacent_rgb_flow_pose_valid(
+                frames[right_anchor].get("pose", {}) or {}
+            ):
+                try:
+                    proposals.setdefault(right_target, []).append(
+                        adjacent_rgb_flow_recover_pair(
+                            anchor_image=image_for(right_anchor),
+                            target_image=image_for(right_target),
+                            anchor_pose=frames[right_anchor]["pose"],
+                            anchor_frame=right_anchor,
+                            target_frame=right_target,
+                            runtime=runtime,
+                            config=config,
+                        )
+                    )
+                except Exception as exc:
+                    rejected.setdefault(right_target, []).append(f"right:{exc}")
+            if not proposals:
+                break
+            progressed = False
+            for target_index, candidates in proposals.items():
+                best = max(
+                    candidates,
+                    key=lambda pose: (
+                        float(pose.get("edge_score", 0.0)),
+                        int(pose.get("flow_good_track_count", 0)),
+                    ),
+                )
+                original = copy.deepcopy(frames[target_index].get("pose", {}) or {})
+                frames[target_index]["pose_before_adjacent_rgb_flow"] = original
+                frames[target_index].setdefault("pose_candidates", {})[
+                    "stage10_adjacent_bidirectional_rgb_flow"
+                ] = copy.deepcopy(best)
+                frames[target_index]["pose"] = best
+                recovered[target_index] = best
+                remaining.remove(target_index)
+                progressed = True
+            if not progressed:
+                break
+    output = config.output_pkl.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    success_count = 0
+    source_counts: dict[str, int] = {}
+    try:
+        with temporary.open("wb") as stream:
+            out_header = copy.deepcopy(header)
+            out_header["created_wall_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            out_header["source_input_pkl"] = str(config.input_pkl.resolve())
+            out_header["metadata"] = {
+                **(out_header.get("metadata", {}) or {}),
+                "script": str(Path(__file__).resolve()),
+                "method": (
+                    "embedded automatic short-gap bidirectional adjacent RGB LK flow, "
+                    "homography, tag-corner PnP, and RGB-edge gating"
+                ),
+                "target_name": config.target_name,
+                "max_gap_frames": int(config.max_gap_frames),
+                "recovered_frames": sorted(recovered),
+                "rejected_recovery_reasons": rejected,
+            }
+            pickle.dump(out_header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for index in sorted(frames):
+                frame = frames[index]
+                pose = frame.get("pose", {}) or {}
+                if adjacent_rgb_flow_pose_valid(pose):
+                    success_count += 1
+                source = str(pose.get("pose_source", "failed"))
+                source_counts[source] = source_counts.get(source, 0) + 1
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            out_footer = copy.deepcopy(footer or {})
+            out_footer.update(
+                {
+                    "type": "footer",
+                    "frame_count": len(frames),
+                    "success_count": success_count,
+                    "pose_source_counts": source_counts,
+                    "adjacent_rgb_flow_recovered_count": len(recovered),
+                    "adjacent_rgb_flow_recovered_frames": sorted(recovered),
+                    "source_footer": footer,
+                    "raw_footer": raw_footer,
+                    "stopped_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            pickle.dump(out_footer, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    print(
+        f"[INFO] adjacent RGB-flow recovered={len(recovered)} "
+        f"success={success_count}/{len(frames)} output={output}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Embedded synchronized multi-camera stream reader (formerly scripts/utils).
+# -----------------------------------------------------------------------------
+import pickle
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, overload
+mcstream_MULTI_CAMERA_STREAM_FORMAT = 'consens_multi_camera_sync_stream'
+mcstream_MULTI_CAMERA_STREAM_VERSION = 1
+
+@dataclass(frozen=True)
+class mcstream_MultiCameraStreamIndex:
+    path: Path
+    header: dict[str, Any]
+    sample_offsets: tuple[int, ...]
+    footer: dict[str, Any] | None
+
+    @property
+    def complete(self) -> bool:
+        return self.footer is not None
+
+def mcstream_is_stream_header(record: Any) -> bool:
+    return isinstance(record, dict) and record.get('type') == 'header' and (record.get('format') == mcstream_MULTI_CAMERA_STREAM_FORMAT)
+
+def mcstream_iter_stream_records(path: str | Path) -> Iterator[dict[str, Any]]:
+    """Yield header/sample/footer records without retaining prior samples."""
+    resolved = Path(path).expanduser().resolve()
+    with resolved.open('rb') as stream:
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                return
+            if not isinstance(record, dict):
+                raise ValueError(f'Expected dict record at byte {stream.tell()} in {resolved}, got {type(record).__name__}')
+            yield record
+
+def mcstream_iter_stream_samples(path: str | Path) -> Iterator[dict[str, Any]]:
+    """Yield one synchronized sample at a time with bounded memory use."""
+    saw_header = False
+    for record in mcstream_iter_stream_records(path):
+        record_type = record.get('type')
+        if not saw_header:
+            if not mcstream_is_stream_header(record):
+                raise ValueError(f'Not a {mcstream_MULTI_CAMERA_STREAM_FORMAT} recording: {path}')
+            saw_header = True
+            continue
+        if record_type == 'sample':
+            sample = record.get('sample')
+            if not isinstance(sample, dict):
+                raise ValueError('Streaming sample record does not contain a dict sample')
+            yield sample
+        elif record_type == 'footer':
+            return
+
+def mcstream_scan_stream_index(path: str | Path) -> mcstream_MultiCameraStreamIndex:
+    """Build byte offsets while holding at most one decoded sample in memory."""
+    resolved = Path(path).expanduser().resolve()
+    header: dict[str, Any] | None = None
+    footer: dict[str, Any] | None = None
+    offsets: list[int] = []
+    with resolved.open('rb') as stream:
+        while True:
+            offset = stream.tell()
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                raise ValueError(f'Expected dict record at byte {offset} in {resolved}, got {type(record).__name__}')
+            record_type = record.get('type')
+            if record_type == 'header':
+                if not mcstream_is_stream_header(record):
+                    raise ValueError(f'Unsupported streaming header in {resolved}')
+                header = record
+            elif record_type == 'sample':
+                offsets.append(offset)
+            elif record_type == 'footer':
+                footer = record
+            del record
+    if header is None:
+        raise ValueError(f'No streaming multi-camera header in {resolved}')
+    return mcstream_MultiCameraStreamIndex(path=resolved, header=header, sample_offsets=tuple(offsets), footer=footer)
+
+def mcstream_load_sample_at_offset(path: str | Path, offset: int) -> dict[str, Any]:
+    resolved = Path(path).expanduser().resolve()
+    with resolved.open('rb') as stream:
+        stream.seek(int(offset))
+        record = pickle.load(stream)
+    if not isinstance(record, dict) or record.get('type') != 'sample':
+        raise ValueError(f'Byte offset {offset} is not a sample record in {resolved}')
+    sample = record.get('sample')
+    if not isinstance(sample, dict):
+        raise ValueError(f'Sample record at byte {offset} has no dict sample')
+    return sample
+
+class mcstream_StreamingSampleSequence(Sequence[dict[str, Any]]):
+    """Random-access sample view that loads only the requested sample."""
+
+    def __init__(self, index: mcstream_MultiCameraStreamIndex) -> None:
+        self.index = index
+
+    def __len__(self) -> int:
+        return len(self.index.sample_offsets)
+
+    @overload
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[dict[str, Any]]:
+        ...
+
+    def __getitem__(self, index: int | slice) -> dict[str, Any] | list[dict[str, Any]]:
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        normalized = int(index)
+        if normalized < 0:
+            normalized += len(self)
+        if normalized < 0 or normalized >= len(self):
+            raise IndexError(index)
+        return mcstream_load_sample_at_offset(self.index.path, self.index.sample_offsets[normalized])
+
+# -----------------------------------------------------------------------------
+# Embedded multi-camera raw -> four-target 020 adapter.
+# -----------------------------------------------------------------------------
+import argparse
+import copy
+import gc
+import hashlib
+import importlib.util
+import pickle
+import shutil
+import sys
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+import numpy as np
+import yaml
+mc_FILE_PATH = Path(__file__).resolve()
+mc_PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
+if str(mc_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(mc_PROJECT_ROOT))
+mc_FINALIZE_020_PATH = mc_PROJECT_ROOT / 'thirdparty' / 'aprilcube' / 'src' / '020_finalize_pose_postprocess.py'
+mc_DEFAULT_INPUT_PKL = mc_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151.pkl'
+mc_DEFAULT_OUTPUT_PKL = mc_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151_020_pose_sidecar.pkl'
+mc_DEFAULT_TEMP_ROOT = Path('/dev/shm/consensv2lab_020_multi_cam_0717_010151')
+mc_EXPECTED_D435_INTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_d435_color_charuco_1920x1080_0716_130910_offline_filtered.yaml')
+mc_EXPECTED_MIDDLE_INTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_scale0p25_2592x1944_0712_225925.yaml')
+mc_VERIFIED_D435_SDK_SERIAL = '244222070135'
+mc_POSE_SIDECAR_FORMAT = 'consensv2_multi_cam_020_pose_sidecar_v1'
+mc_EXPECTED_CUBE_CFG_BY_TARGET = {'wrist_Q': mc_PROJECT_ROOT / 'thirdparty/aprilcube/cubes/cube_april_36h11_100_123_2x2x2_outer62p5mm', 'index_Q': mc_PROJECT_ROOT / 'thirdparty/aprilcube/cubes/cube_april_36h11_6_11_1x1x1_15mm', 'thumb_Q': mc_PROJECT_ROOT / 'thirdparty/aprilcube/cubes/cube_april_36h11_12_17_1x1x1_15mm', 'middle_Q': mc_PROJECT_ROOT / 'thirdparty/aprilcube/cubes/cube_april_36h11_0_5_1x1x1_15mm'}
+mc_SINGLE_TAG_EDGE_THRESHOLD_BY_TARGET = {'index_Q': 0.4, 'thumb_Q': 0.3, 'middle_Q': 0.08}
+mc_SINGLE_TAG_MAX_REPROJ_BY_TARGET = {'middle_Q': 1.5}
+mc_DEFAULT_SINGLE_TAG_EDGE_THRESHOLD = 0.6
+mc_DEFAULT_SINGLE_TAG_MAX_REPROJ = 1.0
+
+@dataclass(frozen=True)
+class mc_PoseTarget:
+    name: str
+    worker_name: str
+    camera_name: str
+    cube_metadata_key: str
+    intrinsics_kind: str
+mc_TARGETS: tuple[mc_PoseTarget, ...] = (mc_PoseTarget('wrist_Q', 'rs', 'd435', 'wrist_cube_cfg', 'rs'), mc_PoseTarget('index_Q', 'thumb', 'thumb_web_cam', 'index_cube_cfg', 'cv2'), mc_PoseTarget('thumb_Q', 'thumb', 'thumb_web_cam', 'thumb_cube_cfg', 'cv2'), mc_PoseTarget('middle_Q', 'middle', 'middle_finger_cam', 'middle_cube_cfg', 'cv2'))
+
+@dataclass(frozen=True)
+class mc_TargetRuntime:
+    spec: mc_PoseTarget
+    intrinsics: dict[str, Any]
+    recorded_intrinsics_path: Path
+    cube_cfg: Path
+    recorded_cube_cfg: Path
+    single_tag_edge_threshold: float
+    single_tag_max_reproj: float
+
+def mc_sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while (chunk := stream.read(8 * 1024 * 1024)):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def mc_load_finalize_020() -> Any:
+    """Return this already-loaded monolithic module.
+
+    The former adapter imported 020 through a second module instance.  Keeping
+    one instance avoids duplicated JAX/DeepTag state and is required for the
+    standalone-file contract.
+    """
+    return sys.modules[__name__]
+
+def mc_load_final_sidecar_smoother() -> Any:
+    return type('_EmbeddedStage13', (), {'run': staticmethod(stage13_run)})
+
+def mc_require_all_target_poses(summary: dict[str, Any], target_names: list[str]) -> None:
+    frame_count = int(summary.get('frame_count', -1))
+    success_counts = summary.get('success_counts', {}) or {}
+    incomplete = {name: {'success': int(success_counts.get(name, 0)), 'required': frame_count, 'missing': frame_count - int(success_counts.get(name, 0))} for name in target_names if int(success_counts.get(name, 0)) != frame_count}
+    if incomplete:
+        raise RuntimeError(f'020 produced an intermediate sidecar, but final stage13 smoothing is forbidden until every cube has a pose on every frame. Run the target-specific direct/RGB-flow/local-interpolation recovery first: {incomplete}')
+
+def mc_load_intrinsics(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    with path.open('r', encoding='utf-8') as stream:
+        data = yaml.safe_load(stream)
+    if not isinstance(data, dict):
+        raise ValueError(f'Intrinsics YAML is not a mapping: {path}')
+    dist = data.get('dist', data.get('D'))
+    if dist is None:
+        raise ValueError(f'Intrinsics YAML has no dist/D field: {path}')
+    return {'path': path, 'image_size': tuple((int(v) for v in data['image_size'])), 'K': np.asarray(data['K'], dtype=np.float64).reshape(3, 3), 'dist': np.asarray(dist, dtype=np.float64).reshape(-1), 'camera_model': str(data.get('camera_model', 'pinhole')), 'distortion_model': str(data.get('distortion_model', '')), 'rms': float(data.get('rms', float('nan'))), 'mean_reproj_error': float(data.get('mean_reproj_error', float('nan'))), 'num_samples': int(data.get('num_samples', 0))}
+
+def mc_target_intrinsics_path(metadata: dict[str, Any], target: mc_PoseTarget) -> Path:
+    if target.intrinsics_kind == 'rs':
+        value = metadata.get('rs_intrinsics_yaml')
+    else:
+        mapping = metadata.get('cv2_camera_to_intrinsics_yaml', {})
+        value = mapping.get(target.camera_name) if isinstance(mapping, dict) else None
+    if not value:
+        raise ValueError(f'No recorded intrinsics path for {target.name}/{target.camera_name}')
+    return Path(str(value)).expanduser().resolve()
+
+def mc_build_target_runtimes(metadata: dict[str, Any], target_names: set[str] | None=None) -> list[mc_TargetRuntime]:
+    runtimes: list[mc_TargetRuntime] = []
+    for target in mc_TARGETS:
+        if target_names is not None and target.name not in target_names:
+            continue
+        recorded_intrinsics_path = mc_target_intrinsics_path(metadata, target)
+        intrinsics_path = recorded_intrinsics_path
+        if target.name == 'wrist_Q' and recorded_intrinsics_path != mc_EXPECTED_D435_INTRINSICS.resolve():
+            raise ValueError(f'D435 intrinsics mismatch: recorded={recorded_intrinsics_path}, expected={mc_EXPECTED_D435_INTRINSICS.resolve()}')
+        if target.name == 'middle_Q':
+            intrinsics_path = mc_EXPECTED_MIDDLE_INTRINSICS.resolve()
+            if recorded_intrinsics_path != intrinsics_path:
+                print(f'[WARN] Overriding recorded middle_finger_cam intrinsics: recorded={recorded_intrinsics_path}, effective={intrinsics_path}')
+        intrinsics = mc_load_intrinsics(intrinsics_path)
+        cube_value = metadata.get(target.cube_metadata_key)
+        if not cube_value:
+            raise ValueError(f'metadata.{target.cube_metadata_key} is missing')
+        recorded_cube_cfg = Path(str(cube_value)).expanduser().resolve()
+        cube_cfg = mc_EXPECTED_CUBE_CFG_BY_TARGET[target.name].resolve()
+        if not (cube_cfg / 'config.json').is_file():
+            raise FileNotFoundError(f'Cube config is missing for {target.name}: {cube_cfg}')
+        runtimes.append(mc_TargetRuntime(target, intrinsics, recorded_intrinsics_path, cube_cfg, recorded_cube_cfg, mc_SINGLE_TAG_EDGE_THRESHOLD_BY_TARGET.get(target.name, mc_DEFAULT_SINGLE_TAG_EDGE_THRESHOLD), mc_SINGLE_TAG_MAX_REPROJ_BY_TARGET.get(target.name, mc_DEFAULT_SINGLE_TAG_MAX_REPROJ)))
+    return runtimes
+
+def mc_load_source_recording(source_path: Path) -> dict[str, Any]:
+    with source_path.open('rb') as stream:
+        first_record = pickle.load(stream)
+    if mcstream_is_stream_header(first_record):
+        index = mcstream_scan_stream_index(source_path)
+        if not index.complete:
+            raise ValueError(f'Streaming recording has no complete footer: {source_path}')
+        footer = index.footer or {}
+        return {'metadata': index.header.get('metadata', {}), 'num_samples': len(index.sample_offsets), 'record_hz': index.header.get('record_hz'), 'measured_record_hz': footer.get('measured_record_hz', index.header.get('measured_record_hz')), 'samples': mcstream_StreamingSampleSequence(index), '_source_storage': 'streaming'}
+    if not isinstance(first_record, dict):
+        raise ValueError(f'Expected recording dict or streaming header, got {type(first_record).__name__}')
+    first_record['_source_storage'] = 'monolithic'
+    return first_record
+
+def mc_source_frame(sample: dict[str, Any], target: mc_PoseTarget) -> tuple[np.ndarray, float]:
+    try:
+        image = sample['worker_raw_frames'][target.worker_name][target.camera_name]
+        timestamp = float(sample['worker_timestamps'][target.worker_name][target.camera_name])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f'Missing frame/timestamp for {target.name}/{target.camera_name}') from exc
+    return (image, timestamp)
+
+def mc_validate_recording(data: Any, *, source_path: Path, max_frames: int | None, target_names: set[str] | None=None) -> tuple[dict[str, Any], Sequence[dict[str, Any]], list[mc_TargetRuntime]]:
+    if not isinstance(data, dict) or not isinstance(data.get('samples'), Sequence):
+        raise ValueError(f'Expected multi-camera recording with a sample sequence: {source_path}')
+    metadata = data.get('metadata')
+    if not isinstance(metadata, dict):
+        raise ValueError('Recording has no metadata mapping')
+    samples = data['samples']
+    declared_count = int(data.get('num_samples', len(samples)))
+    if declared_count != len(samples):
+        raise ValueError(f'num_samples mismatch: declared={declared_count}, actual={len(samples)}')
+    if max_frames is not None:
+        if max_frames <= 0:
+            raise ValueError('--max-frames must be positive')
+        samples = samples[:max_frames]
+    if not samples:
+        raise ValueError('Recording contains no samples')
+    if str(metadata.get('rs_color_format', '')).upper() != 'BGR8':
+        raise ValueError(f"Expected rs_color_format=BGR8, got {metadata.get('rs_color_format')}")
+    if not bool(metadata.get('rs_strict_profile', False)):
+        raise ValueError('Recording did not declare rs_strict_profile=True')
+    runtimes = mc_build_target_runtimes(metadata, target_names)
+    checked_streams: set[tuple[str, str]] = set()
+    for runtime in runtimes:
+        target = runtime.spec
+        stream_key = (target.worker_name, target.camera_name)
+        if stream_key in checked_streams:
+            continue
+        checked_streams.add(stream_key)
+        (target_w, target_h) = runtime.intrinsics['image_size']
+        timestamps: list[float] = []
+        for (sample_index, sample) in enumerate(samples):
+            if not isinstance(sample, dict):
+                raise ValueError(f'Sample {sample_index} is not a mapping')
+            (image, timestamp) = mc_source_frame(sample, target)
+            if not isinstance(image, np.ndarray):
+                raise ValueError(f'Sample {sample_index} {target.camera_name} is not ndarray')
+            if image.shape != (target_h, target_w, 3) or image.dtype != np.uint8:
+                raise ValueError(f'Sample {sample_index} {target.camera_name} mismatch: shape={image.shape}, dtype={image.dtype}, expected={(target_h, target_w, 3)}/uint8')
+            timestamps.append(timestamp)
+        if any((right <= left for (left, right) in zip(timestamps, timestamps[1:]))):
+            raise ValueError(f'{target.camera_name} timestamps are not strictly increasing')
+    return (metadata, samples, runtimes)
+
+def mc_build_sample_manifest(samples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{'sample_index': sample_index, 'step_idx': int(sample.get('step_idx', sample_index)), 'time_monotonic': sample.get('time_monotonic'), 'time_wall': sample.get('time_wall'), 'physical_camera_timestamps': copy.deepcopy(sample.get('physical_camera_timestamps', {}))} for (sample_index, sample) in enumerate(samples)]
+
+def mc_write_012_stream(*, source_path: Path, source_metadata: dict[str, Any], samples: Sequence[dict[str, Any]], runtime: mc_TargetRuntime, output_path: Path) -> None:
+    target = runtime.spec
+    intrinsics = runtime.intrinsics
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + '.tmp')
+    temporary_path.unlink(missing_ok=True)
+    source_stat = source_path.stat()
+    header = {'type': 'header', 'format': 'aprilcube_rs_raw_frame_stream_v1', 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'source_multi_cam_pkl': str(source_path), 'source_multi_cam_identity': {'size': int(source_stat.st_size), 'mtime_ns': int(source_stat.st_mtime_ns)}, 'metadata': {'script': str(mc_FILE_PATH), 'method': 'camera/target extraction from monolithic synchronized samples', 'source_format': 'consensv2_multi_cam_monolithic_dict_v1', 'pose_target': target.name, 'source_camera_name': target.camera_name, 'source_worker_name': target.worker_name, 'verified_d435_sdk_serial': mc_VERIFIED_D435_SDK_SERIAL if target.camera_name == 'd435' else None, 'intrinsics_yaml': str(intrinsics['path']), 'recorded_intrinsics_yaml': str(runtime.recorded_intrinsics_path), 'cube_cfg': str(runtime.cube_cfg), 'recorded_cube_cfg': str(runtime.recorded_cube_cfg), 'single_tag_edge_threshold': runtime.single_tag_edge_threshold, 'single_tag_max_reproj': runtime.single_tag_max_reproj, 'image_size': tuple((int(v) for v in intrinsics['image_size'])), 'fps': float(source_metadata.get('rs_fps' if target.intrinsics_kind == 'rs' else 'record_hz', 0.0)), 'undistort_for_detection': True, 'raw_camera_matrix': intrinsics['K'].tolist(), 'raw_dist_coeffs': intrinsics['dist'].tolist(), 'camera_model': intrinsics['camera_model'], 'distortion_model': intrinsics['distortion_model'], 'raw_image_field': 'image_bgr', 'raw_image_storage': 'original ndarray from source multi-camera sample', 'frame_count': len(samples)}}
+    try:
+        with temporary_path.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for (sample_index, sample) in enumerate(samples):
+                (image, timestamp) = mc_source_frame(sample, target)
+                frame = {'type': 'frame', 'frame_index': int(sample_index), 'source_sample_index': int(sample_index), 'source_step_idx': int(sample.get('step_idx', sample_index)), 'device_name': target.camera_name, 'camera_name': target.camera_name, 'loop_frame_idx': int(sample.get('step_idx', sample_index)), 'capture_timestamp': timestamp, 'source_sample_time_monotonic': sample.get('time_monotonic'), 'source_sample_time_wall': sample.get('time_wall'), 'shape': tuple((int(v) for v in image.shape)), 'dtype': str(image.dtype), 'image_bgr': image}
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+                done = sample_index + 1
+                if done == len(samples) or done % 20 == 0:
+                    print(f'\r[INFO] Extract {target.name}/{target.camera_name}: {done}/{len(samples)}', end='', flush=True)
+            pickle.dump({'type': 'footer', 'frame_count': len(samples), 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        print()
+        temporary_path.replace(output_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+def mc_copy_final_pose_stream(final_pose_path: Path, result_path: Path) -> None:
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = result_path.with_suffix(result_path.suffix + '.tmp')
+    temporary_path.unlink(missing_ok=True)
+    try:
+        shutil.copy2(final_pose_path, temporary_path)
+        temporary_path.replace(result_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+def mc_compact_pose_result(pose_frame: dict[str, Any], runtime: mc_TargetRuntime) -> dict[str, Any]:
+    result = {'camera_name': runtime.spec.camera_name, 'capture_timestamp': pose_frame.get('capture_timestamp'), 'pose': copy.deepcopy(pose_frame.get('pose', {})), 'selected_stage': pose_frame.get('selected_stage', ''), 'overlay_shape': pose_frame.get('overlay_shape'), 'overlay_format': pose_frame.get('overlay_format'), 'overlay_jpeg': pose_frame.get('overlay_jpeg')}
+    for key in ('pose_candidates', 'pose_before_temporal_smoothing', 'pose_temporally_smoothed', 'selected_stage_before_temporal_smoothing'):
+        if key in pose_frame:
+            result[key] = copy.deepcopy(pose_frame[key])
+    return result
+
+def mc_sidecar_target_metadata(runtime: mc_TargetRuntime) -> dict[str, Any]:
+    return {'camera_name': runtime.spec.camera_name, 'worker_name': runtime.spec.worker_name, 'intrinsics_yaml': str(runtime.intrinsics['path']), 'recorded_intrinsics_yaml': str(runtime.recorded_intrinsics_path), 'intrinsics_yaml_sha256': mc_sha256_file(runtime.intrinsics['path']), 'camera_model': runtime.intrinsics['camera_model'], 'image_size': runtime.intrinsics['image_size'], 'cube_cfg': str(runtime.cube_cfg), 'recorded_cube_cfg': str(runtime.recorded_cube_cfg), 'single_tag_edge_threshold': runtime.single_tag_edge_threshold, 'single_tag_max_reproj': runtime.single_tag_max_reproj}
+
+def mc_write_combined_sidecar(*, finalize020: Any, source_path: Path, source_metadata: dict[str, Any], sample_manifest: list[dict[str, Any]], runtimes: list[mc_TargetRuntime], result_paths: dict[str, Path], output_path: Path) -> dict[str, Any]:
+    indexed: dict[str, tuple[dict[str, Any], list[int], dict[str, Any] | None]] = {}
+    for runtime in runtimes:
+        indexed[runtime.spec.name] = finalize020.build_stream_index(result_paths[runtime.spec.name])
+        frame_count = len(indexed[runtime.spec.name][1])
+        if frame_count != len(sample_manifest):
+            raise ValueError(f'{runtime.spec.name} frame count mismatch: {frame_count} != {len(sample_manifest)}')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + '.tmp')
+    temporary_path.unlink(missing_ok=True)
+    source_stat = source_path.stat()
+    success_counts = {runtime.spec.name: 0 for runtime in runtimes}
+    pose_source_counts: dict[str, dict[str, int]] = {runtime.spec.name: {} for runtime in runtimes}
+    try:
+        with temporary_path.open('wb') as stream:
+            pickle.dump({'type': 'header', 'format': mc_POSE_SIDECAR_FORMAT, 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'source_multi_cam_pkl': str(source_path), 'source_multi_cam_identity': {'size': int(source_stat.st_size), 'mtime_ns': int(source_stat.st_mtime_ns)}, 'source_multi_cam_metadata': copy.deepcopy(source_metadata), 'metadata': {'script': str(mc_FILE_PATH), 'pipeline_script': str(mc_FINALIZE_020_PATH), 'pipeline_script_sha256': mc_sha256_file(mc_FINALIZE_020_PATH), 'mapping_key': 'sample_index', 'frame_count': len(sample_manifest), 'contains_raw_images': False, 'contains_overlay_jpeg': True, 'verified_d435_sdk_serial': mc_VERIFIED_D435_SDK_SERIAL, 'targets': {runtime.spec.name: mc_sidecar_target_metadata(runtime) for runtime in runtimes}}}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for (sample_index, manifest) in enumerate(sample_manifest):
+                pose_results: dict[str, Any] = {}
+                for runtime in runtimes:
+                    target_name = runtime.spec.name
+                    (_header, offsets, _footer) = indexed[target_name]
+                    pose_frame = finalize020.load_at(result_paths[target_name], offsets[sample_index])
+                    if int(pose_frame.get('frame_index', -1)) != sample_index:
+                        raise ValueError(f'{target_name} frame index mismatch at {sample_index}')
+                    compact = mc_compact_pose_result(pose_frame, runtime)
+                    pose_results[target_name] = compact
+                    pose = compact['pose'] or {}
+                    success_counts[target_name] += int(bool(pose.get('success', False)))
+                    source = str(pose.get('pose_source', ''))
+                    counts = pose_source_counts[target_name]
+                    counts[source] = counts.get(source, 0) + 1
+                pickle.dump({'type': 'frame', **copy.deepcopy(manifest), 'pose_results': pose_results, 'poses': {name: copy.deepcopy(result['pose']) for (name, result) in pose_results.items()}}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            summary = {'frame_count': len(sample_manifest), 'success_counts': success_counts, 'pose_source_counts': pose_source_counts}
+            pickle.dump({'type': 'footer', **summary, 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary_path.replace(output_path)
+        return summary
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+def mc_write_merged_sidecar(*, finalize020: Any, source_path: Path, sample_manifest: list[dict[str, Any]], runtimes: list[mc_TargetRuntime], result_paths: dict[str, Path], existing_path: Path, output_path: Path) -> dict[str, Any]:
+    """Replace selected target results while preserving all other sidecar targets."""
+    if not existing_path.is_file():
+        raise FileNotFoundError(f'Existing sidecar does not exist: {existing_path}')
+    indexed: dict[str, tuple[dict[str, Any], list[int], dict[str, Any] | None]] = {}
+    for runtime in runtimes:
+        target_name = runtime.spec.name
+        indexed[target_name] = finalize020.build_stream_index(result_paths[target_name])
+        frame_count = len(indexed[target_name][1])
+        if frame_count != len(sample_manifest):
+            raise ValueError(f'{target_name} frame count mismatch: {frame_count} != {len(sample_manifest)}')
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + '.tmp')
+    temporary_path.unlink(missing_ok=True)
+    selected_names = [runtime.spec.name for runtime in runtimes]
+    source_stat = source_path.stat()
+    try:
+        with existing_path.open('rb') as source_stream, temporary_path.open('wb') as output_stream:
+            header = pickle.load(source_stream)
+            if not isinstance(header, dict) or header.get('format') != mc_POSE_SIDECAR_FORMAT:
+                raise ValueError(f"Unsupported existing sidecar format: {header.get('format')}")
+            if Path(str(header.get('source_multi_cam_pkl', ''))).resolve() != source_path:
+                raise ValueError('Existing sidecar source PKL does not match requested source')
+            existing_identity = header.get('source_multi_cam_identity', {})
+            expected_identity = {'size': int(source_stat.st_size), 'mtime_ns': int(source_stat.st_mtime_ns)}
+            if existing_identity != expected_identity:
+                raise ValueError(f'Existing sidecar source identity mismatch: existing={existing_identity}, current={expected_identity}')
+            updated_header = copy.deepcopy(header)
+            metadata = updated_header.setdefault('metadata', {})
+            targets_metadata = metadata.setdefault('targets', {})
+            for runtime in runtimes:
+                targets_metadata[runtime.spec.name] = mc_sidecar_target_metadata(runtime)
+            history = metadata.setdefault('update_history', [])
+            history.append({'updated_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'reprocessed_targets': selected_names, 'pipeline_script': str(mc_FINALIZE_020_PATH), 'pipeline_script_sha256': mc_sha256_file(mc_FINALIZE_020_PATH)})
+            pickle.dump(updated_header, output_stream, protocol=pickle.HIGHEST_PROTOCOL)
+            all_target_names = list(targets_metadata)
+            success_counts = {name: 0 for name in all_target_names}
+            pose_source_counts: dict[str, dict[str, int]] = {name: {} for name in all_target_names}
+            for (sample_index, manifest) in enumerate(sample_manifest):
+                record = pickle.load(source_stream)
+                if not isinstance(record, dict) or record.get('type') != 'frame':
+                    raise ValueError(f'Expected existing sidecar frame at index {sample_index}')
+                if int(record.get('sample_index', -1)) != sample_index:
+                    raise ValueError(f'Existing sidecar sample index mismatch at {sample_index}')
+                if int(record.get('step_idx', -1)) != int(manifest['step_idx']):
+                    raise ValueError(f'Existing sidecar step_idx mismatch at {sample_index}')
+                pose_results = record.setdefault('pose_results', {})
+                poses = record.setdefault('poses', {})
+                for runtime in runtimes:
+                    target_name = runtime.spec.name
+                    (_result_header, offsets, _result_footer) = indexed[target_name]
+                    pose_frame = finalize020.load_at(result_paths[target_name], offsets[sample_index])
+                    if int(pose_frame.get('frame_index', -1)) != sample_index:
+                        raise ValueError(f'{target_name} frame index mismatch at {sample_index}')
+                    compact = mc_compact_pose_result(pose_frame, runtime)
+                    pose_results[target_name] = compact
+                    poses[target_name] = copy.deepcopy(compact['pose'])
+                for target_name in all_target_names:
+                    if target_name not in pose_results:
+                        raise ValueError(f'Existing frame {sample_index} lacks {target_name}')
+                    pose = pose_results[target_name].get('pose', {}) or {}
+                    success_counts[target_name] += int(bool(pose.get('success', False)))
+                    source = str(pose.get('pose_source', ''))
+                    counts = pose_source_counts[target_name]
+                    counts[source] = counts.get(source, 0) + 1
+                pickle.dump(record, output_stream, protocol=pickle.HIGHEST_PROTOCOL)
+            old_footer = pickle.load(source_stream)
+            if not isinstance(old_footer, dict) or old_footer.get('type') != 'footer':
+                raise ValueError('Existing sidecar footer is missing')
+            if int(old_footer.get('frame_count', -1)) != len(sample_manifest):
+                raise ValueError('Existing sidecar footer frame count mismatch')
+            summary = {'frame_count': len(sample_manifest), 'success_counts': success_counts, 'pose_source_counts': pose_source_counts, 'reprocessed_targets': selected_names}
+            pickle.dump({'type': 'footer', **summary, 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}, output_stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary_path.replace(output_path)
+        return summary
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+def mc_run(args: argparse.Namespace) -> None:
+    source_path = args.input.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+    temp_root = args.temp_root.expanduser().resolve()
+    requested_target_names = set(args.targets)
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+    print(f'[INFO] Loading recording: {source_path}')
+    load_started = time.perf_counter()
+    data = mc_load_source_recording(source_path)
+    print(f"[INFO] Loaded {data.get('_source_storage', 'unknown')} recording in {time.perf_counter() - load_started:.2f}s")
+    (source_metadata, samples, runtimes) = mc_validate_recording(data, source_path=source_path, max_frames=args.max_frames, target_names=requested_target_names)
+    sample_manifest = mc_build_sample_manifest(samples)
+    print(f'[INFO] Validated frames={len(samples)} targets={[r.spec.name for r in runtimes]}')
+    for runtime in runtimes:
+        print(f"[INFO] {runtime.spec.name}: camera={runtime.spec.camera_name} size={runtime.intrinsics['image_size']} model={runtime.intrinsics['camera_model']} rms={runtime.intrinsics['rms']:.3f}px cube={runtime.cube_cfg.name} recorded_intrinsics={runtime.recorded_intrinsics_path.name} recorded_cube={runtime.recorded_cube_cfg.name} single_tag_edge={runtime.single_tag_edge_threshold:.2f} single_tag_reproj={runtime.single_tag_max_reproj:.2f}px")
+    if args.validate_only:
+        return
+    if temp_root.exists() and any(temp_root.iterdir()):
+        raise FileExistsError(f'Temporary root is not empty: {temp_root}. Remove it or choose --temp-root.')
+    temp_root.mkdir(parents=True, exist_ok=True)
+    raw_paths: dict[str, Path] = {}
+    result_paths: dict[str, Path] = {}
+    try:
+        for runtime in runtimes:
+            target_root = temp_root / runtime.spec.name
+            raw_path = target_root / f'{source_path.stem}_{runtime.spec.name}_012_raw.pkl'
+            mc_write_012_stream(source_path=source_path, source_metadata=source_metadata, samples=samples, runtime=runtime, output_path=raw_path)
+            raw_paths[runtime.spec.name] = raw_path
+        del samples
+        del data
+        gc.collect()
+        finalize020 = mc_load_finalize_020()
+        results_root = temp_root / 'pose_results'
+        strict_index_stream: Path | None = None
+        for runtime in runtimes:
+            target_name = runtime.spec.name
+            target_root = temp_root / target_name
+            work_dir = target_root / '020_work'
+            unused_merged_output = target_root / 'unused_020_with_raw.pkl'
+            print(f'[INFO] Starting 020 target={target_name} camera={runtime.spec.camera_name}')
+            final_pose_path = finalize020.process_012_recording(raw_pkl=raw_paths[target_name], output_pkl=unused_merged_output, work_dir=work_dir, merge_final_raw=False, single_tag_edge_threshold=runtime.single_tag_edge_threshold, single_tag_max_reproj=runtime.single_tag_max_reproj, preferred_single_tag_id=2 if target_name == 'middle_Q' else None, prefer_deeptag_single_tag=target_name == 'middle_Q', enable_temporal_outline_recovery=target_name == 'wrist_Q', enable_adjacent_rgb_flow_recovery=False, target_name=target_name)
+            result_path = results_root / f'{target_name}_final_pose.pkl'
+            mc_copy_final_pose_stream(final_pose_path, result_path)
+            result_paths[target_name] = result_path
+            if target_name == 'index_Q':
+                strict_source = work_dir / f"strict_aprilcube_pose_{raw_paths[target_name].stem}.pkl"
+                strict_index_stream = results_root / 'index_Q_strict_aprilcube.pkl'
+                mc_copy_final_pose_stream(strict_source, strict_index_stream)
+            shutil.rmtree(target_root)
+            print(f'[INFO] Completed 020 target={target_name}')
+        if args.merge_existing is not None:
+            summary = mc_write_merged_sidecar(finalize020=finalize020, source_path=source_path, sample_manifest=sample_manifest, runtimes=runtimes, result_paths=result_paths, existing_path=args.merge_existing.expanduser().resolve(), output_path=output_path)
+        else:
+            all_target_names = {target.name for target in mc_TARGETS}
+            if requested_target_names != all_target_names:
+                raise ValueError('A partial --targets run requires --merge-existing so the other target results are preserved.')
+            summary = mc_write_combined_sidecar(finalize020=finalize020, source_path=source_path, source_metadata=source_metadata, sample_manifest=sample_manifest, runtimes=runtimes, result_paths=result_paths, output_path=output_path)
+        print(f'[INFO] Saved combined pose sidecar: {output_path}')
+        print(f'[INFO] Sidecar summary: {summary}')
+        all_target_names = {target.name for target in mc_TARGETS}
+        if requested_target_names == all_target_names:
+            if strict_index_stream is None:
+                raise RuntimeError('The complete run did not preserve index_Q strict poses')
+            summary = run_embedded_pose_recovery_patches(
+                source_path=source_path,
+                initial_sidecar=output_path,
+                strict_index_stream=strict_index_stream,
+                output_sidecar=output_path,
+                work_dir=temp_root / 'complete_pose_recovery',
+            )
+            print(f'[INFO] Complete recovered sidecar summary: {summary}')
+        if not args.skip_final_global_smoothing:
+            all_target_names = [target.name for target in mc_TARGETS]
+            mc_require_all_target_poses(summary, all_target_names)
+            final_output_path = args.final_output.expanduser().resolve() if args.final_output is not None else output_path.with_name(f'{source_path.stem}_post_progress{output_path.suffix}')
+            final_qa_path = args.final_qa.expanduser().resolve() if args.final_qa is not None else final_output_path.with_suffix('.smoothing_qa.json')
+            print('[INFO] All target poses complete; starting mandatory stage13 final sidecar smoothing')
+            final_smoother = mc_load_final_sidecar_smoother()
+            final_smoother.run(SimpleNamespace(source=source_path, sidecar=output_path, output=final_output_path, qa=final_qa_path, targets=all_target_names, window_radius=4, window_seconds=0.18, sigma_seconds=0.075, max_measured_translation_mm=4.0, max_measured_rotation_deg=4.0, max_filled_translation_mm=10.0, max_filled_rotation_deg=8.0, max_edge_score_drop=0.04, overwrite=True))
+            print(f'[INFO] Final complete+smoothed sidecar: {final_output_path}')
+    finally:
+        if args.keep_temp:
+            print(f'[INFO] Keeping temporary files: {temp_root}')
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            print(f'[INFO] Removed temporary files: {temp_root}')
+
+def mc_build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Postprocess wrist/index/thumb/middle AprilCube poses from a multi-camera PKL.')
+    parser.add_argument('--input', type=Path, default=mc_DEFAULT_INPUT_PKL)
+    parser.add_argument('--output', type=Path, default=mc_DEFAULT_OUTPUT_PKL)
+    parser.add_argument('--temp-root', type=Path, default=mc_DEFAULT_TEMP_ROOT)
+    parser.add_argument('--max-frames', type=int, default=None)
+    parser.add_argument('--targets', nargs='+', choices=[target.name for target in mc_TARGETS], default=[target.name for target in mc_TARGETS], help='Pose targets to process. Partial runs require --merge-existing.')
+    parser.add_argument('--merge-existing', type=Path, default=None, help='Existing combined sidecar whose unselected target results are preserved.')
+    parser.add_argument('--validate-only', action='store_true')
+    parser.add_argument('--keep-temp', action='store_true')
+    parser.add_argument('--final-output', type=Path, default=None, help='Final complete+globally-smoothed sidecar. By default, write <input-stem>_post_progress.pkl next to --output.')
+    parser.add_argument('--final-qa', type=Path, default=None, help='QA JSON for the mandatory final complete-sidecar smoothing stage.')
+    parser.add_argument('--skip-final-global-smoothing', action='store_true', help='Diagnostic escape hatch: write only the intermediate 020 sidecar. Such output is intentionally rejected by retargeting/full-body IK.')
+    return parser
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Embedded Wuji-left four-point retargeting.
+#
+# This implementation is namespace-prefixed from the former two retargeting
+# scripts. It is executable code in this file, preserving the original
+# numerical path without loading either script at runtime.
+# -----------------------------------------------------------------------------
+import argparse
+import json
+import pickle
+import sys
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any
+rtbase_FILE_PATH = Path(__file__).resolve()
+rtbase_REPO_ROOT = APRILCUBE_ROOT.parent.parent
+rtbase_PYROKI_SRC = rtbase_REPO_ROOT / 'thirdparty/pyroki/src'
+if str(rtbase_REPO_ROOT) not in sys.path:
+    sys.path.append(str(rtbase_REPO_ROOT))
+if str(rtbase_PYROKI_SRC) not in sys.path:
+    sys.path.append(str(rtbase_PYROKI_SRC))
+import jax
+import jax.numpy as jnp
+import jaxlie
+import jaxls
+import numpy as np
+import pyroki as pk
+import yourdfpy
+import yaml
+from scipy.spatial.transform import Rotation
+rtbase_DEFAULT_PKL_PATH = rtbase_REPO_ROOT / 'thirdparty/aprilcube/recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl'
+rtbase_DEFAULT_URDF_PATH = rtbase_REPO_ROOT / 'thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf'
+rtbase_DEFAULT_CONTACT_CONFIG = rtbase_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints.yaml'
+rtbase_DEFAULT_OUTPUT_DIR = rtbase_REPO_ROOT / 'outputs/retargeting/index_middle_cube_calibration_021'
+rtbase_DEFAULT_INDEX_ONLY_RESULT = rtbase_REPO_ROOT / 'outputs/retargeting/index_cube_calibration_021/optimized_unconstrained_four_point_se3_from_bounded.npz'
+rtbase_EXPECTED_PKL_FORMAT = 'aprilcube_hand_back_software_synced_raw_v1'
+rtbase_SOURCE_POSE_FIELD = 'hand_back_cube_obj_poses'
+rtbase_ROOT_LINK_NAME = 'left_palm_link'
+rtbase_POSITION_WEIGHT = 40.0
+rtbase_NUMERICAL_ACTIVE_WEIGHT = 0.001
+rtbase_INACTIVE_JOINT_WEIGHT = 2.0
+rtbase_LAMBDA_INITIAL = 1.0
+rtbase_DEFAULT_SOLVER_ITERATIONS = 100
+rtbase_DEFAULT_ALTERNATING_ITERATIONS = 30
+rtbase_T_PALM_CUBE_INITIAL = np.asarray([[0.0, 0.0, -1.0, -0.07175], [0.0, -1.0, 0.0, 0.005444], [-1.0, 0.0, 0.0, 0.011613], [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+
+@dataclass(frozen=True)
+class rtbase_FingerSpec:
+    name: str
+    robot_link_name: str
+    robot_joint_prefix: str
+    obj_mesh_name: str
+rtbase_FINGER_SPECS = (rtbase_FingerSpec('index', 'left_finger2_link4', 'left_finger2_', 'index.obj'), rtbase_FingerSpec('middle', 'left_finger3_link4', 'left_finger3_', 'middle.obj'))
+rtbase_ACTIVE_JOINT_NAMES = tuple((f'left_finger{finger_index}_joint{joint_index}' for finger_index in (2, 3) for joint_index in range(1, 5)))
+
+@dataclass
+class rtbase_SequenceSolution:
+    qpos: np.ndarray
+    target_obj_poses: np.ndarray
+    predicted_obj_poses: np.ndarray
+    target_keypoints: np.ndarray
+    predicted_keypoints: np.ndarray
+    mean_error_m: np.ndarray
+    max_error_m: np.ndarray
+    elapsed_seconds: float
+
+def rtbase_transform_points(transform: np.ndarray, points: np.ndarray) -> np.ndarray:
+    transform = np.asarray(transform, dtype=np.float64)
+    points = np.asarray(points, dtype=np.float64)
+    return (transform[:3, :3] @ points.T).T + transform[:3, 3]
+
+def rtbase_make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    output = np.eye(4, dtype=np.float64)
+    output[:3, :3] = rotation
+    output[:3, 3] = translation
+    return output
+
+def rtbase_rpy_transform(xyz: list[float], rpy: list[float]) -> np.ndarray:
+    return rtbase_make_transform(Rotation.from_euler('xyz', rpy).as_matrix(), np.asarray(xyz, dtype=np.float64))
+
+def rtbase_validate_transform(transform: np.ndarray, label: str) -> np.ndarray:
+    transform = np.asarray(transform, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError(f'{label} must be a finite 4x4 matrix')
+    if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-08):
+        raise ValueError(f'{label} has an invalid homogeneous last row')
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-05):
+        raise ValueError(f'{label} rotation is not orthonormal')
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-05):
+        raise ValueError(f'{label} rotation determinant is not +1')
+    return transform
+
+def rtbase_load_urdf(path: Path) -> yourdfpy.URDF:
+    return yourdfpy.URDF.load(str(path), filename_handler=partial(yourdfpy.filename_handler_magic, dir=path.parent))
+
+def rtbase_load_contact_keypoints(config_path: Path) -> np.ndarray:
+    with config_path.open('r', encoding='utf-8') as stream:
+        config = yaml.safe_load(stream)
+    if config.get('coordinate_frame') != 'per_finger_obj':
+        raise ValueError('Contact points must be expressed in per_finger_obj')
+    if config.get('coordinate_unit') != 'm':
+        raise ValueError('Contact points must use metres')
+    fingers = config.get('fingers', {})
+    output: list[np.ndarray] = []
+    for spec in rtbase_FINGER_SPECS:
+        payload = fingers.get(spec.name)
+        if not isinstance(payload, dict):
+            raise KeyError(f'Contact config has no {spec.name} entry')
+        if Path(payload.get('obj_path', '')).name != spec.obj_mesh_name:
+            raise ValueError(f'{spec.name} points do not reference {spec.obj_mesh_name}')
+        points = np.asarray(payload.get('keypoints_obj_m'), dtype=np.float64)
+        if points.shape != (4, 3) or not np.all(np.isfinite(points)):
+            raise ValueError(f'{spec.name} keypoints must have finite shape (4, 3)')
+        output.append(points)
+    return np.stack(output, axis=0)
+
+def rtbase_load_link_from_obj_transforms(urdf_path: Path) -> np.ndarray:
+    root = ET.parse(urdf_path).getroot()
+    output: list[np.ndarray] = []
+    for spec in rtbase_FINGER_SPECS:
+        matches: list[np.ndarray] = []
+        for link in root.findall('link'):
+            if link.attrib.get('name') != spec.robot_link_name:
+                continue
+            for visual in link.findall('visual'):
+                mesh = visual.find('./geometry/mesh')
+                if mesh is None:
+                    continue
+                if Path(mesh.attrib.get('filename', '')).name != spec.obj_mesh_name:
+                    continue
+                scale = np.asarray([float(value) for value in mesh.attrib.get('scale', '1 1 1').split()])
+                if scale.shape != (3,) or not np.allclose(scale, 0.001, atol=1e-12):
+                    raise ValueError(f'{spec.obj_mesh_name} scale must be 0.001, got {scale.tolist()}')
+                origin = visual.find('origin')
+                xyz = [0.0, 0.0, 0.0]
+                rpy = [0.0, 0.0, 0.0]
+                if origin is not None:
+                    xyz = [float(v) for v in origin.attrib.get('xyz', '0 0 0').split()]
+                    rpy = [float(v) for v in origin.attrib.get('rpy', '0 0 0').split()]
+                matches.append(rtbase_rpy_transform(xyz, rpy))
+        if len(matches) != 1:
+            raise ValueError(f'Expected one {spec.obj_mesh_name} visual on {spec.robot_link_name}; found {len(matches)}')
+        output.append(matches[0])
+    return np.stack(output, axis=0)
+
+def rtbase_load_source_poses(pkl_path: Path, max_frames: int | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    poses: list[np.ndarray] = []
+    timestamps: list[float] = []
+    source_record_indices: list[int] = []
+    total_bytes = pkl_path.stat().st_size
+    record_index = -1
+    with pkl_path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('type') != 'header':
+            raise ValueError('Source PKL does not begin with a header')
+        if header.get('format') != rtbase_EXPECTED_PKL_FORMAT:
+            raise ValueError(f"Unexpected PKL format: {header.get('format')!r}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            record_index += 1
+            if not isinstance(record, dict) or record.get('type') != 'frame_pair':
+                continue
+            payload = record.get(rtbase_SOURCE_POSE_FIELD)
+            if not isinstance(payload, dict):
+                raise KeyError(f'Record {record_index} is missing {rtbase_SOURCE_POSE_FIELD}')
+            if payload.get('reference_frame') != 'hand_back_cube':
+                raise ValueError(f'Record {record_index} has the wrong reference frame')
+            objects = payload.get('objects', {})
+            current: list[np.ndarray] = []
+            valid = True
+            for spec in rtbase_FINGER_SPECS:
+                entry = objects.get(spec.name)
+                if not isinstance(entry, dict) or not bool(entry.get('success', False)):
+                    valid = False
+                    break
+                current.append(rtbase_validate_transform(entry.get('T_hand_back_cube_obj'), f'record {record_index} {spec.name} pose'))
+            if not valid:
+                print(f'\n[WARN] Skipping record {record_index}: invalid finger pose')
+                continue
+            poses.append(np.stack(current, axis=0))
+            timestamps.append(float(record.get('pair_timestamp', len(poses) - 1)))
+            source_record_indices.append(record_index)
+            if len(poses) == 1 or len(poses) % 25 == 0:
+                ratio = stream.tell() / max(total_bytes, 1)
+                print(f'\r[INFO] Reading source: {len(poses)} valid frames ({ratio * 100.0:.1f}%)', end='', flush=True)
+            if max_frames is not None and len(poses) >= max_frames:
+                break
+    print()
+    if not poses:
+        raise ValueError('No valid index+middle frames found')
+    return (np.asarray(poses, dtype=np.float64), np.asarray(timestamps, dtype=np.float64), np.asarray(source_record_indices, dtype=np.int32))
+
+class rtbase_IndexMiddleIKSolver:
+
+    def __init__(self, urdf: yourdfpy.URDF, robot: pk.Robot, link_from_obj: np.ndarray, keypoints_obj: np.ndarray, natural_qpos: np.ndarray, active_mask: np.ndarray, max_iterations: int) -> None:
+        self.urdf = urdf
+        self.robot = robot
+        self.link_from_obj = np.asarray(link_from_obj, dtype=np.float64)
+        self.keypoints_obj = np.asarray(keypoints_obj, dtype=np.float64)
+        self.keypoints_link = np.stack([rtbase_transform_points(transform, points) for (transform, points) in zip(link_from_obj, keypoints_obj)], axis=0).astype(np.float32)
+        self.natural_qpos = np.asarray(natural_qpos, dtype=np.float32)
+        self.active_mask = np.asarray(active_mask, dtype=np.float32)
+        self.lower = np.asarray(robot.joints.lower_limits, dtype=np.float32)
+        self.upper = np.asarray(robot.joints.upper_limits, dtype=np.float32)
+        self.link_indices = np.asarray([robot.links.names.index(spec.robot_link_name) for spec in rtbase_FINGER_SPECS], dtype=np.int32)
+        self.max_iterations = int(max_iterations)
+        self._build_solver()
+
+    def _build_solver(self) -> None:
+        num_joints = len(self.natural_qpos)
+        num_fingers = len(rtbase_FINGER_SPECS)
+
+        class TargetVar(jaxls.Var[jax.Array], default_factory=lambda : jnp.zeros((num_fingers, 4, 3), dtype=jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+
+        class PreviousVar(jaxls.Var[jax.Array], default_factory=lambda : jnp.zeros((num_joints,), dtype=jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+        joint_var = self.robot.joint_var_cls(0)
+        target_var = TargetVar(0)
+        previous_var = PreviousVar(0)
+        robot = self.robot
+        link_indices = jnp.asarray(self.link_indices, dtype=jnp.int32)
+        points_link = jnp.asarray(self.keypoints_link, dtype=jnp.float32)
+        natural = jnp.asarray(self.natural_qpos, dtype=jnp.float32)
+        weights = jnp.asarray(self.active_mask * rtbase_NUMERICAL_ACTIVE_WEIGHT + (1.0 - self.active_mask) * rtbase_INACTIVE_JOINT_WEIGHT, dtype=jnp.float32)
+
+        @jaxls.Cost.factory
+        def alignment_cost(values: jaxls.VarValues, var_q: jaxls.Var[jnp.ndarray], var_target: jaxls.Var[jnp.ndarray]) -> jax.Array:
+            root_from_links = jaxlie.SE3(robot.forward_kinematics(cfg=values[var_q])[link_indices])
+            predicted = jnp.einsum('fij,fkj->fki', root_from_links.rotation().as_matrix(), points_link) + root_from_links.translation()[:, None, :]
+            return ((predicted - values[var_target]) * rtbase_POSITION_WEIGHT).reshape(-1)
+
+        @jaxls.Cost.factory
+        def seed_cost(values: jaxls.VarValues, var_q: jaxls.Var[jnp.ndarray], var_previous: jaxls.Var[jnp.ndarray]) -> jax.Array:
+            return ((values[var_q] - values[var_previous]) * weights).reshape(-1)
+        self.joint_var = joint_var
+        self.target_var = target_var
+        self.previous_var = previous_var
+        self.problem = jaxls.LeastSquaresProblem(costs=[alignment_cost(joint_var, target_var), pk.costs.rest_cost(joint_var, natural, weights), seed_cost(joint_var, previous_var), pk.costs.limit_constraint(robot, joint_var)], variables=[joint_var, target_var, previous_var]).analyze(use_onp=True)
+
+    def solve_frame(self, target_keypoints: np.ndarray, initial_qpos: np.ndarray) -> np.ndarray:
+        values = jaxls.VarValues.make([self.joint_var.with_value(jnp.asarray(initial_qpos, dtype=jnp.float32)), self.target_var.with_value(jnp.asarray(target_keypoints, dtype=jnp.float32)), self.previous_var.with_value(jnp.asarray(initial_qpos, dtype=jnp.float32))])
+        solution = self.problem.solve(initial_vals=values, verbose=False, linear_solver='conjugate_gradient', trust_region=jaxls.TrustRegionConfig(lambda_initial=rtbase_LAMBDA_INITIAL), termination=jaxls.TerminationConfig(max_iterations=self.max_iterations))
+        qpos = np.asarray(solution[self.joint_var], dtype=np.float32)
+        qpos = np.clip(qpos, self.lower, self.upper)
+        qpos[self.active_mask < 0.5] = self.natural_qpos[self.active_mask < 0.5]
+        return qpos
+
+    def solve_sequence(self, palm_from_cube: np.ndarray, cube_from_obj: np.ndarray) -> rtbase_SequenceSolution:
+        started = time.monotonic()
+        q_values: list[np.ndarray] = []
+        target_obj_values: list[np.ndarray] = []
+        predicted_obj_values: list[np.ndarray] = []
+        target_point_values: list[np.ndarray] = []
+        predicted_point_values: list[np.ndarray] = []
+        mean_errors: list[float] = []
+        max_errors: list[float] = []
+        previous = self.natural_qpos.copy()
+        frame_count = len(cube_from_obj)
+        for (frame_index, frame_cube_objs) in enumerate(cube_from_obj):
+            target_objs = np.stack([palm_from_cube @ cube_obj for cube_obj in frame_cube_objs], axis=0)
+            target_points = np.stack([rtbase_transform_points(transform, points) for (transform, points) in zip(target_objs, self.keypoints_obj)], axis=0)
+            qpos = self.solve_frame(target_points, previous)
+            previous = qpos
+            self.urdf.update_cfg(qpos)
+            predicted_objs: list[np.ndarray] = []
+            predicted_points: list[np.ndarray] = []
+            for (spec, link_obj, points_obj) in zip(rtbase_FINGER_SPECS, self.link_from_obj, self.keypoints_obj):
+                palm_link = np.asarray(self.urdf.get_transform(spec.robot_link_name, rtbase_ROOT_LINK_NAME, collision_geometry=False), dtype=np.float64)
+                palm_obj = palm_link @ link_obj
+                predicted_objs.append(palm_obj)
+                predicted_points.append(rtbase_transform_points(palm_obj, points_obj))
+            predicted_objs_array = np.stack(predicted_objs, axis=0)
+            predicted_points_array = np.stack(predicted_points, axis=0)
+            errors = np.linalg.norm(predicted_points_array - target_points, axis=-1)
+            q_values.append(qpos.copy())
+            target_obj_values.append(target_objs)
+            predicted_obj_values.append(predicted_objs_array)
+            target_point_values.append(target_points)
+            predicted_point_values.append(predicted_points_array)
+            mean_errors.append(float(np.mean(errors)))
+            max_errors.append(float(np.max(errors)))
+            if frame_index == 0 or (frame_index + 1) % 50 == 0:
+                print(f'\r[INFO] IK [{frame_index + 1:4d}/{frame_count}] mean={np.mean(mean_errors) * 1000.0:.3f} mm', end='', flush=True)
+        print()
+        return rtbase_SequenceSolution(qpos=np.asarray(q_values, dtype=np.float32), target_obj_poses=np.asarray(target_obj_values, dtype=np.float64), predicted_obj_poses=np.asarray(predicted_obj_values, dtype=np.float64), target_keypoints=np.asarray(target_point_values, dtype=np.float64), predicted_keypoints=np.asarray(predicted_point_values, dtype=np.float64), mean_error_m=np.asarray(mean_errors, dtype=np.float64), max_error_m=np.asarray(max_errors, dtype=np.float64), elapsed_seconds=time.monotonic() - started)
+
+def rtbase_fit_global_transform(cube_from_obj: np.ndarray, keypoints_obj: np.ndarray, predicted_keypoints: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    cube_points = np.asarray([[rtbase_transform_points(transform, points) for (transform, points) in zip(frame_transforms, keypoints_obj)] for frame_transforms in cube_from_obj], dtype=np.float64).reshape(-1, 3)
+    robot_points = np.asarray(predicted_keypoints, dtype=np.float64).reshape(-1, 3)
+    source_centroid = np.mean(cube_points, axis=0)
+    target_centroid = np.mean(robot_points, axis=0)
+    source_centered = cube_points - source_centroid
+    target_centered = robot_points - target_centroid
+    covariance = source_centered.T @ target_centered
+    (u, singular_values, vt) = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0.0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+    translation = target_centroid - rotation @ source_centroid
+    transform = rtbase_make_transform(rotation, translation)
+    fitted = (rotation @ cube_points.T).T + translation
+    residual = np.linalg.norm(fitted - robot_points, axis=-1)
+    return (transform, {'point_count': int(len(cube_points)), 'singular_values': singular_values.tolist(), 'fixed_q_mean_error_mm': float(np.mean(residual) * 1000.0)})
+
+def rtbase_run_alternating(solver: rtbase_IndexMiddleIKSolver, cube_from_obj: np.ndarray, keypoints_obj: np.ndarray, initial_transform: np.ndarray, max_iterations: int) -> tuple[np.ndarray, rtbase_SequenceSolution, list[dict[str, Any]], bool]:
+    transform = rtbase_validate_transform(initial_transform, 'initial transform').copy()
+    best_transform = transform.copy()
+    best_solution: rtbase_SequenceSolution | None = None
+    best_error = float('inf')
+    previous_error = float('inf')
+    converged = False
+    history: list[dict[str, Any]] = []
+    for iteration in range(max_iterations):
+        print(f'[INFO] alternating iteration {iteration + 1}')
+        solution = solver.solve_sequence(transform, cube_from_obj)
+        mean_error = float(np.mean(solution.mean_error_m))
+        if mean_error < best_error:
+            best_error = mean_error
+            best_transform = transform.copy()
+            best_solution = solution
+        (next_transform, fit_info) = rtbase_fit_global_transform(cube_from_obj, keypoints_obj, solution.predicted_keypoints)
+        rotation_change = float(np.linalg.norm(Rotation.from_matrix(next_transform[:3, :3] @ transform[:3, :3].T).as_rotvec()))
+        translation_change = float(np.linalg.norm(next_transform[:3, 3] - transform[:3, 3]))
+        history.append({'iteration': iteration + 1, 'mean_error_mm': mean_error * 1000.0, 'T_before': transform.tolist(), 'T_after': next_transform.tolist(), 'translation_change_m': translation_change, 'rotation_change_rad': rotation_change, 'registration': fit_info})
+        error_change = abs(previous_error - mean_error)
+        transform = next_transform
+        if translation_change < 1e-07 and rotation_change < 1e-06 and (error_change < 1e-07):
+            converged = True
+            break
+        previous_error = mean_error
+    print('[INFO] final IK')
+    final_solution = solver.solve_sequence(transform, cube_from_obj)
+    final_error = float(np.mean(final_solution.mean_error_m))
+    if final_error < best_error or best_solution is None:
+        return (transform, final_solution, history, converged)
+    return (best_transform, best_solution, history, converged)
+
+def rtbase_stats_mm(values_m: np.ndarray) -> dict[str, float]:
+    values = np.asarray(values_m, dtype=np.float64) * 1000.0
+    return {'mean_mm': float(np.mean(values)), 'median_mm': float(np.median(values)), 'p95_mm': float(np.percentile(values, 95.0)), 'max_mm': float(np.max(values))}
+
+def rtbase_summarize(name: str, transform: np.ndarray, solution: rtbase_SequenceSolution, history: list[dict[str, Any]], converged: bool, active_indices: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> dict[str, Any]:
+    errors = np.linalg.norm(solution.predicted_keypoints - solution.target_keypoints, axis=-1)
+    q_active = solution.qpos[:, active_indices]
+    margins = np.minimum(q_active - lower[active_indices][None, :], upper[active_indices][None, :] - q_active)
+    delta_rotation = transform[:3, :3] @ rtbase_T_PALM_CUBE_INITIAL[:3, :3].T
+    return {'name': name, 'fingers': [spec.name for spec in rtbase_FINGER_SPECS], 'frame_count': int(len(solution.qpos)), 'T_left_palm_link_hand_back_cube': transform.tolist(), 'translation_m': transform[:3, 3].tolist(), 'translation_delta_m': (transform[:3, 3] - rtbase_T_PALM_CUBE_INITIAL[:3, 3]).tolist(), 'rotation_delta_rotvec_deg': (Rotation.from_matrix(delta_rotation).as_rotvec() * 180.0 / np.pi).tolist(), 'all_keypoint_error': rtbase_stats_mm(errors.reshape(-1)), 'per_frame_mean_keypoint_error': rtbase_stats_mm(np.mean(errors, axis=(1, 2))), 'per_finger_keypoint_error': {spec.name: rtbase_stats_mm(errors[:, finger_index, :].reshape(-1)) for (finger_index, spec) in enumerate(rtbase_FINGER_SPECS)}, 'joint_limits': {'minimum_margin_rad': float(np.min(margins)), 'frames_at_limit': int(np.sum(np.any(margins < 1e-05, axis=1)))}, 'active_natural_pose_weight': rtbase_NUMERICAL_ACTIVE_WEIGHT, 'active_seed_weight': rtbase_NUMERICAL_ACTIVE_WEIGHT, 'ik_elapsed_seconds': float(solution.elapsed_seconds), 'alternating_iterations': len(history), 'converged': bool(converged), 'history': history}
+
+def rtbase_save_npz(path: Path, name: str, transform: np.ndarray, solution: rtbase_SequenceSolution, cube_from_obj: np.ndarray, timestamps: np.ndarray, source_indices: np.ndarray, keypoints_obj: np.ndarray, link_from_obj: np.ndarray, joint_names: list[str], active_indices: np.ndarray) -> None:
+    np.savez_compressed(path, schema=np.asarray('consens.left_wuji_index_middle_cube_calibration.v1'), result_name=np.asarray(name), finger_names=np.asarray([spec.name for spec in rtbase_FINGER_SPECS]), qpos=solution.qpos, joint_names=np.asarray(joint_names), active_joint_indices=active_indices, active_joint_names=np.asarray(rtbase_ACTIVE_JOINT_NAMES), timestamps=timestamps, source_record_indices=source_indices, T_left_palm_link_hand_back_cube=transform, T_hand_back_cube_obj=cube_from_obj, target_T_left_palm_link_obj=solution.target_obj_poses, predicted_T_left_palm_link_obj=solution.predicted_obj_poses, target_keypoints=solution.target_keypoints, predicted_keypoints=solution.predicted_keypoints, mean_keypoint_error_m=solution.mean_error_m, max_keypoint_error_m=solution.max_error_m, keypoints_obj_m=keypoints_obj, T_robot_link_obj=link_from_obj)
+
+def rtbase_parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Optimize index+middle contact surfaces and one global cube SE(3).')
+    parser.add_argument('pkl_path', nargs='?', type=Path, default=rtbase_DEFAULT_PKL_PATH)
+    parser.add_argument('--urdf', type=Path, default=rtbase_DEFAULT_URDF_PATH)
+    parser.add_argument('--contact-keypoints', type=Path, default=rtbase_DEFAULT_CONTACT_CONFIG)
+    parser.add_argument('--output-dir', type=Path, default=rtbase_DEFAULT_OUTPUT_DIR)
+    parser.add_argument('--index-only-result', type=Path, default=rtbase_DEFAULT_INDEX_ONLY_RESULT)
+    parser.add_argument('--initial-transform-npz', type=Path, help='Run one refinement path initialized from the T_left_palm_link_hand_back_cube stored in this NPZ.')
+    parser.add_argument('--start-name', default='refined_best', help='Result-name suffix used with --initial-transform-npz.')
+    parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--solver-iterations', type=int, default=rtbase_DEFAULT_SOLVER_ITERATIONS)
+    parser.add_argument('--alternating-iterations', type=int, default=rtbase_DEFAULT_ALTERNATING_ITERATIONS)
+    return parser.parse_args()
+
+def rtbase_main() -> None:
+    args = rtbase_parse_args()
+    pkl_path = args.pkl_path.expanduser().resolve()
+    urdf_path = args.urdf.expanduser().resolve()
+    contact_path = args.contact_keypoints.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    index_only_path = args.index_only_result.expanduser().resolve()
+    for path in (pkl_path, urdf_path, contact_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if args.max_frames is not None and args.max_frames <= 0:
+        raise ValueError('--max-frames must be positive')
+    if args.solver_iterations <= 0 or args.alternating_iterations <= 0:
+        raise ValueError('Iteration counts must be positive')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    keypoints_obj = rtbase_load_contact_keypoints(contact_path)
+    link_from_obj = rtbase_load_link_from_obj_transforms(urdf_path)
+    cache_path = output_dir / 'source_index_middle_poses.npz'
+    if cache_path.is_file() and args.max_frames is None:
+        with np.load(cache_path, allow_pickle=False) as archive:
+            cube_from_obj = np.asarray(archive['T_hand_back_cube_obj'], dtype=np.float64)
+            timestamps = np.asarray(archive['timestamps'], dtype=np.float64)
+            source_indices = np.asarray(archive['source_record_indices'], dtype=np.int32)
+        print(f'[INFO] Loaded source cache: {len(cube_from_obj)} frames')
+    else:
+        (cube_from_obj, timestamps, source_indices) = rtbase_load_source_poses(pkl_path, args.max_frames)
+        if args.max_frames is None:
+            np.savez_compressed(cache_path, T_hand_back_cube_obj=cube_from_obj, timestamps=timestamps, source_record_indices=source_indices)
+    urdf = rtbase_load_urdf(urdf_path)
+    joint_names = list(urdf.actuated_joint_names)
+    lower = np.asarray([float(urdf.joint_map[name].limit.lower) for name in joint_names], dtype=np.float32)
+    upper = np.asarray([float(urdf.joint_map[name].limit.upper) for name in joint_names], dtype=np.float32)
+    natural = np.clip(np.zeros(len(joint_names), dtype=np.float32), lower, upper)
+    active_indices = np.asarray([joint_names.index(name) for name in rtbase_ACTIVE_JOINT_NAMES], dtype=np.int32)
+    active_mask = np.zeros(len(joint_names), dtype=np.float32)
+    active_mask[active_indices] = 1.0
+    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=jnp.asarray(natural))
+    solver = rtbase_IndexMiddleIKSolver(urdf=urdf, robot=robot, link_from_obj=link_from_obj, keypoints_obj=keypoints_obj, natural_qpos=natural, active_mask=active_mask, max_iterations=int(args.solver_iterations))
+    if args.initial_transform_npz is not None:
+        initial_transform_path = args.initial_transform_npz.expanduser().resolve()
+        if not initial_transform_path.is_file():
+            raise FileNotFoundError(initial_transform_path)
+        with np.load(initial_transform_path, allow_pickle=False) as archive:
+            resumed_transform = rtbase_validate_transform(np.asarray(archive['T_left_palm_link_hand_back_cube'], dtype=np.float64), 'resumed transform')
+        starts: list[tuple[str, np.ndarray]] = [(str(args.start_name), resumed_transform)]
+        print(f'[INFO] Refining transform from: {initial_transform_path}')
+    else:
+        starts = [('theoretical', rtbase_T_PALM_CUBE_INITIAL)]
+        if index_only_path.is_file():
+            with np.load(index_only_path, allow_pickle=False) as archive:
+                index_only_transform = np.asarray(archive['T_left_palm_link_hand_back_cube'], dtype=np.float64)
+            starts.append(('index_only', index_only_transform))
+    results: dict[str, dict[str, Any]] = {}
+    result_paths: dict[str, str] = {}
+    for (start_name, initial_transform) in starts:
+        print(f'[INFO] Starting path: {start_name}')
+        (transform, solution, history, converged) = rtbase_run_alternating(solver, cube_from_obj, keypoints_obj, initial_transform, int(args.alternating_iterations))
+        result_name = f'unconstrained_from_{start_name}'
+        summary = rtbase_summarize(result_name, transform, solution, history, converged, active_indices, lower, upper)
+        result_path = output_dir / f'{result_name}.npz'
+        rtbase_save_npz(result_path, result_name, transform, solution, cube_from_obj, timestamps, source_indices, keypoints_obj, link_from_obj, joint_names, active_indices)
+        results[result_name] = summary
+        result_paths[result_name] = str(result_path)
+    best_name = min(results, key=lambda name: results[name]['all_keypoint_error']['mean_mm'])
+    report = {'schema': 'consens.left_wuji_index_middle_cube_experiments.v1', 'source_pkl': str(pkl_path), 'urdf': str(urdf_path), 'contact_keypoints': str(contact_path), 'scope': 'index+middle; 8 points; 8 active joints; one constant unconstrained cube SE(3)', 'best_result': best_name, 'result_npz': result_paths, 'experiments': results}
+    report_path = output_dir / 'experiment_summary.json'
+    with report_path.open('w', encoding='utf-8') as stream:
+        json.dump(report, stream, indent=2, ensure_ascii=False)
+        stream.write('\n')
+    print('\n[RESULT] index+middle all-keypoint errors')
+    for (name, summary) in results.items():
+        print(f"  {name:32s} {summary['all_keypoint_error']['mean_mm']:.3f} mm")
+    print(f'[RESULT] best: {best_name}')
+    print('[RESULT] T_left_palm_link_hand_back_cube:\n' + np.array2string(np.asarray(results[best_name]['T_left_palm_link_hand_back_cube']), precision=9, suppress_small=True))
+    print(f'[RESULT] summary: {report_path}')
+
+base = SimpleNamespace(
+    ACTIVE_JOINT_NAMES=rtbase_ACTIVE_JOINT_NAMES,
+    FINGER_SPECS=rtbase_FINGER_SPECS,
+    FingerSpec=rtbase_FingerSpec,
+    INACTIVE_JOINT_WEIGHT=rtbase_INACTIVE_JOINT_WEIGHT,
+    IndexMiddleIKSolver=rtbase_IndexMiddleIKSolver,
+    LAMBDA_INITIAL=rtbase_LAMBDA_INITIAL,
+    NUMERICAL_ACTIVE_WEIGHT=rtbase_NUMERICAL_ACTIVE_WEIGHT,
+    POSITION_WEIGHT=rtbase_POSITION_WEIGHT,
+    SequenceSolution=rtbase_SequenceSolution,
+    T_PALM_CUBE_INITIAL=rtbase_T_PALM_CUBE_INITIAL,
+    jax=jax,
+    jaxlie=jaxlie,
+    jaxls=jaxls,
+    jnp=jnp,
+    load_contact_keypoints=rtbase_load_contact_keypoints,
+    load_link_from_obj_transforms=rtbase_load_link_from_obj_transforms,
+    load_source_poses=rtbase_load_source_poses,
+    load_urdf=rtbase_load_urdf,
+    make_transform=rtbase_make_transform,
+    pk=pk,
+    stats_mm=rtbase_stats_mm,
+    summarize=rtbase_summarize,
+    transform_points=rtbase_transform_points,
+    validate_transform=rtbase_validate_transform,
+)
+
+import argparse
+import json
+import os
+import pickle
+import time
+from pathlib import Path
+from typing import Any, Literal
+import numpy as np
+import yaml
+from scipy.optimize import minimize
+from scipy.spatial.transform import Rotation
+rt_FILE_PATH = Path(__file__).resolve()
+rt_REPO_ROOT = APRILCUBE_ROOT.parent.parent
+rt_DEFAULT_PKL_PATH = rt_REPO_ROOT / 'thirdparty/aprilcube/recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl'
+rt_DEFAULT_URDF_PATH = rt_REPO_ROOT / 'thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf'
+rt_DEFAULT_CONTACT_CONFIG = rt_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints.yaml'
+rt_DEFAULT_OUTPUT_DIR = rt_REPO_ROOT / 'outputs/retargeting/021_new_intrinsics_recovered/three_finger'
+rt_EXPECTED_MIDDLE_INTRINSICS = '/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_scale0p25_2592x1944_0712_225925.yaml'
+rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/extrinsics_wrist_Q_thumb_web_cam_middle_finger_cam_apriltag_grid_offline_2samples_0712_030212_0712_031300.yaml')
+rt_MULTI_CAM_RAW_FORMAT = 'consens_multi_camera_sync_stream'
+rt_MULTI_CAM_SIDECAR_FORMAT = 'consensv2_multi_cam_020_pose_sidecar_v1'
+rt_MULTI_CAM_TARGET_MAPPING = {'thumb': {'sidecar_target': 'thumb_Q', 'camera': 'thumb_web_cam', 'cube_dir': 'cube_april_36h11_12_17_1x1x1_15mm'}, 'index': {'sidecar_target': 'index_Q', 'camera': 'thumb_web_cam', 'cube_dir': 'cube_april_36h11_6_11_1x1x1_15mm'}, 'middle': {'sidecar_target': 'middle_Q', 'camera': 'middle_finger_cam', 'cube_dir': 'cube_april_36h11_0_5_1x1x1_15mm'}}
+rt_SCHEMA = 'consens.left_wuji_three_finger_cube_calibration.v1'
+rt_COMPACT_PKL_FORMAT = 'consens.left_wuji_three_finger_retarget.compact.v2'
+rt_OPTIMIZED_CUBE_OFFSET_KEY = 'T_left_palm_link_hand_back_cube_6d_optimized'
+rt_DEFAULT_SOLVER_ITERATIONS = 100
+rt_DEFAULT_ALTERNATING_ITERATIONS = 30
+rt_DEFAULT_TEMPORAL_BRANCH_WEIGHT = 5e-05
+rt_DEFAULT_TEMPORAL_SEED_WEIGHT = 0.25
+rt_DEFAULT_JOINT_VELOCITY_WEIGHT = 9.3
+rt_DEFAULT_JOINT_ACCELERATION_WEIGHT = 0.62
+rt_DEFAULT_JOINT_JERK_WEIGHT = 0.026
+rt_DEFAULT_JOINT_OPTIMIZATION_ITERATIONS = 800
+rt_DEFAULT_JOINT_MAX_STEP_DEG = 2.1
+rt_DEFAULT_JOINT_MAX_STEP_WEIGHT = 165.0
+rt_Mode = Literal['fixed', 'translation', 'rotation', 'se3']
+rt_FINGER_SPECS = (base.FingerSpec('thumb', 'left_finger1_link4', 'left_finger1_', 'thumb.obj'), base.FingerSpec('index', 'left_finger2_link4', 'left_finger2_', 'index.obj'), base.FingerSpec('middle', 'left_finger3_link4', 'left_finger3_', 'middle.obj'))
+rt_ACTIVE_JOINT_NAMES = tuple((f'left_finger{finger_index}_joint{joint_index}' for finger_index in (1, 2, 3) for joint_index in range(1, 5)))
+base.FINGER_SPECS = rt_FINGER_SPECS
+base.ACTIVE_JOINT_NAMES = rt_ACTIVE_JOINT_NAMES
+base.NUMERICAL_ACTIVE_WEIGHT = 0.0
+# In the original two-module implementation the assignments above mutated the
+# imported base module globals.  The embedded namespace is a facade, so keep
+# the namespace-prefixed base globals in lockstep explicitly.
+rtbase_FINGER_SPECS = rt_FINGER_SPECS
+rtbase_ACTIVE_JOINT_NAMES = rt_ACTIVE_JOINT_NAMES
+rtbase_NUMERICAL_ACTIVE_WEIGHT = 0.0
+
+class rt_BatchedThreeFingerIKSolver(base.IndexMiddleIKSolver):
+    """Solve all independent frame IK problems in parallel on the accelerator."""
+
+    def _build_solver(self) -> None:
+        num_joints = len(self.natural_qpos)
+        num_fingers = len(rt_FINGER_SPECS)
+
+        class TargetVar(base.jaxls.Var[base.jax.Array], default_factory=lambda : base.jnp.zeros((num_fingers, 4, 3), dtype=base.jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+
+        class PointWeightVar(base.jaxls.Var[base.jax.Array], default_factory=lambda : base.jnp.ones((num_fingers, 4), dtype=base.jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+
+        class PreviousVar(base.jaxls.Var[base.jax.Array], default_factory=lambda : base.jnp.zeros((num_joints,), dtype=base.jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+
+        class SeedWeightVar(base.jaxls.Var[base.jax.Array], default_factory=lambda : base.jnp.zeros((num_joints,), dtype=base.jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+        joint_var = self.robot.joint_var_cls(0)
+        target_var = TargetVar(0)
+        point_weight_var = PointWeightVar(0)
+        previous_var = PreviousVar(0)
+        seed_weight_var = SeedWeightVar(0)
+        robot = self.robot
+        link_indices = base.jnp.asarray(self.link_indices, dtype=base.jnp.int32)
+        points_link = base.jnp.asarray(self.keypoints_link, dtype=base.jnp.float32)
+        natural = base.jnp.asarray(self.natural_qpos, dtype=base.jnp.float32)
+        inactive_weights = base.jnp.asarray((1.0 - self.active_mask) * base.INACTIVE_JOINT_WEIGHT, dtype=base.jnp.float32)
+
+        @base.jaxls.Cost.factory
+        def alignment_cost(values: base.jaxls.VarValues, var_q: base.jaxls.Var[base.jnp.ndarray], var_target: base.jaxls.Var[base.jnp.ndarray], var_weight: base.jaxls.Var[base.jnp.ndarray]) -> base.jax.Array:
+            root_from_links = base.jaxlie.SE3(robot.forward_kinematics(cfg=values[var_q])[link_indices])
+            predicted = base.jnp.einsum('fij,fkj->fki', root_from_links.rotation().as_matrix(), points_link) + root_from_links.translation()[:, None, :]
+            point_scale = base.jnp.sqrt(base.jnp.maximum(values[var_weight], 0.0))[..., None]
+            return ((predicted - values[var_target]) * point_scale * base.POSITION_WEIGHT).reshape(-1)
+
+        @base.jaxls.Cost.factory
+        def inactive_seed_cost(values: base.jaxls.VarValues, var_q: base.jaxls.Var[base.jnp.ndarray], var_previous: base.jaxls.Var[base.jnp.ndarray], var_seed_weight: base.jaxls.Var[base.jnp.ndarray]) -> base.jax.Array:
+            return ((values[var_q] - values[var_previous]) * values[var_seed_weight]).reshape(-1)
+        self.joint_var = joint_var
+        self.target_var = target_var
+        self.point_weight_var = point_weight_var
+        self.previous_var = previous_var
+        self.seed_weight_var = seed_weight_var
+        self.problem = base.jaxls.LeastSquaresProblem(costs=[alignment_cost(joint_var, target_var, point_weight_var), base.pk.costs.rest_cost(joint_var, natural, inactive_weights), inactive_seed_cost(joint_var, previous_var, seed_weight_var), base.pk.costs.limit_constraint(robot, joint_var)], variables=[joint_var, target_var, point_weight_var, previous_var, seed_weight_var]).analyze(use_onp=True)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.point_weights = np.asarray(kwargs.pop('point_weights'), dtype=np.float32)
+        self.ignored_joint_indices = np.asarray(kwargs.pop('ignored_joint_indices'), dtype=np.int32)
+        self.temporal_branch_weight = float(kwargs.pop('temporal_branch_weight', rt_DEFAULT_TEMPORAL_BRANCH_WEIGHT))
+        if self.temporal_branch_weight < 0.0:
+            raise ValueError('temporal_branch_weight must be nonnegative')
+        super().__init__(*args, **kwargs)
+        solver = self
+
+        def solve_one(target: Any, point_weight: Any, initial: Any, seed_weight: Any) -> Any:
+            values = base.jaxls.VarValues.make([solver.joint_var.with_value(initial), solver.target_var.with_value(target), solver.point_weight_var.with_value(point_weight), solver.previous_var.with_value(initial), solver.seed_weight_var.with_value(seed_weight)])
+            solution = solver.problem.solve(initial_vals=values, verbose=False, linear_solver='conjugate_gradient', trust_region=base.jaxls.TrustRegionConfig(lambda_initial=base.LAMBDA_INITIAL), termination=base.jaxls.TerminationConfig(max_iterations=solver.max_iterations))
+            return solution[solver.joint_var]
+        self._solve_batch_jax = base.jax.jit(base.jax.vmap(solve_one))
+        link_indices = base.jnp.asarray(self.link_indices, dtype=base.jnp.int32)
+        robot = self.robot
+
+        def fk_one(qpos: Any) -> Any:
+            return base.jaxlie.SE3(robot.forward_kinematics(cfg=qpos)[link_indices]).as_matrix()
+        self._fk_batch_jax = base.jax.jit(base.jax.vmap(fk_one))
+
+    def solve_q_batch(self, targets: np.ndarray, point_weights: np.ndarray, initial_qpos: np.ndarray, active_seed_weight: float=0.0) -> np.ndarray:
+        seed_weight = (1.0 - self.active_mask) * base.INACTIVE_JOINT_WEIGHT + self.active_mask * float(active_seed_weight)
+        seed_weights = np.tile(seed_weight[None, :], (len(np.asarray(targets)), 1)).astype(np.float32)
+        qpos = self._solve_batch_jax(base.jnp.asarray(targets, dtype=base.jnp.float32), base.jnp.asarray(point_weights, dtype=base.jnp.float32), base.jnp.asarray(initial_qpos, dtype=base.jnp.float32), base.jnp.asarray(seed_weights, dtype=base.jnp.float32))
+        base.jax.block_until_ready(qpos)
+        output = np.asarray(qpos, dtype=np.float32)
+        output = np.clip(output, self.lower[None, :], self.upper[None, :])
+        output[:, self.active_mask < 0.5] = self.natural_qpos[self.active_mask < 0.5]
+        return output
+
+    def refine_sequence_temporally(self, palm_from_cube: np.ndarray, cube_from_obj: np.ndarray, initial_qpos: np.ndarray, active_seed_weight: float) -> base.SequenceSolution:
+        if active_seed_weight <= 0.0:
+            raise ValueError('active_seed_weight must be positive')
+        target_obj_poses = np.einsum('ij,tfjk->tfik', np.asarray(palm_from_cube, dtype=np.float64), np.asarray(cube_from_obj, dtype=np.float64))
+        target_keypoints = np.einsum('tfij,fkj->tfki', target_obj_poses[:, :, :3, :3], self.keypoints_obj) + target_obj_poses[:, :, None, :3, 3]
+        qpos = np.asarray(initial_qpos, dtype=np.float32).copy()
+        for frame_index in range(1, len(qpos)):
+            qpos[frame_index] = self.solve_q_batch(target_keypoints[frame_index:frame_index + 1], self.point_weights[frame_index:frame_index + 1], qpos[frame_index - 1:frame_index], active_seed_weight=active_seed_weight)[0]
+        result = self.evaluate_qpos(qpos, target_obj_poses, target_keypoints)
+        active_delta = np.diff(qpos[:, self.active_mask > 0.5], axis=0)
+        maximum_active_step_deg = float(np.rad2deg(np.max(np.abs(active_delta))))
+        print(f'[INFO] Sequential temporal IK frames={len(qpos)} mean={np.mean(result.mean_error_m) * 1000.0:.3f} mm max_active_step={maximum_active_step_deg:.3f} deg seed_weight={active_seed_weight:.6f}')
+        return result
+
+    def optimize_sequence_jointly(self, palm_from_cube: np.ndarray, cube_from_obj: np.ndarray, timestamps: np.ndarray, initial_qpos: np.ndarray, velocity_weight: float, acceleration_weight: float, jerk_weight: float, max_step_deg: float, max_step_weight: float, max_iterations: int) -> tuple[base.SequenceSolution, dict[str, Any]]:
+        """Jointly optimize all frames for contact fit and C3 time smoothness."""
+        if min(velocity_weight, acceleration_weight, jerk_weight, max_step_deg, max_step_weight) < 0.0:
+            raise ValueError('Joint temporal weights must be nonnegative')
+        if max_iterations <= 0:
+            raise ValueError('Joint temporal max_iterations must be positive')
+        target_obj_poses = np.einsum('ij,tfjk->tfik', np.asarray(palm_from_cube, dtype=np.float64), np.asarray(cube_from_obj, dtype=np.float64))
+        target_keypoints = np.einsum('tfij,fkj->tfki', target_obj_poses[:, :, :3, :3], self.keypoints_obj) + target_obj_poses[:, :, None, :3, 3]
+        timestamps = np.asarray(timestamps, dtype=np.float64)
+        dt = np.diff(timestamps)
+        if len(dt) < 3 or np.any(~np.isfinite(dt)) or np.any(dt <= 0.0):
+            raise ValueError('Joint temporal optimization needs >=4 monotonic timestamps')
+        initial_qpos = np.asarray(initial_qpos, dtype=np.float32)
+        active_indices = np.flatnonzero(self.active_mask > 0.5).astype(np.int32)
+        inactive_qpos = base.jnp.asarray(initial_qpos, dtype=base.jnp.float32)
+        target_jax = base.jnp.asarray(target_keypoints, dtype=base.jnp.float32)
+        weights_jax = base.jnp.asarray(self.point_weights, dtype=base.jnp.float32)
+        link_from_obj_jax = base.jnp.asarray(self.link_from_obj, dtype=base.jnp.float32)
+        points_obj_jax = base.jnp.asarray(self.keypoints_obj, dtype=base.jnp.float32)
+        dt_jax = base.jnp.asarray(dt, dtype=base.jnp.float32)
+        active_indices_jax = base.jnp.asarray(active_indices, dtype=base.jnp.int32)
+        data_weight_sum = base.jnp.maximum(base.jnp.sum(weights_jax), 1.0)
+
+        def objective(active_flat: Any) -> Any:
+            active_qpos = active_flat.reshape((len(initial_qpos), len(active_indices)))
+            qpos = inactive_qpos.at[:, active_indices_jax].set(active_qpos)
+            root_from_links = self._fk_batch_jax(qpos)
+            root_from_obj = base.jnp.einsum('tfij,fjk->tfik', root_from_links, link_from_obj_jax)
+            predicted_keypoints = base.jnp.einsum('tfij,fkj->tfki', root_from_obj[:, :, :3, :3], points_obj_jax) + root_from_obj[:, :, None, :3, 3]
+            residual = predicted_keypoints - target_jax
+            data_mm2 = base.jnp.sum(residual * residual * weights_jax[..., None]) / data_weight_sum * 1000000.0
+            velocity = base.jnp.diff(active_qpos, axis=0) / dt_jax[:, None]
+            step_deg = base.jnp.abs(base.jnp.diff(active_qpos, axis=0)) * (180.0 / np.pi)
+            step_excess_deg = base.jnp.maximum(step_deg - float(max_step_deg), 0.0)
+            acceleration_dt = 0.5 * (dt_jax[1:] + dt_jax[:-1])
+            acceleration = base.jnp.diff(velocity, axis=0) / acceleration_dt[:, None]
+            jerk_dt = (dt_jax[2:] + dt_jax[1:-1] + dt_jax[:-2]) / 3.0
+            jerk = base.jnp.diff(acceleration, axis=0) / jerk_dt[:, None]
+            return data_mm2 + float(velocity_weight) * base.jnp.mean(velocity * velocity) + float(acceleration_weight) * base.jnp.mean(acceleration * acceleration) + float(jerk_weight) * base.jnp.mean(jerk * jerk) + float(max_step_weight) * base.jnp.mean(base.jnp.sum(step_excess_deg ** 2, axis=1))
+        value_and_grad = base.jax.jit(base.jax.value_and_grad(objective))
+
+        def scipy_value_and_grad(flat: np.ndarray) -> tuple[float, np.ndarray]:
+            (value, gradient) = value_and_grad(base.jnp.asarray(flat, dtype=base.jnp.float32))
+            base.jax.block_until_ready(value)
+            return (float(value), np.asarray(gradient, dtype=np.float64))
+        x0 = initial_qpos[:, active_indices].astype(np.float64).reshape(-1)
+        active_lower = self.lower[active_indices].astype(np.float64)
+        active_upper = self.upper[active_indices].astype(np.float64)
+        bounds = list(zip(np.tile(active_lower, len(initial_qpos)), np.tile(active_upper, len(initial_qpos))))
+        (initial_loss, _) = scipy_value_and_grad(x0)
+        optimized = minimize(scipy_value_and_grad, x0, method='L-BFGS-B', jac=True, bounds=bounds, options={'maxiter': int(max_iterations), 'ftol': 1e-10, 'gtol': 1e-07, 'maxls': 40})
+        qpos = initial_qpos.copy()
+        qpos[:, active_indices] = np.asarray(optimized.x.reshape((len(initial_qpos), len(active_indices))), dtype=np.float32)
+        result = self.evaluate_qpos(qpos, target_obj_poses, target_keypoints)
+        (final_loss, _) = scipy_value_and_grad(optimized.x)
+        metadata = {'method': 'confidence_weighted_four_point_plus_velocity_acceleration_jerk', 'optimizer': 'scipy_L-BFGS-B_with_JAX_gradient', 'success': bool(optimized.success), 'status': int(optimized.status), 'message': str(optimized.message), 'iterations': int(optimized.nit), 'function_evaluations': int(optimized.nfev), 'initial_total_loss': float(initial_loss), 'final_total_loss': float(final_loss), 'velocity_weight': float(velocity_weight), 'acceleration_weight': float(acceleration_weight), 'jerk_weight': float(jerk_weight), 'maximum_step_target_deg': float(max_step_deg), 'maximum_step_weight': float(max_step_weight), 'max_iterations': int(max_iterations)}
+        print(f'[INFO] Joint temporal optimization success={optimized.success} iterations={optimized.nit} loss={initial_loss:.6f}->{final_loss:.6f} mean={np.mean(result.mean_error_m) * 1000.0:.3f} mm')
+        return (result, metadata)
+
+    def evaluate_qpos(self, qpos: np.ndarray, target_obj_poses: np.ndarray, target_keypoints: np.ndarray) -> base.SequenceSolution:
+        started = time.monotonic()
+        link_poses = self._fk_batch_jax(base.jnp.asarray(qpos, dtype=base.jnp.float32))
+        base.jax.block_until_ready(link_poses)
+        link_poses_np = np.asarray(link_poses, dtype=np.float64)
+        predicted_obj_poses = np.einsum('tfij,fjk->tfik', link_poses_np, self.link_from_obj)
+        predicted_keypoints = np.einsum('tfij,fkj->tfki', predicted_obj_poses[:, :, :3, :3], self.keypoints_obj) + predicted_obj_poses[:, :, None, :3, 3]
+        errors = np.linalg.norm(predicted_keypoints - target_keypoints, axis=-1)
+        weights = np.asarray(self.point_weights, dtype=np.float64)
+        weight_sum = np.sum(weights, axis=(1, 2))
+        if np.any(weight_sum <= 0.0):
+            raise ValueError('Every frame must retain at least one positive-weight point')
+        mean_error_m = np.sum(errors * weights, axis=(1, 2)) / weight_sum
+        max_error_m = np.max(np.where(weights > 0.0, errors, -np.inf), axis=(1, 2))
+        return base.SequenceSolution(qpos=np.asarray(qpos, dtype=np.float32), target_obj_poses=np.asarray(target_obj_poses, dtype=np.float64), predicted_obj_poses=predicted_obj_poses, target_keypoints=np.asarray(target_keypoints, dtype=np.float64), predicted_keypoints=predicted_keypoints, mean_error_m=mean_error_m, max_error_m=max_error_m, elapsed_seconds=time.monotonic() - started)
+
+    def solve_sequence(self, palm_from_cube: np.ndarray, cube_from_obj: np.ndarray, initial_qpos: np.ndarray | None=None) -> base.SequenceSolution:
+        started = time.monotonic()
+        target_obj_poses = np.einsum('ij,tfjk->tfik', np.asarray(palm_from_cube, dtype=np.float64), np.asarray(cube_from_obj, dtype=np.float64))
+        target_keypoints = np.einsum('tfij,fkj->tfki', target_obj_poses[:, :, :3, :3], self.keypoints_obj) + target_obj_poses[:, :, None, :3, 3]
+        frame_count = len(target_obj_poses)
+        if self.point_weights.shape != (frame_count, len(rt_FINGER_SPECS), 4):
+            raise ValueError(f'Point weights must have shape ({frame_count}, {len(rt_FINGER_SPECS)}, 4); got {self.point_weights.shape}')
+        seeds = np.tile(self.natural_qpos[None, :], (frame_count, 1)) if initial_qpos is None else np.asarray(initial_qpos, dtype=np.float32)
+        primary = self.solve_q_batch(target_keypoints, self.point_weights, seeds)
+        forward_seed = primary.copy()
+        backward_seed = primary.copy()
+        if frame_count > 1:
+            forward_seed[1:] = primary[:-1]
+            backward_seed[:-1] = primary[1:]
+        forward = self.solve_q_batch(target_keypoints, self.point_weights, forward_seed)
+        backward = self.solve_q_batch(target_keypoints, self.point_weights, backward_seed)
+        candidates = np.stack([primary, forward, backward], axis=0)
+        candidate_errors = []
+        for candidate in candidates:
+            evaluated = self.evaluate_qpos(candidate, target_obj_poses, target_keypoints)
+            residual = evaluated.predicted_keypoints - target_keypoints
+            candidate_errors.append(np.sum(residual * residual * self.point_weights[..., None], axis=(1, 2, 3)))
+        emissions = np.stack(candidate_errors, axis=0)
+        if self.temporal_branch_weight > 0.0 and frame_count > 1:
+            state_count = len(candidates)
+            active_mask = np.asarray(self.active_mask, dtype=np.float64)
+            accumulated = np.empty_like(emissions, dtype=np.float64)
+            backpointers = np.zeros((frame_count, state_count), dtype=np.int32)
+            accumulated[:, 0] = emissions[:, 0]
+            for frame_index in range(1, frame_count):
+                difference = candidates[:, frame_index - 1, None, :] - candidates[None, :, frame_index, :]
+                transition = self.temporal_branch_weight * np.sum(difference * difference * active_mask[None, None, :], axis=-1)
+                total = accumulated[:, frame_index - 1, None] + transition
+                backpointers[frame_index] = np.argmin(total, axis=0)
+                accumulated[:, frame_index] = emissions[:, frame_index] + np.min(total, axis=0)
+            choice = np.zeros(frame_count, dtype=np.int32)
+            choice[-1] = int(np.argmin(accumulated[:, -1]))
+            for frame_index in range(frame_count - 1, 0, -1):
+                choice[frame_index - 1] = backpointers[frame_index, choice[frame_index]]
+        else:
+            choice = np.argmin(emissions, axis=0)
+        selected = candidates[choice, np.arange(frame_count)]
+        ignored_frames = np.flatnonzero(np.all(self.point_weights[:, 0, :] <= 0.0, axis=1))
+        for frame_index in ignored_frames:
+            if 0 < frame_index < frame_count - 1:
+                selected[frame_index, self.ignored_joint_indices] = 0.5 * (selected[frame_index - 1, self.ignored_joint_indices] + selected[frame_index + 1, self.ignored_joint_indices])
+            elif frame_index > 0:
+                selected[frame_index, self.ignored_joint_indices] = selected[frame_index - 1, self.ignored_joint_indices]
+            elif frame_count > 1:
+                selected[frame_index, self.ignored_joint_indices] = selected[frame_index + 1, self.ignored_joint_indices]
+        result = self.evaluate_qpos(selected, target_obj_poses, target_keypoints)
+        result.elapsed_seconds = time.monotonic() - started
+        active_delta = np.diff(selected[:, self.active_mask > 0.5], axis=0)
+        maximum_active_step_deg = float(np.rad2deg(np.max(np.abs(active_delta)))) if active_delta.size else 0.0
+        print(f'[INFO] Batched IK frames={frame_count} mean={np.mean(result.mean_error_m) * 1000.0:.3f} mm max_active_step={maximum_active_step_deg:.3f} deg elapsed={result.elapsed_seconds:.3f}s')
+        return result
+
+def rt_flatten_cube_points(cube_from_obj: np.ndarray, keypoints_obj: np.ndarray) -> np.ndarray:
+    return np.asarray([[base.transform_points(transform, points) for (transform, points) in zip(frame_transforms, keypoints_obj)] for frame_transforms in cube_from_obj], dtype=np.float64).reshape(-1, 3)
+
+def rt_kabsch_rotation(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    covariance = np.asarray(source, dtype=np.float64).T @ np.asarray(target, dtype=np.float64)
+    (u, singular_values, vt) = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0.0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+    return (rotation, singular_values)
+
+def rt_fit_transform_for_mode(mode: rt_Mode, cube_from_obj: np.ndarray, keypoints_obj: np.ndarray, predicted_keypoints: np.ndarray, point_weights: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    source = rt_flatten_cube_points(cube_from_obj, keypoints_obj)
+    target = np.asarray(predicted_keypoints, dtype=np.float64).reshape(-1, 3)
+    weights = np.asarray(point_weights, dtype=np.float64).reshape(-1)
+    valid = weights > 0.0
+    source = source[valid]
+    target = target[valid]
+    weights = weights[valid]
+    if not len(source):
+        raise ValueError('Global registration has no positive-weight points')
+    sqrt_weights = np.sqrt(weights)[:, None]
+    initial = base.T_PALM_CUBE_INITIAL
+    singular_values = np.zeros(3, dtype=np.float64)
+    if mode == 'translation':
+        rotation = initial[:3, :3].copy()
+        translation = np.average(target - (rotation @ source.T).T, axis=0, weights=weights)
+    elif mode == 'rotation':
+        translation = initial[:3, 3].copy()
+        (rotation, singular_values) = rt_kabsch_rotation(source * sqrt_weights, (target - translation[None, :]) * sqrt_weights)
+    elif mode == 'se3':
+        source_centroid = np.average(source, axis=0, weights=weights)
+        target_centroid = np.average(target, axis=0, weights=weights)
+        (rotation, singular_values) = rt_kabsch_rotation((source - source_centroid) * sqrt_weights, (target - target_centroid) * sqrt_weights)
+        translation = target_centroid - rotation @ source_centroid
+    else:
+        raise ValueError(f'Mode {mode!r} does not optimize a transform')
+    transform = base.make_transform(rotation, translation)
+    fitted = (rotation @ source.T).T + translation
+    errors = np.linalg.norm(fitted - target, axis=-1)
+    return (transform, {'mode': mode, 'point_count': int(len(source)), 'weight_sum': float(np.sum(weights)), 'singular_values': singular_values.tolist(), 'fixed_q_mean_error_mm': float(np.mean(errors) * 1000.0), 'fixed_q_rmse_mm': float(np.sqrt(np.mean(errors ** 2)) * 1000.0)})
+
+def rt_transform_change(previous: np.ndarray, current: np.ndarray) -> tuple[float, float]:
+    translation_m = float(np.linalg.norm(current[:3, 3] - previous[:3, 3]))
+    rotation_rad = float(np.linalg.norm(Rotation.from_matrix(current[:3, :3] @ previous[:3, :3].T).as_rotvec()))
+    return (translation_m, rotation_rad)
+
+def rt_objective_rmse_m(solution: base.SequenceSolution, point_weights: np.ndarray) -> float:
+    residual = np.asarray(solution.predicted_keypoints - solution.target_keypoints, dtype=np.float64)
+    squared_distance = np.sum(residual * residual, axis=-1)
+    weights = np.asarray(point_weights, dtype=np.float64)
+    return float(np.sqrt(np.sum(squared_distance * weights) / np.sum(weights)))
+
+def rt_trajectory_smoothness_stats(qpos: np.ndarray, timestamps: np.ndarray, active_indices: np.ndarray) -> dict[str, Any]:
+    active = np.asarray(qpos, dtype=np.float64)[:, active_indices]
+    dt = np.diff(np.asarray(timestamps, dtype=np.float64))
+    velocity = np.diff(active, axis=0) / dt[:, None]
+    acceleration_dt = 0.5 * (dt[1:] + dt[:-1])
+    acceleration = np.diff(velocity, axis=0) / acceleration_dt[:, None]
+    jerk_dt = (dt[2:] + dt[1:-1] + dt[:-2]) / 3.0
+    jerk = np.diff(acceleration, axis=0) / jerk_dt[:, None]
+    step_deg = np.rad2deg(np.diff(active, axis=0))
+
+    def stats(values: np.ndarray) -> dict[str, float]:
+        absolute = np.abs(np.asarray(values, dtype=np.float64))
+        return {'rms': float(np.sqrt(np.mean(absolute * absolute))), 'p95_abs': float(np.percentile(absolute, 95.0)), 'max_abs': float(np.max(absolute))}
+    flat_index = int(np.argmax(np.abs(step_deg)))
+    (transition, joint) = np.unravel_index(flat_index, step_deg.shape)
+    per_finger: dict[str, Any] = {}
+    for (finger_index, finger_name) in enumerate(('thumb', 'index', 'middle')):
+        selection = slice(4 * finger_index, 4 * (finger_index + 1))
+        finger_steps = step_deg[:, selection]
+        local_flat = int(np.argmax(np.abs(finger_steps)))
+        (local_transition, local_joint) = np.unravel_index(local_flat, finger_steps.shape)
+        per_finger[finger_name] = {**stats(finger_steps), 'maximum_transition': [int(local_transition), int(local_transition + 1)], 'maximum_joint_name': rt_ACTIVE_JOINT_NAMES[4 * finger_index + int(local_joint)]}
+    return {'step_deg': {**stats(step_deg), 'maximum_transition': [int(transition), int(transition + 1)], 'maximum_joint_name': rt_ACTIVE_JOINT_NAMES[int(joint)]}, 'velocity_rad_s': stats(velocity), 'acceleration_rad_s2': stats(acceleration), 'jerk_rad_s3': stats(jerk), 'per_finger_step_deg': per_finger}
+
+def rt_run_path(mode: rt_Mode, start_name: str, initial_transform: np.ndarray, solver: rt_BatchedThreeFingerIKSolver, cube_from_obj: np.ndarray, keypoints_obj: np.ndarray, point_weights: np.ndarray, alternating_iterations: int) -> tuple[np.ndarray, base.SequenceSolution, dict[str, Any]]:
+    transform = base.validate_transform(initial_transform, f'{mode}/{start_name} start').copy()
+    if mode == 'translation':
+        transform[:3, :3] = base.T_PALM_CUBE_INITIAL[:3, :3]
+    elif mode == 'rotation':
+        transform[:3, 3] = base.T_PALM_CUBE_INITIAL[:3, 3]
+    history: list[dict[str, Any]] = []
+    best_transform = transform.copy()
+    best_solution: base.SequenceSolution | None = None
+    best_rmse = float('inf')
+    converged = mode == 'fixed'
+    max_iterations = 1 if mode == 'fixed' else int(alternating_iterations)
+    q_seed: np.ndarray | None = None
+    for iteration in range(max_iterations):
+        print(f'[INFO] {mode}/{start_name}: IK-registration iteration {iteration + 1}/{max_iterations}')
+        solution = solver.solve_sequence(transform, cube_from_obj, q_seed)
+        q_seed = solution.qpos
+        rmse = rt_objective_rmse_m(solution, point_weights)
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_transform = transform.copy()
+            best_solution = solution
+        if mode == 'fixed':
+            break
+        (next_transform, registration) = rt_fit_transform_for_mode(mode, cube_from_obj, keypoints_obj, solution.predicted_keypoints, point_weights)
+        (translation_change_m, rotation_change_rad) = rt_transform_change(transform, next_transform)
+        history.append({'iteration': iteration + 1, 'objective_rmse_mm': rmse * 1000.0, 'T_before': transform.tolist(), 'T_after': next_transform.tolist(), 'translation_change_m': translation_change_m, 'rotation_change_rad': rotation_change_rad, 'registration': registration})
+        transform = next_transform
+        if translation_change_m < 1e-07 and rotation_change_rad < 1e-06:
+            converged = True
+            break
+    if mode != 'fixed':
+        print(f'[INFO] {mode}/{start_name}: final IK')
+        final_solution = solver.solve_sequence(transform, cube_from_obj, q_seed)
+        final_rmse = rt_objective_rmse_m(final_solution, point_weights)
+        if final_rmse < best_rmse or best_solution is None:
+            best_rmse = final_rmse
+            best_transform = transform.copy()
+            best_solution = final_solution
+    assert best_solution is not None
+    path_summary = {'start_name': start_name, 'mode': mode, 'objective_rmse_mm': best_rmse * 1000.0, 'converged': bool(converged), 'iterations': len(history), 'T_left_palm_link_hand_back_cube': best_transform.tolist(), 'history': history}
+    return (best_transform, best_solution, path_summary)
+
+def rt_deduplicate_starts(starts: list[tuple[str, np.ndarray]]) -> list[tuple[str, np.ndarray]]:
+    output: list[tuple[str, np.ndarray]] = []
+    for (name, transform) in starts:
+        if any((np.allclose(transform, existing, atol=1e-12) for (_, existing) in output)):
+            continue
+        output.append((name, transform))
+    return output
+
+def rt_summarize_best(mode: rt_Mode, best_start: str, transform: np.ndarray, solution: base.SequenceSolution, point_weights: np.ndarray, path_summaries: list[dict[str, Any]], ignored_observations: list[dict[str, Any]], active_indices: np.ndarray, lower: np.ndarray, upper: np.ndarray, temporal_branch_weight: float) -> dict[str, Any]:
+    summary = base.summarize(mode, transform, solution, [], any((item['converged'] for item in path_summaries)), active_indices, lower, upper)
+    residual = np.asarray(solution.predicted_keypoints - solution.target_keypoints, dtype=np.float64)
+    errors = np.linalg.norm(residual, axis=-1)
+    weights = np.asarray(point_weights, dtype=np.float64)
+    valid = weights > 0.0
+    per_frame_mean = np.sum(errors * weights, axis=(1, 2)) / np.sum(weights, axis=(1, 2))
+    summary['all_keypoint_error'] = base.stats_mm(errors[valid])
+    summary['per_frame_mean_keypoint_error'] = base.stats_mm(per_frame_mean)
+    summary['per_finger_keypoint_error'] = {spec.name: base.stats_mm(errors[:, finger_index, :][weights[:, finger_index, :] > 0.0]) for (finger_index, spec) in enumerate(rt_FINGER_SPECS)}
+    squared_distance = np.sum(residual * residual, axis=-1)
+    summary['unweighted_objective_rmse_mm'] = float(np.sqrt(np.mean(squared_distance)) * 1000.0)
+    reliable = weights >= 0.75
+    summary['reliable_direct_observation_rmse_mm'] = float(np.sqrt(np.mean(squared_distance[reliable])) * 1000.0)
+    summary['per_finger_confidence_weighted_rmse_mm'] = {spec.name: float(np.sqrt(np.sum(squared_distance[:, finger_index, :] * weights[:, finger_index, :]) / np.sum(weights[:, finger_index, :])) * 1000.0) for (finger_index, spec) in enumerate(rt_FINGER_SPECS)}
+    summary['observation_confidence'] = {'minimum': float(np.min(weights)), 'mean': float(np.mean(weights)), 'reliable_point_fraction': float(np.mean(reliable))}
+    summary.update({'mode': mode, 'best_start': best_start, 'objective': 'equal_weight_four_contact_point_squared_distance', 'objective_rmse_mm': float(np.sqrt(np.sum(np.sum(residual * residual, axis=-1) * weights) / np.sum(weights)) * 1000.0), 'active_natural_pose_weight': 0.0, 'active_temporal_smoothness_weight': float(temporal_branch_weight), 'ignored_observations': ignored_observations, 'path_summaries': path_summaries})
+    return summary
+
+def rt_save_npz(path: Path, mode: rt_Mode, best_start: str, transform: np.ndarray, solution: base.SequenceSolution, cube_from_obj: np.ndarray, timestamps: np.ndarray, source_indices: np.ndarray, keypoints_obj: np.ndarray, link_from_obj: np.ndarray, joint_names: list[str], active_indices: np.ndarray, point_weights: np.ndarray) -> None:
+    np.savez_compressed(path, schema=np.asarray(rt_SCHEMA), result_name=np.asarray(f'three_finger_{mode}'), mode=np.asarray(mode), best_start=np.asarray(best_start), finger_names=np.asarray([spec.name for spec in rt_FINGER_SPECS]), qpos=solution.qpos, joint_names=np.asarray(joint_names), active_joint_indices=active_indices, active_joint_names=np.asarray(rt_ACTIVE_JOINT_NAMES), timestamps=timestamps, source_record_indices=source_indices, T_left_palm_link_hand_back_cube=transform, T_hand_back_cube_obj=cube_from_obj, target_T_left_palm_link_obj=solution.target_obj_poses, predicted_T_left_palm_link_obj=solution.predicted_obj_poses, target_keypoints=solution.target_keypoints, predicted_keypoints=solution.predicted_keypoints, mean_keypoint_error_m=solution.mean_error_m, max_keypoint_error_m=solution.max_error_m, keypoints_obj_m=keypoints_obj, T_robot_link_obj=link_from_obj, keypoint_weights=point_weights)
+
+def rt_write_compact_pkl(path: Path, source_pkl: Path, mode: rt_Mode, best_start: str, summary: dict[str, Any], transform: np.ndarray, solution: base.SequenceSolution, timestamps: np.ndarray, source_indices: np.ndarray, joint_names: list[str], active_indices: np.ndarray, point_weights: np.ndarray, source_validation: dict[str, Any], overwrite: bool) -> None:
+    if path.exists() and (not overwrite):
+        raise FileExistsError(path)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.unlink(missing_ok=True)
+    header = {'type': 'header', 'format': rt_COMPACT_PKL_FORMAT, 'source_pkl': str(source_pkl), 'source_validation': source_validation, 'mode': mode, 'best_start': best_start, 'finger_names': [spec.name for spec in rt_FINGER_SPECS], 'joint_names': joint_names, 'active_joint_indices': active_indices, 'wujihand_qpos_joint_order': [joint_names[int(index)] for index in active_indices], 'wujihand_qpos_dimension': int(len(active_indices)), 'wujihand_qpos_unit': 'radian', rt_OPTIMIZED_CUBE_OFFSET_KEY: transform, 'cube_offset_transform_convention': 'p_left_palm_link = T_left_palm_link_hand_back_cube_6d_optimized @ p_hand_back_cube', 'summary': summary}
+    try:
+        with temporary.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            errors = np.linalg.norm(solution.predicted_keypoints - solution.target_keypoints, axis=-1)
+            for frame_index in range(len(solution.qpos)):
+                pickle.dump({'type': 'frame', 'frame_index': frame_index, 'source_record_index': int(source_indices[frame_index]), 'timestamp': float(timestamps[frame_index]), 'wujihand_qpos': solution.qpos[frame_index, active_indices], 'target_T_left_palm_link_obj': solution.target_obj_poses[frame_index], 'predicted_T_left_palm_link_obj': solution.predicted_obj_poses[frame_index], 'target_keypoints': solution.target_keypoints[frame_index], 'predicted_keypoints': solution.predicted_keypoints[frame_index], 'keypoint_error_m': errors[frame_index], 'keypoint_weight': point_weights[frame_index]}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def rt__is_direct_pose(pose: dict[str, Any]) -> bool:
+    source = str(pose.get('pose_source', ''))
+    return not bool(pose.get('pose_filled', False)) and (not any((token in source for token in ('rgb_flow', 'interpolation'))))
+
+def rt__interpolate_transform(previous: np.ndarray, following: np.ndarray, alpha: float) -> np.ndarray:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    output = np.eye(4, dtype=np.float64)
+    output[:3, 3] = (1.0 - alpha) * previous[:3, 3] + alpha * following[:3, 3]
+    relative = previous[:3, :3].T @ following[:3, :3]
+    output[:3, :3] = previous[:3, :3] @ Rotation.from_rotvec(alpha * Rotation.from_matrix(relative).as_rotvec()).as_matrix()
+    return output
+
+def rt_calibrate_observation_confidences(pose_rows: list[list[dict[str, Any]]], transforms: np.ndarray, timestamps: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Calibrate continuous weights from image quality and held-out tag motion."""
+    frame_count = len(pose_rows)
+    confidences = np.zeros((frame_count, len(rt_FINGER_SPECS)), dtype=np.float32)
+    report: dict[str, Any] = {'method': 'continuous image-quality likelihood multiplied by direct-tag leave-one-out SE3 temporal consistency', 'ground_truth_status': 'No external mocap ground truth; direct tag detections are held out one frame at a time as a measurable proxy validation set.', 'per_finger': {}}
+
+    def finite_values(values: list[float], fallback: float) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        array = array[np.isfinite(array)]
+        return array if len(array) else np.asarray([fallback], dtype=np.float64)
+
+    def lower_is_better(value: float, center: float, scale: float) -> float:
+        if not np.isfinite(value):
+            return 0.25
+        excess = max(float(value) - float(center), 0.0)
+        return float(np.exp(-excess / max(float(scale), 1e-06)))
+
+    def stats(values: list[float]) -> dict[str, float]:
+        array = finite_values(values, 0.0)
+        return {'mean': float(np.mean(array)), 'median': float(np.median(array)), 'p95': float(np.percentile(array, 95.0)), 'max': float(np.max(array))}
+    for (finger_index, spec) in enumerate(rt_FINGER_SPECS):
+        records = [row[finger_index] for row in pose_rows]
+        direct = np.asarray([rt__is_direct_pose(record) for record in records])
+        direct_indices = np.flatnonzero(direct)
+        direct_reprojection = finite_values([float(records[index].get('reproj_error', np.nan)) for index in direct_indices], 1.0)
+        reprojection_center = float(np.median(direct_reprojection))
+        reprojection_scale = max(float(np.percentile(direct_reprojection, 90.0) - reprojection_center), 0.25)
+        direct_edges = finite_values([float(records[index].get('edge_score', np.nan)) for index in direct_indices], 0.5)
+        edge_low = float(np.percentile(direct_edges, 10.0))
+        edge_high = max(float(np.percentile(direct_edges, 90.0)), edge_low + 0.05)
+        previous_direct = np.full(frame_count, -1, dtype=np.int32)
+        following_direct = np.full(frame_count, -1, dtype=np.int32)
+        last = -1
+        for frame_index in range(frame_count):
+            previous_direct[frame_index] = last
+            if direct[frame_index]:
+                last = frame_index
+        last = -1
+        for frame_index in range(frame_count - 1, -1, -1):
+            following_direct[frame_index] = last
+            if direct[frame_index]:
+                last = frame_index
+        innovation_translation_mm = np.full(frame_count, np.nan, dtype=np.float64)
+        innovation_rotation_deg = np.full(frame_count, np.nan, dtype=np.float64)
+        bracket_seconds = np.full(frame_count, np.nan, dtype=np.float64)
+        for frame_index in range(frame_count):
+            before = int(previous_direct[frame_index])
+            after = int(following_direct[frame_index])
+            if before < 0 or after < 0:
+                continue
+            duration = float(timestamps[after] - timestamps[before])
+            if duration <= 0.0:
+                continue
+            alpha = float((timestamps[frame_index] - timestamps[before]) / duration)
+            predicted = rt__interpolate_transform(transforms[before, finger_index], transforms[after, finger_index], alpha)
+            observed = transforms[frame_index, finger_index]
+            innovation_translation_mm[frame_index] = np.linalg.norm(observed[:3, 3] - predicted[:3, 3]) * 1000.0
+            innovation_rotation_deg[frame_index] = np.rad2deg(np.linalg.norm(Rotation.from_matrix(predicted[:3, :3].T @ observed[:3, :3]).as_rotvec()))
+            bracket_seconds[frame_index] = duration
+        held_out_translation = innovation_translation_mm[direct]
+        held_out_rotation = innovation_rotation_deg[direct]
+        translation_scale = max(float(np.nanpercentile(held_out_translation, 95.0)), 0.5)
+        rotation_scale = max(float(np.nanpercentile(held_out_rotation, 95.0)), 0.5)
+        flow_indices = [index for (index, record) in enumerate(records) if 'rgb_flow' in str(record.get('pose_source', ''))]
+        flow_reprojection = finite_values([float(records[index].get('reproj_error', np.nan)) for index in flow_indices], reprojection_center + reprojection_scale)
+        flow_fb = finite_values([float(records[index].get('flow_fb_median_px', np.nan)) for index in flow_indices], 1.0)
+        flow_agreement = finite_values([float(records[index].get('flow_current_tag_corner_agreement_px', np.nan)) for index in flow_indices], 5.0)
+        flow_reprojection_reference = max(float(np.median(flow_reprojection)), 0.5)
+        flow_fb_reference = max(float(np.median(flow_fb)), 0.25)
+        flow_agreement_reference = max(float(np.median(flow_agreement)), 1.0)
+        median_dt = float(np.median(np.diff(timestamps)))
+        for (frame_index, record) in enumerate(records):
+            source = str(record.get('pose_source', ''))
+            reprojection = float(record.get('reproj_error', np.nan))
+            reprojection_score = lower_is_better(reprojection, reprojection_center, reprojection_scale)
+            point_score = float(np.clip(record.get('point_inlier_fraction', 1.0), 0.05, 1.0))
+            edge = float(record.get('edge_score', np.nan))
+            edge_score = 1.0 if not np.isfinite(edge) else float(np.clip((edge - edge_low) / (edge_high - edge_low), 0.1, 1.0))
+            if direct[frame_index]:
+                image_score = float((reprojection_score * point_score * edge_score) ** (1.0 / 3.0))
+                multi_tag_bonus = min(max(int(record.get('n_tags', 1)) - 1, 0), 2)
+                confidences[frame_index, finger_index] = np.clip(0.6 + 0.3 * image_score + 0.05 * multi_tag_bonus, 0.6, 1.0)
+                continue
+            translation_innovation = innovation_translation_mm[frame_index]
+            rotation_innovation = innovation_rotation_deg[frame_index]
+            temporal_score = 0.35
+            if np.isfinite(translation_innovation) and np.isfinite(rotation_innovation):
+                temporal_score = float(np.exp(-0.5 * ((translation_innovation / translation_scale) ** 2 + (rotation_innovation / rotation_scale) ** 2)))
+            if 'rgb_flow' in source:
+                fb = float(record.get('flow_fb_median_px', np.nan))
+                agreement = float(record.get('flow_current_tag_corner_agreement_px', np.nan))
+                if not np.isfinite(reprojection):
+                    reprojection = 2.0 * flow_reprojection_reference
+                if not np.isfinite(fb):
+                    fb = 2.0 * flow_fb_reference
+                if not np.isfinite(agreement):
+                    agreement = 2.0 * flow_agreement_reference
+                inlier_ratio = float(np.clip(record.get('flow_homography_inlier_ratio', 0.0), 0.01, 1.0))
+                flow_score = (1.0 / (1.0 + (max(reprojection, 0.0) / flow_reprojection_reference) ** 2) * 1.0 / (1.0 + (max(fb, 0.0) / flow_fb_reference) ** 2) * 1.0 / (1.0 + (max(agreement, 0.0) / flow_agreement_reference) ** 2) * inlier_ratio * temporal_score) ** 0.2
+                if bool(record.get('flow_anchor_is_filled', False)):
+                    flow_score *= 0.65
+                confidences[frame_index, finger_index] = np.clip(0.04 + 0.46 * flow_score, 0.04, 0.5)
+            else:
+                span = bracket_seconds[frame_index]
+                span_score = 0.25 if not np.isfinite(span) else float(np.exp(-max(span - 2.0 * median_dt, 0.0) / (4.0 * median_dt)))
+                confidences[frame_index, finger_index] = np.clip(0.04 + 0.36 * np.sqrt(span_score * temporal_score), 0.04, 0.4)
+        finger_confidence = confidences[:, finger_index]
+        report['per_finger'][spec.name] = {'direct_frame_count': int(np.sum(direct)), 'filled_frame_count': int(np.sum(~direct)), 'held_out_direct_frame_count': int(np.sum(np.isfinite(held_out_translation) & np.isfinite(held_out_rotation))), 'held_out_direct_translation_error_mm': stats(held_out_translation.tolist()), 'held_out_direct_rotation_error_deg': stats(held_out_rotation.tolist()), 'direct_reprojection_center_px': reprojection_center, 'direct_reprojection_scale_px': reprojection_scale, 'temporal_translation_scale_mm': translation_scale, 'temporal_rotation_scale_deg': rotation_scale, 'confidence': stats(finger_confidence.tolist()), 'minimum_confidence_frames': np.argsort(finger_confidence)[:8].tolist()}
+    return (confidences, report)
+
+def rt_load_multi_cam_sidecar_poses(raw_path: Path, sidecar_path: Path, max_frames: int | None, wrist_extrinsics_override: Path | None=None) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load 0717 multi-camera poses, correcting thumb/index by physical Cube ID."""
+    with raw_path.open('rb') as stream:
+        raw_header = pickle.load(stream)
+    if not isinstance(raw_header, dict) or raw_header.get('format') != rt_MULTI_CAM_RAW_FORMAT:
+        raise ValueError(f"Unsupported multi-camera raw format: {raw_header.get('format')!r}")
+    raw_frame_count = int(raw_header.get('num_samples', -1))
+    if raw_frame_count <= 0:
+        raise ValueError('Multi-camera raw header has no positive num_samples')
+    with sidecar_path.open('rb') as stream:
+        sidecar_header_preview = pickle.load(stream)
+    if not isinstance(sidecar_header_preview, dict) or sidecar_header_preview.get('format') != rt_MULTI_CAM_SIDECAR_FORMAT:
+        raise ValueError(f"Unsupported pose sidecar format: {sidecar_header_preview.get('format')!r}")
+    wrist_target_metadata = sidecar_header_preview.get('metadata', {}).get('targets', {}).get('wrist_Q')
+    if not isinstance(wrist_target_metadata, dict):
+        raise KeyError('Sidecar metadata has no wrist_Q target')
+    final_smoothing = sidecar_header_preview.get('metadata', {}).get('final_global_smoothing', {})
+    required_targets = {'wrist_Q', 'index_Q', 'thumb_Q', 'middle_Q'}
+    applied_counts = final_smoothing.get('applied_counts', {}) or {}
+    if not bool(final_smoothing.get('complete', False)) or not bool(final_smoothing.get('completion_barrier_passed', False)) or int(final_smoothing.get('frame_count', -1)) != raw_frame_count or (set(final_smoothing.get('targets', [])) != required_targets) or any((int(applied_counts.get(name, -1)) != raw_frame_count for name in required_targets)):
+        raise ValueError('Retargeting requires a complete stage13 sidecar: all wrist/index/thumb/middle poses must exist before final global smoothing. Run this 020 pipeline from the multi-camera raw PKL first.')
+    expected_wrist_cube_dir = Path(str(wrist_target_metadata.get('cube_cfg', ''))).name
+    raw_extrinsics_value = raw_header.get('metadata', {}).get('wrist_extrinsics_yaml')
+    candidates: list[Path] = []
+    if wrist_extrinsics_override is not None:
+        candidates.append(wrist_extrinsics_override.expanduser().resolve())
+    else:
+        if raw_extrinsics_value:
+            candidates.append(Path(str(raw_extrinsics_value)).expanduser().resolve())
+        candidates.append(rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS.expanduser().resolve())
+    wrist_extrinsics_path: Path | None = None
+    wrist_payload: dict[str, Any] | None = None
+    rejected_extrinsics: list[dict[str, str]] = []
+    for candidate in dict.fromkeys(candidates):
+        if not candidate.is_file():
+            rejected_extrinsics.append({'path': str(candidate), 'reason': 'file_not_found'})
+            continue
+        with candidate.open('r', encoding='utf-8') as stream:
+            payload = yaml.safe_load(stream)
+        actual_wrist_cube_dir = Path(str(payload.get('inputs', {}).get('aprilcube_cfg_dir', ''))).name
+        if actual_wrist_cube_dir != expected_wrist_cube_dir:
+            rejected_extrinsics.append({'path': str(candidate), 'reason': f'cube_cfg_mismatch:{actual_wrist_cube_dir!r}!={expected_wrist_cube_dir!r}'})
+            continue
+        wrist_extrinsics_path = candidate
+        wrist_payload = payload
+        break
+    if wrist_extrinsics_path is None or wrist_payload is None:
+        raise ValueError(f'No wrist extrinsics use the same Q cube model as wrist_Q: expected={expected_wrist_cube_dir!r}, rejected={rejected_extrinsics}')
+    world_from_camera = {camera: base.validate_transform(np.asarray(wrist_payload[f'Q_T_{camera}'], dtype=np.float64), f'{wrist_extrinsics_path}:Q_T_{camera}') for camera in ('thumb_web_cam', 'middle_finger_cam')}
+    poses: list[np.ndarray] = []
+    pose_quality_rows: list[list[dict[str, Any]]] = []
+    pose_source_counts: dict[str, dict[str, int]] = {spec.name: {} for spec in rt_FINGER_SPECS}
+    timestamps: list[float] = []
+    source_indices: list[int] = []
+    footer: dict[str, Any] | None = None
+    with sidecar_path.open('rb') as stream:
+        sidecar_header = pickle.load(stream)
+        if not isinstance(sidecar_header, dict) or sidecar_header.get('format') != rt_MULTI_CAM_SIDECAR_FORMAT:
+            raise ValueError(f"Unsupported pose sidecar format: {sidecar_header.get('format')!r}")
+        if Path(str(sidecar_header.get('source_multi_cam_pkl', ''))).resolve() != raw_path:
+            raise ValueError('Pose sidecar source_multi_cam_pkl does not match raw PKL')
+        expected_identity = {'size': int(raw_path.stat().st_size), 'mtime_ns': int(raw_path.stat().st_mtime_ns)}
+        if sidecar_header.get('source_multi_cam_identity') != expected_identity:
+            raise ValueError('Pose sidecar source identity does not match raw PKL')
+        target_metadata = sidecar_header.get('metadata', {}).get('targets', {})
+        for (finger_name, mapping) in rt_MULTI_CAM_TARGET_MAPPING.items():
+            target_name = str(mapping['sidecar_target'])
+            metadata = target_metadata.get(target_name)
+            if not isinstance(metadata, dict):
+                raise KeyError(f'Sidecar metadata has no target {target_name!r}')
+            actual_cube_dir = Path(str(metadata.get('cube_cfg', ''))).name
+            if actual_cube_dir != mapping['cube_dir']:
+                raise ValueError(f"{finger_name} must use physical Cube {mapping['cube_dir']}, but sidecar target {target_name} uses {actual_cube_dir!r}")
+            if metadata.get('camera_name') != mapping['camera']:
+                raise ValueError(f"{target_name} camera mismatch: {metadata.get('camera_name')!r}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get('type') == 'footer':
+                footer = record
+                break
+            if record.get('type') != 'frame':
+                continue
+            sample_index = int(record.get('sample_index', -1))
+            if sample_index != len(source_indices):
+                raise ValueError(f'Sidecar sample_index is not contiguous: got {sample_index}, expected {len(source_indices)}')
+            frame_poses = record.get('poses', {})
+            current: list[np.ndarray] = []
+            current_quality: list[dict[str, Any]] = []
+            for spec in rt_FINGER_SPECS:
+                mapping = rt_MULTI_CAM_TARGET_MAPPING[spec.name]
+                target_name = str(mapping['sidecar_target'])
+                pose = frame_poses.get(target_name)
+                if not isinstance(pose, dict) or not bool(pose.get('success', False)) or pose.get('T') is None:
+                    raise ValueError(f'Sidecar frame {sample_index} has no valid {target_name} pose')
+                if not bool(pose.get('final_global_smoothing_applied', False)):
+                    raise ValueError(f'Sidecar frame {sample_index} {target_name} bypassed the mandatory final global smoothing stage')
+                camera_from_obj = np.asarray(pose['T'], dtype=np.float64).copy()
+                camera_from_obj[:3, 3] *= 0.001
+                camera_from_obj = base.validate_transform(camera_from_obj, f'sidecar frame {sample_index} {target_name}')
+                current.append(world_from_camera[str(mapping['camera'])] @ camera_from_obj)
+                current_quality.append(pose)
+                pose_source = str(pose.get('pose_source', 'unknown'))
+                source_counts = pose_source_counts[spec.name]
+                source_counts[pose_source] = source_counts.get(pose_source, 0) + 1
+            poses.append(np.stack(current, axis=0))
+            pose_quality_rows.append(current_quality)
+            timestamps.append(float(record.get('time_monotonic', sample_index)))
+            source_indices.append(sample_index)
+            if max_frames is not None and len(poses) >= max_frames:
+                break
+    if not poses:
+        raise ValueError('Pose sidecar contains no usable three-finger frames')
+    if max_frames is None:
+        if len(poses) != raw_frame_count:
+            raise ValueError(f'Raw/sidecar frame count mismatch: {raw_frame_count} != {len(poses)}')
+        if footer is None or int(footer.get('frame_count', -1)) != len(poses):
+            raise ValueError('Pose sidecar footer frame_count mismatch')
+        required_targets = {'wrist_Q', 'index_Q', 'thumb_Q', 'middle_Q'}
+        success_counts = footer.get('success_counts', {}) or {}
+        applied_counts = footer.get('final_global_smoothing_applied_counts', {}) or {}
+        if not bool(footer.get('final_global_smoothing_complete', False)) or any((int(success_counts.get(name, -1)) != len(poses) for name in required_targets)) or any((int(applied_counts.get(name, -1)) != len(poses) for name in required_targets)):
+            raise ValueError('Pose sidecar footer does not certify complete stage13 smoothing for every target/frame')
+    mapping_summary = {finger_name: {'sidecar_target': str(mapping['sidecar_target']), 'camera': str(mapping['camera']), 'physical_cube': str(mapping['cube_dir'])} for (finger_name, mapping) in rt_MULTI_CAM_TARGET_MAPPING.items()}
+    poses_array = np.asarray(poses, dtype=np.float64)
+    timestamps_array = np.asarray(timestamps, dtype=np.float64)
+    (observation_confidences, confidence_calibration) = rt_calibrate_observation_confidences(pose_quality_rows, poses_array, timestamps_array)
+    validation = {'source_kind': 'multi_camera_020_pose_sidecar', 'raw_format': rt_MULTI_CAM_RAW_FORMAT, 'pose_sidecar': str(sidecar_path), 'pose_sidecar_format': rt_MULTI_CAM_SIDECAR_FORMAT, 'wrist_extrinsics': str(wrist_extrinsics_path), 'wrist_cube_cfg': expected_wrist_cube_dir, 'rejected_wrist_extrinsics': rejected_extrinsics, 'frame_count': int(len(poses)), 'finger_mapping_by_physical_cube_id': mapping_summary, 'observation_confidence_calibration': confidence_calibration, 'pose_source_counts': pose_source_counts, 'final_global_smoothing': final_smoothing}
+    return (validation, poses_array, timestamps_array, np.asarray(source_indices, dtype=np.int32), observation_confidences)
+
+def rt_validate_source_pkl(path: Path) -> dict[str, Any]:
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+    metadata = header.get('metadata', {})
+    middle_intrinsics = metadata.get('camera_intrinsics_yaml', {}).get('middle_finger_cam')
+    if middle_intrinsics != rt_EXPECTED_MIDDLE_INTRINSICS:
+        raise ValueError(f'Source PKL does not contain the corrected middle intrinsics: {middle_intrinsics!r}')
+    recovery = metadata.get('rgb_pose_recovery', {})
+    recovered_count = recovery.get('quality_summary', {}).get('recovered_pose_count')
+    if recovered_count != 6:
+        raise ValueError('Source PKL does not contain the expected six recovered middle poses')
+    return {'middle_intrinsics': middle_intrinsics, 'recovery_algorithm': recovery.get('algorithm'), 'recovered_pose_count': int(recovered_count)}
+
+def rt_parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Three-finger four-point global cube-pose experiments.')
+    parser.add_argument('pkl_path', nargs='?', type=Path, default=rt_DEFAULT_PKL_PATH)
+    parser.add_argument('--pose-sidecar', type=Path, help='Aligned consensv2_multi_cam_020_pose_sidecar_v1 input. When set, pkl_path is the original multi-camera raw stream.')
+    parser.add_argument('--wrist-extrinsics', type=Path, help='Optional Q_T_camera YAML override. Its AprilCube model must match the sidecar wrist_Q cube model.')
+    parser.add_argument('--urdf', type=Path, default=rt_DEFAULT_URDF_PATH)
+    parser.add_argument('--contact-keypoints', type=Path, default=rt_DEFAULT_CONTACT_CONFIG)
+    parser.add_argument('--output-dir', type=Path, default=rt_DEFAULT_OUTPUT_DIR)
+    parser.add_argument('--modes', nargs='+', choices=('fixed', 'translation', 'rotation', 'se3'), default=('fixed', 'translation', 'rotation', 'se3'))
+    parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--solver-iterations', type=int, default=rt_DEFAULT_SOLVER_ITERATIONS)
+    parser.add_argument('--alternating-iterations', type=int, default=rt_DEFAULT_ALTERNATING_ITERATIONS)
+    parser.add_argument('--temporal-branch-weight', type=float, default=rt_DEFAULT_TEMPORAL_BRANCH_WEIGHT, help='Dynamic-programming penalty in m^2/rad^2 for switching between per-frame IK branches.')
+    parser.add_argument('--temporal-seed-weight', type=float, default=rt_DEFAULT_TEMPORAL_SEED_WEIGHT, help='Active-joint continuity weight used by the final chronological sequential IK refinement.')
+    parser.add_argument('--temporal-refine-only', action='store_true', help='Keep the existing three_finger_se3 offset and run only the final chronological sequential IK refinement.')
+    parser.add_argument('--joint-temporal-optimize', action='store_true', help='Jointly optimize all frame qpos using confidence-weighted four-point contact error plus velocity, acceleration, and jerk penalties.')
+    parser.add_argument('--joint-velocity-weight', type=float, default=rt_DEFAULT_JOINT_VELOCITY_WEIGHT)
+    parser.add_argument('--joint-acceleration-weight', type=float, default=rt_DEFAULT_JOINT_ACCELERATION_WEIGHT)
+    parser.add_argument('--joint-jerk-weight', type=float, default=rt_DEFAULT_JOINT_JERK_WEIGHT)
+    parser.add_argument('--joint-optimization-iterations', type=int, default=rt_DEFAULT_JOINT_OPTIMIZATION_ITERATIONS)
+    parser.add_argument('--joint-max-step-deg', type=float, default=rt_DEFAULT_JOINT_MAX_STEP_DEG)
+    parser.add_argument('--joint-max-step-weight', type=float, default=rt_DEFAULT_JOINT_MAX_STEP_WEIGHT)
+    parser.add_argument('--overwrite', action='store_true')
+    return parser.parse_args()
+
+def rt_main() -> None:
+    args = rt_parse_args()
+    pkl_path = args.pkl_path.expanduser().resolve()
+    urdf_path = args.urdf.expanduser().resolve()
+    contact_path = args.contact_keypoints.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+    pose_sidecar_path = args.pose_sidecar.expanduser().resolve() if args.pose_sidecar is not None else None
+    required_paths = [pkl_path, urdf_path, contact_path]
+    if pose_sidecar_path is not None:
+        required_paths.append(pose_sidecar_path)
+    for path in required_paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if args.max_frames is not None and args.max_frames <= 0:
+        raise ValueError('--max-frames must be positive')
+    if args.solver_iterations <= 0 or args.alternating_iterations <= 0:
+        raise ValueError('Iteration counts must be positive')
+    if args.temporal_branch_weight < 0.0:
+        raise ValueError('--temporal-branch-weight must be nonnegative')
+    if args.temporal_seed_weight < 0.0:
+        raise ValueError('--temporal-seed-weight must be nonnegative')
+    if min(args.joint_velocity_weight, args.joint_acceleration_weight, args.joint_jerk_weight, args.joint_max_step_deg, args.joint_max_step_weight) < 0.0:
+        raise ValueError('Joint temporal weights must be nonnegative')
+    if args.joint_optimization_iterations <= 0:
+        raise ValueError('--joint-optimization-iterations must be positive')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    keypoints_obj = base.load_contact_keypoints(contact_path)
+    link_from_obj = base.load_link_from_obj_transforms(urdf_path)
+    if pose_sidecar_path is None:
+        source_validation = rt_validate_source_pkl(pkl_path)
+        (cube_from_obj, timestamps, source_indices) = base.load_source_poses(pkl_path, args.max_frames)
+        observation_confidence = np.ones((len(cube_from_obj), len(rt_FINGER_SPECS)), dtype=np.float32)
+    else:
+        (source_validation, cube_from_obj, timestamps, source_indices, observation_confidence) = rt_load_multi_cam_sidecar_poses(pkl_path, pose_sidecar_path, args.max_frames, args.wrist_extrinsics)
+    if pose_sidecar_path is None and args.max_frames is None and (len(cube_from_obj) != 363):
+        raise ValueError(f'Expected 363 valid frames, got {len(cube_from_obj)}')
+    point_weights = np.repeat(observation_confidence[:, :, None], 4, axis=2)
+    ignored_observations: list[dict[str, Any]] = []
+    if pose_sidecar_path is None:
+        ignored_rows = np.flatnonzero(source_indices == 275)
+        if args.max_frames is None and ignored_rows.tolist() != [275]:
+            raise ValueError(f'Expected source frame 275 at row 275; got rows {ignored_rows.tolist()}')
+        point_weights[ignored_rows, 0, :] = 0.0
+        ignored_observations = [{'source_frame_index': 275, 'finger': 'thumb', 'keypoint_weights': [0.0, 0.0, 0.0, 0.0], 'other_fingers_unchanged': True}]
+    urdf = base.load_urdf(urdf_path)
+    joint_names = list(urdf.actuated_joint_names)
+    lower = np.asarray([float(urdf.joint_map[name].limit.lower) for name in joint_names], dtype=np.float32)
+    upper = np.asarray([float(urdf.joint_map[name].limit.upper) for name in joint_names], dtype=np.float32)
+    natural = np.clip(np.zeros(len(joint_names), dtype=np.float32), lower, upper)
+    active_indices = np.asarray([joint_names.index(name) for name in rt_ACTIVE_JOINT_NAMES], dtype=np.int32)
+    thumb_joint_indices = np.asarray([joint_names.index(f'left_finger1_joint{i}') for i in range(1, 5)], dtype=np.int32)
+    active_mask = np.zeros(len(joint_names), dtype=np.float32)
+    active_mask[active_indices] = 1.0
+    robot = base.pk.Robot.from_urdf(urdf, default_joint_cfg=base.jnp.asarray(natural))
+    solver = rt_BatchedThreeFingerIKSolver(point_weights=point_weights, ignored_joint_indices=thumb_joint_indices, urdf=urdf, robot=robot, link_from_obj=link_from_obj, keypoints_obj=keypoints_obj, natural_qpos=natural, active_mask=active_mask, max_iterations=int(args.solver_iterations), temporal_branch_weight=float(args.temporal_branch_weight))
+    requested_modes = list(dict.fromkeys(args.modes))
+    results: dict[str, dict[str, Any]] = {}
+    selected: dict[str, tuple[np.ndarray, base.SequenceSolution]] = {}
+    run_config = {'schema': 'consens.left_wuji_three_finger_experiment_config.v1', 'source_pkl': str(pkl_path), 'source_validation': source_validation, 'urdf': str(urdf_path), 'contact_keypoints': str(contact_path), 'fingers': [spec.name for spec in rt_FINGER_SPECS], 'frame_count': int(len(cube_from_obj)), 'point_count_per_frame': 12, 'active_joint_names': list(rt_ACTIVE_JOINT_NAMES), 'T_left_palm_link_hand_back_cube_initial': base.T_PALM_CUBE_INITIAL.tolist(), 'requested_modes': requested_modes, 'solver_iterations': int(args.solver_iterations), 'alternating_iterations': int(args.alternating_iterations), 'objective': 'equal-weight squared 3D distance over 3 fingers x 4 points', 'active_joint_regularization': 0.0, 'active_temporal_regularization': float(args.temporal_branch_weight), 'active_temporal_seed_weight': float(args.temporal_seed_weight), 'joint_temporal_optimize': bool(args.joint_temporal_optimize), 'joint_velocity_weight': float(args.joint_velocity_weight), 'joint_acceleration_weight': float(args.joint_acceleration_weight), 'joint_jerk_weight': float(args.joint_jerk_weight), 'joint_optimization_iterations': int(args.joint_optimization_iterations), 'joint_max_step_deg': float(args.joint_max_step_deg), 'joint_max_step_weight': float(args.joint_max_step_weight), 'joint_limits_from_urdf': True, 'ignored_observations': ignored_observations}
+    (output_dir / 'run_config.json').write_text(json.dumps(run_config, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    if args.temporal_refine_only:
+        if not args.overwrite:
+            raise ValueError('--temporal-refine-only requires --overwrite')
+        if args.temporal_seed_weight <= 0.0:
+            raise ValueError('--temporal-refine-only requires positive --temporal-seed-weight')
+        npz_path = output_dir / 'three_finger_se3.npz'
+        json_path = output_dir / 'three_finger_se3.json'
+        pkl_path_out = output_dir / 'three_finger_se3.pkl'
+        report_path = output_dir / 'experiment_summary.json'
+        for path in (npz_path, json_path, pkl_path_out, report_path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        with np.load(npz_path, allow_pickle=False) as archive:
+            transform = np.asarray(archive['T_left_palm_link_hand_back_cube'], dtype=np.float64)
+            initial_qpos = np.asarray(archive['qpos'], dtype=np.float32)
+            best_start = str(np.asarray(archive['best_start']).item())
+            stored_timestamps = np.asarray(archive['timestamps'], dtype=np.float64)
+        if initial_qpos.shape != (len(cube_from_obj), len(joint_names)):
+            raise ValueError(f'Existing qpos shape does not match current source/URDF: {initial_qpos.shape}')
+        if not np.allclose(stored_timestamps, timestamps, atol=1e-09, rtol=0.0):
+            raise ValueError('Existing retarget timestamps do not match current source')
+        previous_summary = json.loads(json_path.read_text(encoding='utf-8'))
+        refined = solver.refine_sequence_temporally(transform, cube_from_obj, initial_qpos, float(args.temporal_seed_weight))
+        smoothness_before_joint = rt_trajectory_smoothness_stats(refined.qpos, timestamps, active_indices)
+        joint_metadata: dict[str, Any] | None = None
+        if args.joint_temporal_optimize:
+            (refined, joint_metadata) = solver.optimize_sequence_jointly(transform, cube_from_obj, timestamps, refined.qpos, float(args.joint_velocity_weight), float(args.joint_acceleration_weight), float(args.joint_jerk_weight), float(args.joint_max_step_deg), float(args.joint_max_step_weight), int(args.joint_optimization_iterations))
+            joint_metadata['smoothness_before'] = smoothness_before_joint
+            joint_metadata['smoothness_after'] = rt_trajectory_smoothness_stats(refined.qpos, timestamps, active_indices)
+        summary = rt_summarize_best('se3', best_start, transform, refined, point_weights, list(previous_summary.get('path_summaries', [])), ignored_observations, active_indices, lower, upper, float(args.temporal_branch_weight))
+        summary['active_temporal_seed_weight'] = float(args.temporal_seed_weight)
+        summary['temporal_refine_only'] = True
+        summary['trajectory_smoothness'] = rt_trajectory_smoothness_stats(refined.qpos, timestamps, active_indices)
+        if joint_metadata is not None:
+            summary['joint_temporal_optimization'] = joint_metadata
+        rt_save_npz(npz_path, 'se3', best_start, transform, refined, cube_from_obj, timestamps, source_indices, keypoints_obj, link_from_obj, joint_names, active_indices, point_weights)
+        json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+        rt_write_compact_pkl(pkl_path_out, pkl_path, 'se3', best_start, summary, transform, refined, timestamps, source_indices, joint_names, active_indices, point_weights, source_validation, True)
+        report = json.loads(report_path.read_text(encoding='utf-8'))
+        report.update(run_config)
+        report['schema'] = 'consens.left_wuji_three_finger_cube_experiments.v1'
+        report.setdefault('results', {})['se3'] = summary
+        report['best_optimized_mode'] = 'se3'
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+        print(f"[RESULT] temporally refined three_finger_se3 objective_rmse={summary['objective_rmse_mm']:.6f} mm")
+        return
+    (fixed_transform, fixed_solution, fixed_path) = rt_run_path('fixed', 'theoretical', base.T_PALM_CUBE_INITIAL, solver, cube_from_obj, keypoints_obj, point_weights, int(args.alternating_iterations))
+    selected['fixed'] = (fixed_transform, fixed_solution)
+    fixed_summary = rt_summarize_best('fixed', 'theoretical', fixed_transform, fixed_solution, point_weights, [fixed_path], ignored_observations, active_indices, lower, upper, float(args.temporal_branch_weight))
+    results['fixed'] = fixed_summary
+
+    def run_optimized_mode(mode: rt_Mode, starts: list[tuple[str, np.ndarray]]) -> None:
+        path_results: list[tuple[np.ndarray, base.SequenceSolution, dict[str, Any]]] = []
+        for (start_name, start_transform) in rt_deduplicate_starts(starts):
+            path_results.append(rt_run_path(mode, start_name, start_transform, solver, cube_from_obj, keypoints_obj, point_weights, int(args.alternating_iterations)))
+        best_index = min(range(len(path_results)), key=lambda index: path_results[index][2]['objective_rmse_mm'])
+        (transform, solution, best_path) = path_results[best_index]
+        if mode in requested_modes and args.temporal_seed_weight > 0.0:
+            solution = solver.refine_sequence_temporally(transform, cube_from_obj, solution.qpos, float(args.temporal_seed_weight))
+        joint_metadata: dict[str, Any] | None = None
+        if mode in requested_modes and args.joint_temporal_optimize:
+            smoothness_before_joint = rt_trajectory_smoothness_stats(solution.qpos, timestamps, active_indices)
+            (solution, joint_metadata) = solver.optimize_sequence_jointly(transform, cube_from_obj, timestamps, solution.qpos, float(args.joint_velocity_weight), float(args.joint_acceleration_weight), float(args.joint_jerk_weight), float(args.joint_max_step_deg), float(args.joint_max_step_weight), int(args.joint_optimization_iterations))
+            joint_metadata['smoothness_before'] = smoothness_before_joint
+            joint_metadata['smoothness_after'] = rt_trajectory_smoothness_stats(solution.qpos, timestamps, active_indices)
+        path_summaries = [value[2] for value in path_results]
+        selected[mode] = (transform, solution)
+        results[mode] = rt_summarize_best(mode, str(best_path['start_name']), transform, solution, point_weights, path_summaries, ignored_observations, active_indices, lower, upper, float(args.temporal_branch_weight))
+        results[mode]['active_temporal_seed_weight'] = float(args.temporal_seed_weight)
+        results[mode]['trajectory_smoothness'] = rt_trajectory_smoothness_stats(solution.qpos, timestamps, active_indices)
+        if joint_metadata is not None:
+            results[mode]['joint_temporal_optimization'] = joint_metadata
+    (fixed_translation_start, _) = rt_fit_transform_for_mode('translation', cube_from_obj, keypoints_obj, fixed_solution.predicted_keypoints, point_weights)
+    (fixed_rotation_start, _) = rt_fit_transform_for_mode('rotation', cube_from_obj, keypoints_obj, fixed_solution.predicted_keypoints, point_weights)
+    (fixed_se3_start, _) = rt_fit_transform_for_mode('se3', cube_from_obj, keypoints_obj, fixed_solution.predicted_keypoints, point_weights)
+    if 'translation' in requested_modes or 'se3' in requested_modes:
+        run_optimized_mode('translation', [('theoretical', base.T_PALM_CUBE_INITIAL), ('fixed_registration', fixed_translation_start)])
+    if 'rotation' in requested_modes or 'se3' in requested_modes:
+        run_optimized_mode('rotation', [('theoretical', base.T_PALM_CUBE_INITIAL), ('fixed_registration', fixed_rotation_start)])
+    if 'se3' in requested_modes:
+        run_optimized_mode('se3', [('theoretical', base.T_PALM_CUBE_INITIAL), ('fixed_registration', fixed_se3_start), ('translation_best', selected['translation'][0]), ('rotation_best', selected['rotation'][0])])
+    modes_to_write = [mode for mode in requested_modes if mode in selected]
+    for mode in modes_to_write:
+        (transform, solution) = selected[mode]
+        summary = results[mode]
+        stem = f'three_finger_{mode}'
+        npz_path = output_dir / f'{stem}.npz'
+        json_path = output_dir / f'{stem}.json'
+        pkl_path_out = output_dir / f'{stem}.pkl'
+        if not args.overwrite:
+            for path in (npz_path, json_path, pkl_path_out):
+                if path.exists():
+                    raise FileExistsError(path)
+        rt_save_npz(npz_path, mode, str(summary['best_start']), transform, solution, cube_from_obj, timestamps, source_indices, keypoints_obj, link_from_obj, joint_names, active_indices, point_weights)
+        json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+        rt_write_compact_pkl(pkl_path_out, pkl_path, mode, str(summary['best_start']), summary, transform, solution, timestamps, source_indices, joint_names, active_indices, point_weights, source_validation, bool(args.overwrite))
+    report = {**run_config, 'schema': 'consens.left_wuji_three_finger_cube_experiments.v1', 'results': {mode: results[mode] for mode in modes_to_write}, 'best_optimized_mode': min([mode for mode in modes_to_write if mode != 'fixed'], key=lambda mode: results[mode]['objective_rmse_mm']) if any((mode != 'fixed' for mode in modes_to_write)) else None}
+    report_path = output_dir / 'experiment_summary.json'
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    print('\n[RESULT] three-finger objective RMSE')
+    for mode in modes_to_write:
+        print(f"  {mode:12s} {results[mode]['objective_rmse_mm']:.6f} mm start={results[mode]['best_start']}")
+    print(f'[RESULT] summary: {report_path}')
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Embedded xArm7 + Wuji-left full-body IK and hardware-safe trajectory processing.
+#
+# The backend and synchronized multi-camera adapter are namespace-prefixed from
+# their former scripts. No script module is imported at runtime.
+# -----------------------------------------------------------------------------
+import argparse
+import json
+import os
+import pickle
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+import jax
+import jax.numpy as jnp
+import jaxlie
+import jaxls
+import numpy as np
+import pyroki as pk
+import viser
+import yourdfpy
+from scipy.optimize import least_squares
+from scipy.signal import butter, sosfiltfilt
+from scipy.spatial.transform import Rotation, Slerp
+from viser.extras import ViserUrdf
+fb_FILE_PATH = Path(__file__).resolve()
+fb_REPO_ROOT = APRILCUBE_ROOT.parent.parent
+fb_DEFAULT_HAND_PKL = fb_REPO_ROOT / 'thirdparty/aprilcube/recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl'
+fb_DEFAULT_RS_PKL = fb_REPO_ROOT / 'thirdparty/aprilcube/recordings/012_rs_raw_frames_20260715_192635_with_current_020_postprocessed_pose.pkl'
+fb_DEFAULT_URDF = fb_REPO_ROOT / 'thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye.urdf'
+fb_LEGACY_HAND_URDF = fb_REPO_ROOT / 'thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf'
+fb_DEFAULT_OUTPUT_DIR = fb_REPO_ROOT / 'outputs/retargeting/rs_xarm7_wuji'
+fb_DEFAULT_MERGED_PKL = fb_DEFAULT_OUTPUT_DIR / 'rs_hand_three_finger_merged.pkl'
+fb_DEFAULT_IK_PKL = fb_DEFAULT_OUTPUT_DIR / 'xarm7_wuji_full_qpos.pkl'
+fb_HAND_FORMAT = 'aprilcube_hand_back_software_synced_raw_v1'
+fb_RS_FORMAT = 'aprilcube_raw_with_020_postprocessed_pose_stream_v1'
+fb_MERGED_FORMAT = 'consens.rs_hand_three_finger_merged.v1'
+fb_IK_FORMAT = 'consens.xarm7_wuji_rs_virtual_base_ik.v2'
+fb_HAND_POSE_FIELD = 'hand_back_cube_obj_poses'
+fb_HAND_QPOS_FIELD = 'left_wuji_three_finger_se3_retargeting_temporal_smoothed'
+fb_HAND_METADATA_FIELD = 'left_wuji_three_finger_se3_retargeting'
+fb_PALM_CUBE_KEY = 'T_left_palm_link_hand_back_cube_6d_optimized'
+fb_FINGER_NAMES = ('thumb', 'index', 'middle')
+fb_ARM_JOINT_NAMES = tuple((f'joint{i}' for i in range(1, 8)))
+fb_THREE_FINGER_JOINT_NAMES = tuple((f'left_finger{finger}_joint{joint}' for finger in (1, 2, 3) for joint in range(1, 5)))
+
+@dataclass
+class fb_HandTrajectory:
+    timestamps: np.ndarray
+    poses_hand_back_obj: np.ndarray
+    qpos: np.ndarray
+    qpos_joint_names: list[str]
+    palm_from_hand_back: np.ndarray
+    quality: list[dict[str, Any]]
+    header: dict[str, Any]
+
+@dataclass
+class fb_RSTrajectory:
+    timestamps: np.ndarray
+    poses_camera_hand_back: np.ndarray
+    quality: list[dict[str, Any]]
+    header: dict[str, Any]
+
+@dataclass
+class fb_MergedTrajectory:
+    header: dict[str, Any]
+    timestamps: np.ndarray
+    phase: np.ndarray
+    poses_camera_hand_back: np.ndarray
+    poses_hand_back_obj: np.ndarray
+    poses_camera_obj: np.ndarray
+    poses_camera_palm: np.ndarray
+    hand_qpos: np.ndarray
+    hand_qpos_joint_names: list[str]
+    palm_from_hand_back: np.ndarray
+    hand_bracket_indices: np.ndarray
+    hand_interpolation_alpha: np.ndarray
+    rs_quality: list[dict[str, Any]]
+    hand_quality: list[dict[str, Any]]
+
+@dataclass
+class fb_CandidateResult:
+    name: str
+    base_from_camera: np.ndarray
+    qpos: np.ndarray
+    fk_base_palm: np.ndarray
+    target_base_palm: np.ndarray
+    metrics: dict[str, Any]
+
+@dataclass
+class fb_HardwareSafeResult:
+    qpos: np.ndarray
+    fk_base_palm: np.ndarray
+    trajectory_time_s: np.ndarray
+    playback_fps: float
+    metrics: dict[str, Any]
+
+def fb_validate_transform(value: Any, label: str) -> np.ndarray:
+    transform = np.asarray(value, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError(f'{label} must be a finite 4x4 transform')
+    if not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-08):
+        raise ValueError(f'{label} has an invalid homogeneous bottom row')
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-05):
+        raise ValueError(f'{label} rotation is not orthonormal')
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-05):
+        raise ValueError(f'{label} rotation determinant is not +1')
+    return transform
+
+def fb_matrix_to_wxyz(rotation: np.ndarray) -> np.ndarray:
+    xyzw = Rotation.from_matrix(np.asarray(rotation, dtype=np.float64)).as_quat()
+    return np.asarray([xyzw[3], xyzw[0], xyzw[1], xyzw[2]], dtype=np.float64)
+
+def fb_matrix_to_wxyz_xyz(transform: np.ndarray) -> np.ndarray:
+    transform = fb_validate_transform(transform, 'matrix_to_wxyz_xyz input')
+    return np.concatenate([fb_matrix_to_wxyz(transform[:3, :3]), transform[:3, 3]])
+
+def fb_stats(values: np.ndarray) -> dict[str, float]:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    return {'mean': float(np.mean(values)), 'median': float(np.median(values)), 'p95': float(np.percentile(values, 95.0)), 'max': float(np.max(values))}
+
+def fb_load_hand_trajectory(path: Path) -> fb_HandTrajectory:
+    timestamps: list[float] = []
+    poses: list[np.ndarray] = []
+    qpos: list[np.ndarray] = []
+    quality: list[dict[str, Any]] = []
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('format') != fb_HAND_FORMAT:
+            raise ValueError(f"Unsupported hand PKL format: {header.get('format')}")
+        retarget_metadata = header.get(fb_HAND_METADATA_FIELD, {})
+        palm_from_hand_back = fb_validate_transform(retarget_metadata[fb_PALM_CUBE_KEY], f'hand header {fb_HAND_METADATA_FIELD}.{fb_PALM_CUBE_KEY}')
+        smooth_metadata = header.get(fb_HAND_QPOS_FIELD, {})
+        joint_names = [str(name) for name in smooth_metadata.get('active_joint_names', [])]
+        if joint_names != list(fb_THREE_FINGER_JOINT_NAMES):
+            raise ValueError(f'Unexpected embedded hand qpos order: {joint_names}; expected {list(fb_THREE_FINGER_JOINT_NAMES)}')
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict) or record.get('type') != 'frame_pair':
+                continue
+            pose_payload = record.get(fb_HAND_POSE_FIELD, {}).get('objects', {})
+            frame_poses: list[np.ndarray] = []
+            frame_quality: dict[str, Any] = {}
+            for name in fb_FINGER_NAMES:
+                entry = pose_payload.get(name, {})
+                if not entry.get('success', False):
+                    raise ValueError(f'Hand frame {len(timestamps)} has no {name} pose')
+                frame_poses.append(fb_validate_transform(entry['T_hand_back_cube_obj'], f'hand frame {len(timestamps)} {name}'))
+                frame_quality[name] = {'predicted': bool(entry.get('predicted', False)), 'pose_source': str(entry.get('pose_source', '')), 'reproj_error_px': float(entry.get('reproj_error_px', float('nan')))}
+            q_entry = record.get(fb_HAND_QPOS_FIELD, {})
+            frame_qpos = np.asarray(q_entry.get('wujihand_qpos'), dtype=np.float64)
+            if frame_qpos.shape != (len(fb_THREE_FINGER_JOINT_NAMES),):
+                raise ValueError(f'Hand frame {len(timestamps)} qpos shape is {frame_qpos.shape}')
+            timestamps.append(float(record['pair_timestamp']))
+            poses.append(np.stack(frame_poses, axis=0))
+            qpos.append(frame_qpos)
+            quality.append(frame_quality)
+    if len(timestamps) < 2:
+        raise ValueError('Hand trajectory must contain at least two frames')
+    return fb_HandTrajectory(timestamps=np.asarray(timestamps, dtype=np.float64), poses_hand_back_obj=np.asarray(poses, dtype=np.float64), qpos=np.asarray(qpos, dtype=np.float64), qpos_joint_names=joint_names, palm_from_hand_back=palm_from_hand_back, quality=quality, header=header)
+
+def fb_load_rs_trajectory(path: Path) -> fb_RSTrajectory:
+    timestamps: list[float] = []
+    poses: list[np.ndarray] = []
+    quality: list[dict[str, Any]] = []
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('format') != fb_RS_FORMAT:
+            raise ValueError(f"Unsupported RS PKL format: {header.get('format')}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict) or record.get('type') != 'frame':
+                continue
+            pose = record.get('pose', {})
+            if not pose.get('success', False) or pose.get('T') is None:
+                raise ValueError(f'RS frame {len(timestamps)} has no pose')
+            transform = fb_validate_transform(pose['T'], f'RS frame {len(timestamps)}')
+            transform = transform.copy()
+            transform[:3, 3] /= 1000.0
+            timestamps.append(float(record['capture_timestamp']))
+            poses.append(transform)
+            quality.append({'pose_source': str(pose.get('pose_source', '')), 'quality_level': str(pose.get('quality_level', '')), 'quality_reason': str(pose.get('quality_reason', '')), 'pose_filled': bool(pose.get('pose_filled', False)), 'reproj_error_px': float(pose.get('reproj_error', float('nan'))), 'temporal_smoothed': bool(pose.get('temporal_smoothed', False))})
+    if len(timestamps) < 2:
+        raise ValueError('RS trajectory must contain at least two frames')
+    return fb_RSTrajectory(timestamps=np.asarray(timestamps, dtype=np.float64), poses_camera_hand_back=np.asarray(poses, dtype=np.float64), quality=quality, header=header)
+
+def fb_normalized_time(timestamps: np.ndarray) -> np.ndarray:
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    duration = float(timestamps[-1] - timestamps[0])
+    if duration <= 0.0 or np.any(np.diff(timestamps) <= 0.0):
+        raise ValueError('Timestamps must be strictly increasing')
+    return (timestamps - timestamps[0]) / duration
+
+def fb_interpolation_brackets(source_phase: np.ndarray, target_phase: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    right = np.searchsorted(source_phase, target_phase, side='right')
+    right = np.clip(right, 1, len(source_phase) - 1)
+    left = right - 1
+    denominator = source_phase[right] - source_phase[left]
+    alpha = np.divide(target_phase - source_phase[left], denominator, out=np.zeros_like(target_phase), where=denominator > 0.0)
+    alpha[target_phase <= source_phase[0]] = 0.0
+    left[target_phase <= source_phase[0]] = 0
+    right[target_phase <= source_phase[0]] = 0
+    alpha[target_phase >= source_phase[-1]] = 0.0
+    left[target_phase >= source_phase[-1]] = len(source_phase) - 1
+    right[target_phase >= source_phase[-1]] = len(source_phase) - 1
+    return (np.stack([left, right], axis=-1), alpha)
+
+def fb_interpolate_transforms(source_phase: np.ndarray, transforms: np.ndarray, target_phase: np.ndarray) -> np.ndarray:
+    transforms = np.asarray(transforms, dtype=np.float64)
+    flat = transforms.reshape(len(source_phase), -1, 4, 4)
+    output = np.tile(np.eye(4, dtype=np.float64), (len(target_phase), flat.shape[1], 1, 1))
+    for item_index in range(flat.shape[1]):
+        for axis in range(3):
+            output[:, item_index, axis, 3] = np.interp(target_phase, source_phase, flat[:, item_index, axis, 3])
+        rotations = Rotation.from_matrix(flat[:, item_index, :3, :3])
+        output[:, item_index, :3, :3] = Slerp(source_phase, rotations)(target_phase).as_matrix()
+    return output.reshape(len(target_phase), *transforms.shape[1:])
+
+def fb_interpolate_rows(source_phase: np.ndarray, values: np.ndarray, target_phase: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    return np.stack([np.interp(target_phase, source_phase, values[:, column]) for column in range(values.shape[1])], axis=-1)
+
+def fb_build_merged_trajectory(hand: fb_HandTrajectory, rs: fb_RSTrajectory) -> fb_MergedTrajectory:
+    hand_phase = fb_normalized_time(hand.timestamps)
+    rs_source_phase = fb_normalized_time(rs.timestamps)
+    output_timestamps = np.linspace(rs.timestamps[0], rs.timestamps[-1], len(rs.timestamps), dtype=np.float64)
+    output_phase = fb_normalized_time(output_timestamps)
+    (brackets, alpha) = fb_interpolation_brackets(hand_phase, output_phase)
+    (rs_brackets, rs_alpha) = fb_interpolation_brackets(rs_source_phase, output_phase)
+    poses_camera_hand_back = fb_interpolate_transforms(rs_source_phase, rs.poses_camera_hand_back, output_phase)
+    poses_hand_back_obj = fb_interpolate_transforms(hand_phase, hand.poses_hand_back_obj, output_phase)
+    hand_qpos = fb_interpolate_rows(hand_phase, hand.qpos, output_phase)
+    poses_camera_obj = np.einsum('tij,tfjk->tfik', poses_camera_hand_back, poses_hand_back_obj)
+    hand_back_from_palm = np.linalg.inv(hand.palm_from_hand_back)
+    poses_camera_palm = np.einsum('tij,jk->tik', poses_camera_hand_back, hand_back_from_palm)
+    hand_quality = [{'left_source_index': int(pair[0]), 'right_source_index': int(pair[1]), 'alpha': float(weight), 'left': hand.quality[int(pair[0])], 'right': hand.quality[int(pair[1])]} for (pair, weight) in zip(brackets, alpha, strict=True)]
+    rs_quality = [{'left_source_index': int(pair[0]), 'right_source_index': int(pair[1]), 'alpha': float(weight), 'left': rs.quality[int(pair[0])], 'right': rs.quality[int(pair[1])]} for (pair, weight) in zip(rs_brackets, rs_alpha, strict=True)]
+    header = {'type': 'header', 'format': fb_MERGED_FORMAT, 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'frame_convention': 'A_T_B maps coordinates from frame B into frame A', 'translation_unit': 'm', 'rotation_storage': '4x4 rotation matrix', 'master_timeline': 'uniform samples spanning the RS capture duration', 'temporal_alignment': 'normalized endpoint alignment', 'rs_translation_interpolation': 'linear', 'rs_rotation_interpolation': 'quaternion SLERP', 'hand_translation_interpolation': 'linear', 'hand_rotation_interpolation': 'quaternion SLERP', 'hand_qpos_interpolation': 'linear', 'hand_source_frame_count': int(len(hand.timestamps)), 'hand_source_duration_s': float(hand.timestamps[-1] - hand.timestamps[0]), 'rs_source_frame_count': int(len(rs.timestamps)), 'rs_source_duration_s': float(rs.timestamps[-1] - rs.timestamps[0]), 'output_frame_count': int(len(rs.timestamps)), 'output_fps': float((len(rs.timestamps) - 1) / (rs.timestamps[-1] - rs.timestamps[0])), 'hand_qpos_joint_names': hand.qpos_joint_names, 'T_left_palm_link_hand_back_cube': hand.palm_from_hand_back}
+    return fb_MergedTrajectory(header=header, timestamps=output_timestamps, phase=output_phase, poses_camera_hand_back=poses_camera_hand_back, poses_hand_back_obj=poses_hand_back_obj, poses_camera_obj=poses_camera_obj, poses_camera_palm=poses_camera_palm, hand_qpos=hand_qpos, hand_qpos_joint_names=hand.qpos_joint_names, palm_from_hand_back=hand.palm_from_hand_back, hand_bracket_indices=brackets, hand_interpolation_alpha=alpha, rs_quality=rs_quality, hand_quality=hand_quality)
+
+def fb_write_merged_pkl(path: Path, merged: fb_MergedTrajectory, hand_path: Path, rs_path: Path, overwrite: bool) -> None:
+    if path.exists() and (not overwrite):
+        raise FileExistsError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.unlink(missing_ok=True)
+    header = {**merged.header, 'source_hand_pkl': str(hand_path), 'source_rs_pkl': str(rs_path)}
+    try:
+        with temporary.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame_index in range(len(merged.timestamps)):
+                pickle.dump({'type': 'frame', 'frame_index': frame_index, 'rs_capture_timestamp': float(merged.timestamps[frame_index]), 'normalized_phase': float(merged.phase[frame_index]), 'hand_source_bracket_indices': merged.hand_bracket_indices[frame_index], 'hand_interpolation_alpha': float(merged.hand_interpolation_alpha[frame_index]), 'T_rs_camera_hand_back_cube': merged.poses_camera_hand_back[frame_index], 'T_hand_back_cube_obj': merged.poses_hand_back_obj[frame_index], 'T_rs_camera_obj': merged.poses_camera_obj[frame_index], 'T_rs_camera_left_palm_link': merged.poses_camera_palm[frame_index], 'finger_names': list(fb_FINGER_NAMES), 'wujihand_three_finger_qpos': merged.hand_qpos[frame_index], 'rs_pose_quality': merged.rs_quality[frame_index], 'hand_pose_quality': merged.hand_quality[frame_index]}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump({'type': 'footer', 'frame_count': int(len(merged.timestamps))}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def fb_load_merged_pkl(path: Path) -> fb_MergedTrajectory:
+    records: list[dict[str, Any]] = []
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('format') != fb_MERGED_FORMAT:
+            raise ValueError(f"Unsupported merged PKL format: {header.get('format')}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if isinstance(record, dict) and record.get('type') == 'frame':
+                records.append(record)
+    if not records:
+        raise ValueError(f'No frames in {path}')
+    return fb_MergedTrajectory(header=header, timestamps=np.asarray([r['rs_capture_timestamp'] for r in records], dtype=np.float64), phase=np.asarray([r['normalized_phase'] for r in records], dtype=np.float64), poses_camera_hand_back=np.asarray([r['T_rs_camera_hand_back_cube'] for r in records], dtype=np.float64), poses_hand_back_obj=np.asarray([r['T_hand_back_cube_obj'] for r in records], dtype=np.float64), poses_camera_obj=np.asarray([r['T_rs_camera_obj'] for r in records], dtype=np.float64), poses_camera_palm=np.asarray([r['T_rs_camera_left_palm_link'] for r in records], dtype=np.float64), hand_qpos=np.asarray([r['wujihand_three_finger_qpos'] for r in records], dtype=np.float64), hand_qpos_joint_names=[str(v) for v in header['hand_qpos_joint_names']], palm_from_hand_back=np.asarray(header['T_left_palm_link_hand_back_cube'], dtype=np.float64), hand_bracket_indices=np.asarray([r['hand_source_bracket_indices'] for r in records], dtype=np.int32), hand_interpolation_alpha=np.asarray([r['hand_interpolation_alpha'] for r in records], dtype=np.float64), rs_quality=[r['rs_pose_quality'] for r in records], hand_quality=[r['hand_pose_quality'] for r in records])
+
+def fb_load_urdf(path: Path) -> yourdfpy.URDF:
+    return yourdfpy.URDF.load(str(path), filename_handler=partial(yourdfpy.filename_handler_magic, dir=path.parent))
+
+def fb_joint_signature(root: ET.Element, name: str) -> tuple[Any, ...]:
+    node = next((j for j in root.findall('joint') if j.attrib.get('name') == name), None)
+    if node is None:
+        raise KeyError(name)
+    origin = node.find('origin')
+    axis = node.find('axis')
+    limit = node.find('limit')
+    return (node.attrib.get('type'), node.find('parent').attrib.get('link'), node.find('child').attrib.get('link'), None if origin is None else origin.attrib.get('xyz', '0 0 0'), None if origin is None else origin.attrib.get('rpy', '0 0 0'), None if axis is None else axis.attrib.get('xyz'), None if limit is None else limit.attrib.get('lower'), None if limit is None else limit.attrib.get('upper'))
+
+def fb_validate_legacy_qpos_compatibility(combined_path: Path) -> None:
+    combined = ET.parse(combined_path).getroot()
+    legacy = ET.parse(fb_LEGACY_HAND_URDF).getroot()
+    for name in fb_THREE_FINGER_JOINT_NAMES:
+        if fb_joint_signature(combined, name) != fb_joint_signature(legacy, name):
+            raise ValueError(f'{combined_path} is not legacy-qpos-compatible at {name}; use the combined xArm7 + Wuji-left URDF whose hand joint definitions match the retargeting URDF')
+
+class fb_SequentialArmIKSolver:
+
+    def __init__(self, robot: pk.Robot, palm_link_index: int, lower: np.ndarray, upper: np.ndarray, arm_indices: np.ndarray, max_iterations: int, arm_rest_weight: float=0.0) -> None:
+        self.robot = robot
+        self.palm_link_index = int(palm_link_index)
+        self.lower = np.asarray(lower, dtype=np.float32)
+        self.upper = np.asarray(upper, dtype=np.float32)
+        self.arm_indices = np.asarray(arm_indices, dtype=np.int32)
+        self.max_iterations = int(max_iterations)
+        self.arm_rest_weight = float(arm_rest_weight)
+        if self.arm_rest_weight < 0.0:
+            raise ValueError('arm_rest_weight must be nonnegative')
+        self._build()
+
+    def _build(self) -> None:
+        num_joints = self.robot.joints.num_actuated_joints
+
+        class TargetVar(jaxls.Var[jax.Array], default_factory=lambda : jnp.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+
+        class PreviousVar(jaxls.Var[jax.Array], default_factory=lambda : jnp.zeros((num_joints,), dtype=jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+
+        class RestVar(jaxls.Var[jax.Array], default_factory=lambda : jnp.zeros((num_joints,), dtype=jnp.float32), tangent_dim=0, retract_fn=lambda value, delta: value):
+            ...
+        joint_var = self.robot.joint_var_cls(0)
+        target_var = TargetVar(0)
+        previous_var = PreviousVar(0)
+        rest_var = RestVar(0)
+        robot = self.robot
+        palm_link_index = self.palm_link_index
+        arm_mask = np.zeros(num_joints, dtype=np.float32)
+        arm_mask[self.arm_indices] = 1.0
+        seed_weights = jnp.asarray(arm_mask * 0.08 + (1.0 - arm_mask) * 80.0, dtype=jnp.float32)
+        rest_weights = jnp.asarray(arm_mask * self.arm_rest_weight, dtype=jnp.float32)
+
+        @jaxls.Cost.factory
+        def palm_pose_cost(values: jaxls.VarValues, var_q: Any, var_target: Any) -> jax.Array:
+            predicted = jaxlie.SE3(robot.forward_kinematics(cfg=values[var_q])[palm_link_index])
+            target = jaxlie.SE3(values[var_target])
+            error = (predicted.inverse() @ target).log()
+            return jnp.concatenate([error[:3] * 80.0, error[3:] * 8.0])
+
+        @jaxls.Cost.factory
+        def seed_cost(values: jaxls.VarValues, var_q: Any, var_previous: Any) -> jax.Array:
+            return (values[var_q] - values[var_previous]) * seed_weights
+
+        @jaxls.Cost.factory
+        def rest_cost(values: jaxls.VarValues, var_q: Any, var_rest: Any) -> jax.Array:
+            return (values[var_q] - values[var_rest]) * rest_weights
+        self.joint_var = joint_var
+        self.target_var = target_var
+        self.previous_var = previous_var
+        self.rest_var = rest_var
+        self.problem = jaxls.LeastSquaresProblem(costs=[palm_pose_cost(joint_var, target_var), seed_cost(joint_var, previous_var), rest_cost(joint_var, rest_var), pk.costs.limit_constraint(robot, joint_var)], variables=[joint_var, target_var, previous_var, rest_var]).analyze(use_onp=True)
+
+        def fk_one(qpos: jax.Array) -> jax.Array:
+            return jaxlie.SE3(robot.forward_kinematics(cfg=qpos)[palm_link_index]).as_matrix()
+        self._fk_batch = jax.jit(jax.vmap(fk_one))
+
+    def solve_frame(self, target: np.ndarray, seed: np.ndarray, rest: np.ndarray | None=None) -> np.ndarray:
+        if rest is None:
+            rest = seed
+        values = jaxls.VarValues.make([self.joint_var.with_value(jnp.asarray(seed, dtype=jnp.float32)), self.target_var.with_value(jnp.asarray(fb_matrix_to_wxyz_xyz(target), dtype=jnp.float32)), self.previous_var.with_value(jnp.asarray(seed, dtype=jnp.float32)), self.rest_var.with_value(jnp.asarray(rest, dtype=jnp.float32))])
+        solution = self.problem.solve(initial_vals=values, verbose=False, linear_solver='dense_cholesky', trust_region=jaxls.TrustRegionConfig(lambda_initial=1.0), termination=jaxls.TerminationConfig(max_iterations=self.max_iterations))
+        qpos = np.asarray(solution[self.joint_var], dtype=np.float32)
+        return np.clip(qpos, self.lower, self.upper)
+
+    def fk_batch(self, qpos: np.ndarray) -> np.ndarray:
+        result = self._fk_batch(jnp.asarray(qpos, dtype=jnp.float32))
+        jax.block_until_ready(result)
+        return np.asarray(result, dtype=np.float64)
+
+def fb_nominal_arm_postures() -> list[tuple[str, np.ndarray]]:
+    return [('center', np.asarray([0.0, -0.65, 0.0, 1.35, 0.0, 0.7, 0.0])), ('left_bias', np.asarray([0.45, -0.8, 0.2, 1.5, 0.0, 0.75, -0.35])), ('right_bias', np.asarray([-0.45, -0.8, -0.2, 1.5, 0.0, 0.75, 0.35])), ('compact', np.asarray([0.0, -0.35, 0.0, 1.05, 0.0, 0.55, 0.0]))]
+
+def fb_make_full_hand_targets(merged: fb_MergedTrajectory, joint_names: list[str], lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    natural = np.clip(np.zeros(len(joint_names), dtype=np.float64), lower, upper)
+    output = np.tile(natural[None, :], (len(merged.timestamps), 1))
+    for (column, name) in enumerate(merged.hand_qpos_joint_names):
+        output[:, joint_names.index(name)] = merged.hand_qpos[:, column]
+    return np.clip(output, lower[None, :], upper[None, :])
+
+def fb_solve_path_given_extrinsic(solver: fb_SequentialArmIKSolver, camera_palm: np.ndarray, base_from_camera: np.ndarray, hand_targets: np.ndarray, arm_indices: np.ndarray, nominal_arm: np.ndarray, initial_path: np.ndarray | None=None, anchor_index: int | None=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    targets = np.einsum('ij,tjk->tik', base_from_camera, camera_palm)
+    frame_count = len(targets)
+    anchor = frame_count // 2 if anchor_index is None else int(anchor_index)
+    if not 0 <= anchor < frame_count:
+        raise ValueError(f'anchor_index is outside [0, {frame_count}): {anchor}')
+    if initial_path is None:
+        qpos = hand_targets.copy()
+        qpos[:, arm_indices] = nominal_arm[None, :]
+    else:
+        qpos = np.asarray(initial_path, dtype=np.float64).copy()
+        qpos[:, len(fb_ARM_JOINT_NAMES):] = hand_targets[:, len(fb_ARM_JOINT_NAMES):]
+    rest = hand_targets[anchor].copy()
+    rest[arm_indices] = nominal_arm
+    qpos[anchor] = solver.solve_frame(targets[anchor], qpos[anchor], rest)
+    qpos[anchor, len(fb_ARM_JOINT_NAMES):] = hand_targets[anchor, len(fb_ARM_JOINT_NAMES):]
+    for frame_index in range(anchor + 1, frame_count):
+        seed = qpos[frame_index - 1].copy()
+        seed[len(fb_ARM_JOINT_NAMES):] = hand_targets[frame_index, len(fb_ARM_JOINT_NAMES):]
+        rest = hand_targets[frame_index].copy()
+        rest[arm_indices] = nominal_arm
+        qpos[frame_index] = solver.solve_frame(targets[frame_index], seed, rest)
+        qpos[frame_index, len(fb_ARM_JOINT_NAMES):] = hand_targets[frame_index, len(fb_ARM_JOINT_NAMES):]
+    for frame_index in range(anchor - 1, -1, -1):
+        seed = qpos[frame_index + 1].copy()
+        seed[len(fb_ARM_JOINT_NAMES):] = hand_targets[frame_index, len(fb_ARM_JOINT_NAMES):]
+        rest = hand_targets[frame_index].copy()
+        rest[arm_indices] = nominal_arm
+        qpos[frame_index] = solver.solve_frame(targets[frame_index], seed, rest)
+        qpos[frame_index, len(fb_ARM_JOINT_NAMES):] = hand_targets[frame_index, len(fb_ARM_JOINT_NAMES):]
+    fk = solver.fk_batch(qpos)
+    return (qpos, fk, targets)
+
+def fb_fit_base_from_camera(reference: np.ndarray, camera_palm: np.ndarray, fk_base_palm: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+
+    def delta_transform(parameters: np.ndarray) -> np.ndarray:
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = Rotation.from_rotvec(parameters[:3]).as_matrix()
+        transform[:3, 3] = parameters[3:]
+        return transform
+
+    def residual(parameters: np.ndarray) -> np.ndarray:
+        candidate = delta_transform(parameters) @ reference
+        target = np.einsum('ij,tjk->tik', candidate, camera_palm)
+        position = (target[:, :3, 3] - fk_base_palm[:, :3, 3]) * 80.0
+        rotation = np.stack([Rotation.from_matrix(fk_base_palm[index, :3, :3].T @ target[index, :3, :3]).as_rotvec() for index in range(len(target))], axis=0) * 8.0
+        prior = np.concatenate([parameters[:3] / 0.35, parameters[3:] / 0.12]) * 0.1
+        return np.concatenate([position.reshape(-1), rotation.reshape(-1), prior])
+    rotation_bound = np.deg2rad(25.0)
+    result = least_squares(residual, np.zeros(6, dtype=np.float64), bounds=(np.asarray([-rotation_bound] * 3 + [-0.12] * 3), np.asarray([rotation_bound] * 3 + [0.12] * 3)), loss='soft_l1', f_scale=0.5, max_nfev=80)
+    fitted = delta_transform(result.x) @ reference
+    return (fitted, {'success': bool(result.success), 'message': str(result.message), 'nfev': int(result.nfev), 'delta_rotation_deg': np.rad2deg(result.x[:3]).tolist(), 'delta_translation_m': result.x[3:].tolist(), 'cost': float(result.cost)})
+
+def fb_trajectory_metrics(qpos: np.ndarray, fk: np.ndarray, target: np.ndarray, timestamps: np.ndarray, arm_indices: np.ndarray, nominal_arm: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> dict[str, Any]:
+    position_error = np.linalg.norm(fk[:, :3, 3] - target[:, :3, 3], axis=-1)
+    orientation_error = np.asarray([np.linalg.norm(Rotation.from_matrix(fk[index, :3, :3].T @ target[index, :3, :3]).as_rotvec()) for index in range(len(fk))], dtype=np.float64)
+    dt = np.diff(timestamps)
+    arm = qpos[:, arm_indices]
+    velocity = np.diff(arm, axis=0) / dt[:, None]
+    acceleration = np.diff(velocity, axis=0) / (0.5 * (dt[1:] + dt[:-1])[:, None])
+    margin = np.minimum(arm - lower[arm_indices], upper[arm_indices] - arm)
+    rest_rms = float(np.sqrt(np.mean((arm - nominal_arm[None, :]) ** 2)))
+    position_rmse_m = float(np.sqrt(np.mean(position_error ** 2)))
+    orientation_rmse_deg = float(np.rad2deg(np.sqrt(np.mean(orientation_error ** 2))))
+    velocity_rms = float(np.sqrt(np.mean(velocity ** 2)))
+    acceleration_rms = float(np.sqrt(np.mean(acceleration ** 2)))
+    min_margin = float(np.min(margin))
+    score = position_rmse_m * 1000.0 + orientation_rmse_deg * 0.05 + velocity_rms * 0.1 + acceleration_rms * 0.002 + rest_rms * 0.2 + max(0.0, 0.08 - min_margin) * 20.0
+    return {'selection_score': float(score), 'position_error_m': fb_stats(position_error), 'position_rmse_m': position_rmse_m, 'orientation_error_deg': fb_stats(np.rad2deg(orientation_error)), 'orientation_rmse_deg': orientation_rmse_deg, 'arm_velocity_rms_rad_s': velocity_rms, 'arm_acceleration_rms_rad_s2': acceleration_rms, 'arm_rest_deviation_rms_rad': rest_rms, 'minimum_joint_limit_margin_rad': min_margin}
+
+def fb_solve_virtual_base_ik(merged: fb_MergedTrajectory, urdf_path: Path, max_iterations: int, outer_iterations: int, nominal_postures: list[tuple[str, np.ndarray]] | None=None, anchor_index: int | None=None, arm_rest_weight: float=0.0) -> tuple[fb_CandidateResult, list[dict[str, Any]], list[str], np.ndarray, np.ndarray]:
+    fb_validate_legacy_qpos_compatibility(urdf_path)
+    urdf = fb_load_urdf(urdf_path)
+    joint_names = list(urdf.actuated_joint_names)
+    if joint_names[:7] != list(fb_ARM_JOINT_NAMES):
+        raise ValueError(f'Unexpected xArm joint order: {joint_names[:7]}')
+    lower = np.asarray([float(urdf.joint_map[name].limit.lower) for name in joint_names], dtype=np.float64)
+    upper = np.asarray([float(urdf.joint_map[name].limit.upper) for name in joint_names], dtype=np.float64)
+    arm_indices = np.asarray([joint_names.index(name) for name in fb_ARM_JOINT_NAMES])
+    hand_targets = fb_make_full_hand_targets(merged, joint_names, lower, upper)
+    default_qpos = np.clip(np.zeros(len(joint_names), dtype=np.float32), lower, upper)
+    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=jnp.asarray(default_qpos))
+    palm_link_index = robot.links.names.index('left_palm_link')
+    solver = fb_SequentialArmIKSolver(robot, palm_link_index, lower, upper, arm_indices, max_iterations, arm_rest_weight)
+    anchor = len(merged.timestamps) // 2 if anchor_index is None else int(anchor_index)
+    if not 0 <= anchor < len(merged.timestamps):
+        raise ValueError(f'anchor_index is outside [0, {len(merged.timestamps)}): {anchor}')
+    candidates: list[fb_CandidateResult] = []
+    candidate_reports: list[dict[str, Any]] = []
+    postures = fb_nominal_arm_postures() if nominal_postures is None else nominal_postures
+    if not postures:
+        raise ValueError('At least one nominal arm posture is required')
+    for (name, nominal_arm_raw) in postures:
+        nominal_arm = np.clip(nominal_arm_raw, lower[arm_indices] + 0.0001, upper[arm_indices] - 0.0001)
+        nominal_full = hand_targets[anchor].copy()
+        nominal_full[arm_indices] = nominal_arm
+        nominal_fk = solver.fk_batch(nominal_full[None, :])[0]
+        base_from_camera = nominal_fk @ np.linalg.inv(merged.poses_camera_palm[anchor])
+        qpos: np.ndarray | None = None
+        fit_history: list[dict[str, Any]] = []
+        for outer in range(max(outer_iterations, 1)):
+            (qpos, fk, target) = fb_solve_path_given_extrinsic(solver, merged.poses_camera_palm, base_from_camera, hand_targets, arm_indices, nominal_arm, qpos, anchor)
+            if outer + 1 < max(outer_iterations, 1):
+                (base_from_camera, fit_report) = fb_fit_base_from_camera(base_from_camera, merged.poses_camera_palm, fk)
+                fit_history.append({'outer_iteration': outer + 1, **fit_report})
+        assert qpos is not None
+        fk = solver.fk_batch(qpos)
+        target = np.einsum('ij,tjk->tik', base_from_camera, merged.poses_camera_palm)
+        metrics = fb_trajectory_metrics(qpos, fk, target, merged.timestamps, arm_indices, nominal_arm, lower, upper)
+        metrics['fit_history'] = fit_history
+        candidate = fb_CandidateResult(name=name, base_from_camera=base_from_camera, qpos=qpos, fk_base_palm=fk, target_base_palm=target, metrics=metrics)
+        candidates.append(candidate)
+        candidate_reports.append({'name': name, 'nominal_arm_qpos': nominal_arm.tolist(), 'anchor_frame_index': anchor, 'arm_rest_weight': float(arm_rest_weight), 'T_link_base_rs_camera': base_from_camera.tolist(), **metrics})
+        print(f"[INFO] candidate={name} score={metrics['selection_score']:.4f} pos_rmse={metrics['position_rmse_m'] * 1000.0:.3f}mm ori_rmse={metrics['orientation_rmse_deg']:.3f}deg")
+    best = min(candidates, key=lambda item: float(item.metrics['selection_score']))
+    print(f'[INFO] Selected virtual extrinsic candidate: {best.name}')
+    return (best, candidate_reports, joint_names, lower, upper)
+
+def fb_postprocess_qpos_for_hardware(result: fb_CandidateResult, merged: fb_MergedTrajectory, urdf_path: Path, joint_names: list[str], *, arm_cutoff_hz: float, hand_cutoff_hz: float, velocity_limit_fraction: float, acceleration_limit_rad_s2: float, jerk_limit_rad_s3: float, joint_limit_margin_rad: float) -> fb_HardwareSafeResult:
+    """Low-pass qpos and uniformly slow the path to satisfy hardware limits."""
+    if not 0.0 < velocity_limit_fraction < 1.0:
+        raise ValueError('velocity_limit_fraction must lie in (0, 1)')
+    if acceleration_limit_rad_s2 <= 0.0:
+        raise ValueError('acceleration_limit_rad_s2 must be positive')
+    if jerk_limit_rad_s3 <= 0.0:
+        raise ValueError('jerk_limit_rad_s3 must be positive')
+    if joint_limit_margin_rad < 0.0:
+        raise ValueError('joint_limit_margin_rad must be nonnegative')
+    source_fps = float((len(merged.timestamps) - 1) / (merged.timestamps[-1] - merged.timestamps[0]))
+    nyquist = 0.5 * source_fps
+    if not 0.0 < arm_cutoff_hz < nyquist:
+        raise ValueError(f'arm_cutoff_hz must lie in (0, {nyquist})')
+    if not 0.0 < hand_cutoff_hz < nyquist:
+        raise ValueError(f'hand_cutoff_hz must lie in (0, {nyquist})')
+    urdf = fb_load_urdf(urdf_path)
+    lower = np.asarray([float(urdf.joint_map[name].limit.lower) for name in joint_names], dtype=np.float64)
+    upper = np.asarray([float(urdf.joint_map[name].limit.upper) for name in joint_names], dtype=np.float64)
+    velocity_limits = np.asarray([float(urdf.joint_map[name].limit.velocity) for name in joint_names], dtype=np.float64)
+    safe_lower = lower + joint_limit_margin_rad
+    safe_upper = upper - joint_limit_margin_rad
+    if np.any(safe_lower >= safe_upper):
+        raise ValueError('joint_limit_margin_rad leaves an empty joint range')
+    raw_qpos = np.asarray(result.qpos, dtype=np.float64)
+    safe_qpos = raw_qpos.copy()
+    safe_qpos[:, :7] = sosfiltfilt(butter(2, arm_cutoff_hz, fs=source_fps, output='sos'), raw_qpos[:, :7], axis=0)
+    safe_qpos[:, 7:19] = sosfiltfilt(butter(2, hand_cutoff_hz, fs=source_fps, output='sos'), raw_qpos[:, 7:19], axis=0)
+    safe_qpos = np.clip(safe_qpos, safe_lower[None, :], safe_upper[None, :])
+    source_dt = 1.0 / source_fps
+    source_velocity = np.diff(safe_qpos, axis=0) / source_dt
+    source_acceleration = np.diff(source_velocity, axis=0) / source_dt
+    source_jerk = np.diff(source_acceleration, axis=0) / source_dt
+    velocity_scale = float(np.max(np.abs(source_velocity) / (velocity_limit_fraction * velocity_limits[None, :])))
+    acceleration_scale = float(np.sqrt(np.max(np.abs(source_acceleration)) / acceleration_limit_rad_s2))
+    jerk_scale = float(np.cbrt(np.max(np.abs(source_jerk)) / jerk_limit_rad_s3))
+    time_scale = max(1.0, velocity_scale, acceleration_scale, jerk_scale) * 1.001
+    safe_dt = source_dt * time_scale
+    safe_fps = 1.0 / safe_dt
+    trajectory_time_s = np.arange(len(safe_qpos), dtype=np.float64) * safe_dt
+    safe_velocity = np.diff(safe_qpos, axis=0) / safe_dt
+    safe_acceleration = np.diff(safe_velocity, axis=0) / safe_dt
+    safe_jerk = np.diff(safe_acceleration, axis=0) / safe_dt
+    fk_values: list[np.ndarray] = []
+    for row in safe_qpos:
+        urdf.update_cfg(dict(zip(joint_names, row, strict=True)))
+        fk_values.append(urdf.get_transform('left_palm_link', 'link_base'))
+    fk_base_palm = np.asarray(fk_values, dtype=np.float64)
+    position_error = np.linalg.norm(fk_base_palm[:, :3, 3] - result.target_base_palm[:, :3, 3], axis=-1)
+    orientation_error = np.asarray([np.linalg.norm(Rotation.from_matrix(fk_base_palm[index, :3, :3].T @ result.target_base_palm[index, :3, :3]).as_rotvec()) for index in range(len(fk_base_palm))], dtype=np.float64)
+    qpos_adjustment_deg = np.rad2deg(np.abs(safe_qpos - raw_qpos))
+    velocity_ratio = np.abs(safe_velocity) / velocity_limits[None, :]
+    limit_margin = np.minimum(safe_qpos - lower[None, :], upper[None, :] - safe_qpos)
+    per_joint_max_velocity = {name: float(np.max(np.abs(safe_velocity[:, index]))) for (index, name) in enumerate(joint_names)}
+    metrics = {'schema': 'consens.xarm7_wuji.hardware_safe_postprocess.v1', 'method': 'zero_phase_butterworth_qpos_then_uniform_velocity_acceleration_jerk_time_scaling', 'filter_order': 2, 'arm_cutoff_hz_on_source_timeline': float(arm_cutoff_hz), 'three_finger_cutoff_hz_on_source_timeline': float(hand_cutoff_hz), 'ring_little_policy': 'unchanged zero posture', 'source_fps': source_fps, 'source_duration_s': float(merged.timestamps[-1] - merged.timestamps[0]), 'time_scale': time_scale, 'safe_playback_fps': safe_fps, 'safe_duration_s': float(trajectory_time_s[-1]), 'velocity_limit_fraction': float(velocity_limit_fraction), 'acceleration_limit_rad_s2': float(acceleration_limit_rad_s2), 'jerk_limit_rad_s3': float(jerk_limit_rad_s3), 'joint_limit_margin_rad': float(joint_limit_margin_rad), 'maximum_velocity_limit_ratio': float(np.max(velocity_ratio)), 'velocity_violation_count': int(np.sum(velocity_ratio > 1.0 + 1e-07)), 'maximum_acceleration_rad_s2': float(np.max(np.abs(safe_acceleration))), 'acceleration_violation_count': int(np.sum(np.abs(safe_acceleration) > acceleration_limit_rad_s2 + 1e-07)), 'maximum_jerk_rad_s3': float(np.max(np.abs(safe_jerk))), 'jerk_violation_count': int(np.sum(np.abs(safe_jerk) > jerk_limit_rad_s3 + 1e-07)), 'per_joint_max_velocity_rad_s': per_joint_max_velocity, 'minimum_joint_limit_margin_rad': float(np.min(limit_margin)), 'joint_limit_violation_count': int(np.sum((safe_qpos < lower[None, :] - 1e-07) | (safe_qpos > upper[None, :] + 1e-07))), 'arm_qpos_adjustment_deg': fb_stats(qpos_adjustment_deg[:, :7]), 'three_finger_qpos_adjustment_deg': fb_stats(qpos_adjustment_deg[:, 7:19]), 'safe_palm_position_error_m': fb_stats(position_error), 'safe_palm_position_rmse_m': float(np.sqrt(np.mean(position_error ** 2))), 'safe_palm_orientation_error_deg': fb_stats(np.rad2deg(orientation_error)), 'safe_palm_orientation_rmse_deg': float(np.rad2deg(np.sqrt(np.mean(orientation_error ** 2))))}
+    return fb_HardwareSafeResult(qpos=safe_qpos, fk_base_palm=fk_base_palm, trajectory_time_s=trajectory_time_s, playback_fps=safe_fps, metrics=metrics)
+
+def fb_write_ik_pkl(path: Path, merged_path: Path, merged: fb_MergedTrajectory, result: fb_CandidateResult, safe: fb_HardwareSafeResult, candidates: list[dict[str, Any]], urdf_path: Path, joint_names: list[str], overwrite: bool) -> None:
+    if path.exists() and (not overwrite):
+        raise FileExistsError(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.unlink(missing_ok=True)
+    position_error = np.linalg.norm(safe.fk_base_palm[:, :3, 3] - result.target_base_palm[:, :3, 3], axis=-1)
+    orientation_error = np.asarray([np.linalg.norm(Rotation.from_matrix(safe.fk_base_palm[index, :3, :3].T @ result.target_base_palm[index, :3, :3]).as_rotvec()) for index in range(len(result.qpos))], dtype=np.float64)
+    header = {'type': 'header', 'format': fb_IK_FORMAT, 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'source_merged_pkl': str(merged_path), 'urdf': str(urdf_path), 'frame_convention': 'A_T_B maps coordinates from frame B into frame A', 'translation_unit': 'm', 'qpos_unit': 'rad', 'qpos_policy': 'hardware-safe filtered qpos on a uniformly time-scaled trajectory', 'qpos_joint_names': joint_names, 'qpos_dimension': len(joint_names), 'arm_joint_names': list(fb_ARM_JOINT_NAMES), 'three_finger_joint_names': merged.hand_qpos_joint_names, 'inactive_ring_little_policy': 'zero clipped to URDF joint limits', 'virtual_extrinsic_warning': 'T_link_base_rs_camera is gauge-selected for reachability/continuity and Viser; it is not a physical camera-to-robot calibration', 'selected_candidate': result.name, 'T_link_base_rs_camera': result.base_from_camera, 'T_left_palm_link_hand_back_cube': merged.palm_from_hand_back, 'selection_metrics': result.metrics, 'candidate_reports': candidates, 'hardware_safety': safe.metrics}
+    try:
+        with temporary.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame_index in range(len(result.qpos)):
+                pickle.dump({'type': 'frame', 'frame_index': frame_index, 'rs_capture_timestamp': float(merged.timestamps[frame_index]), 'trajectory_time_s': float(safe.trajectory_time_s[frame_index]), 'normalized_phase': float(merged.phase[frame_index]), 'qpos': safe.qpos[frame_index].astype(np.float32), 'raw_ik_qpos': result.qpos[frame_index].astype(np.float32), 'arm_qpos': safe.qpos[frame_index, :7].astype(np.float32), 'wujihand_qpos': safe.qpos[frame_index, 7:].astype(np.float32), 'wujihand_three_finger_qpos': safe.qpos[frame_index, 7:19].astype(np.float32), 'source_interpolated_three_finger_qpos': merged.hand_qpos[frame_index].astype(np.float32), 'T_rs_camera_hand_back_cube': merged.poses_camera_hand_back[frame_index], 'T_hand_back_cube_obj': merged.poses_hand_back_obj[frame_index], 'T_rs_camera_obj': merged.poses_camera_obj[frame_index], 'target_T_link_base_left_palm_link': result.target_base_palm[frame_index], 'fk_T_link_base_left_palm_link': safe.fk_base_palm[frame_index], 'raw_ik_fk_T_link_base_left_palm_link': result.fk_base_palm[frame_index], 'palm_position_error_m': float(position_error[frame_index]), 'palm_orientation_error_deg': float(np.rad2deg(orientation_error[frame_index])), 'rs_pose_quality': merged.rs_quality[frame_index], 'hand_pose_quality': merged.hand_quality[frame_index]}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump({'type': 'footer', 'frame_count': len(result.qpos), 'safe_playback_fps': float(safe.playback_fps), 'safe_duration_s': float(safe.trajectory_time_s[-1]), 'position_error_m': fb_stats(position_error), 'orientation_error_deg': fb_stats(np.rad2deg(orientation_error))}, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def fb_load_ik_pkl(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    frames: list[dict[str, Any]] = []
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('format') != fb_IK_FORMAT:
+            raise ValueError(f"Unsupported IK PKL format: {header.get('format')}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if isinstance(record, dict) and record.get('type') == 'frame':
+                frames.append(record)
+    return (header, frames)
+
+def fb_run_viser(path: Path, host: str, port: int, fps: float) -> None:
+    (header, frames) = fb_load_ik_pkl(path)
+    urdf_path = Path(header['urdf'])
+    urdf = fb_load_urdf(urdf_path)
+    safe_fps = float(header.get('hardware_safety', {}).get('safe_playback_fps', fps))
+    server = viser.ViserServer(host=host, port=port)
+    print(f'[INFO] Viser URL: http://127.0.0.1:{server.get_port()}')
+    server.scene.set_up_direction('+z')
+    server.scene.world_axes.visible = True
+    server.gui.set_panel_label('Hardware-safe RS + xArm7 + Wuji IK')
+    server.initial_camera.position = (1.1, -1.1, 0.9)
+    server.initial_camera.look_at = (0.25, 0.0, 0.45)
+    server.initial_camera.up = (0.0, 0.0, 1.0)
+    server.scene.add_grid('/ground', width=2.0, height=2.0, plane='xy', cell_size=0.05, section_size=0.25)
+    urdf_vis = ViserUrdf(server, urdf, root_node_name='/robot')
+    base_from_camera = np.asarray(header['T_link_base_rs_camera'], dtype=np.float64)
+    server.scene.add_frame('/rs_camera', position=base_from_camera[:3, 3], wxyz=fb_matrix_to_wxyz(base_from_camera[:3, :3]), axes_length=0.12, axes_radius=0.003)
+    target_palm = server.scene.add_frame('/targets/left_palm_link', axes_length=0.08, axes_radius=0.002)
+    actual_palm = server.scene.add_frame('/fk/left_palm_link', axes_length=0.07, axes_radius=0.0015)
+    hand_back = server.scene.add_frame('/targets/hand_back_cube', axes_length=0.07, axes_radius=0.002)
+    server.scene.add_box('/targets/hand_back_cube/box', dimensions=(0.0625, 0.0625, 0.0625), color=(80, 120, 255), opacity=0.18)
+    finger_frames = {name: server.scene.add_frame(f'/targets/fingers/{name}', axes_length=0.035, axes_radius=0.0012) for name in fb_FINGER_NAMES}
+    with server.gui.add_folder('Playback'):
+        slider = server.gui.add_slider('Frame', min=0, max=len(frames) - 1, step=1, initial_value=0)
+        autoplay = server.gui.add_checkbox('Auto play', initial_value=False)
+        loop = server.gui.add_checkbox('Loop', initial_value=True)
+        speed = server.gui.add_slider('FPS', min=1.0, max=30.0, step=0.1, initial_value=max(min(float(fps), safe_fps), 1.0))
+        server.gui.add_markdown(f'Hardware-safe real-time playback: `{safe_fps:.3f} FPS`. Higher GUI speeds are visualization-only.')
+    with server.gui.add_folder('Virtual camera-to-base transform'):
+        server.gui.add_markdown('This is an optimized Viser gauge, not physical calibration.\n\n```text\n' + np.array2string(base_from_camera, precision=8, suppress_small=True) + '\n```')
+    with server.gui.add_folder('Current frame'):
+        frame_text = server.gui.add_markdown('')
+    rendered = -1
+    last_step = time.monotonic()
+
+    def render(index: int) -> None:
+        nonlocal rendered
+        record = frames[index]
+        urdf_vis.update_cfg(np.asarray(record['qpos'], dtype=np.float64))
+        target = np.asarray(record['target_T_link_base_left_palm_link'])
+        actual = np.asarray(record['fk_T_link_base_left_palm_link'])
+        cube = base_from_camera @ np.asarray(record['T_rs_camera_hand_back_cube'])
+        target_palm.position = target[:3, 3]
+        target_palm.wxyz = fb_matrix_to_wxyz(target[:3, :3])
+        actual_palm.position = actual[:3, 3]
+        actual_palm.wxyz = fb_matrix_to_wxyz(actual[:3, :3])
+        hand_back.position = cube[:3, 3]
+        hand_back.wxyz = fb_matrix_to_wxyz(cube[:3, :3])
+        for (finger_index, name) in enumerate(fb_FINGER_NAMES):
+            pose = base_from_camera @ np.asarray(record['T_rs_camera_obj'])[finger_index]
+            finger_frames[name].position = pose[:3, 3]
+            finger_frames[name].wxyz = fb_matrix_to_wxyz(pose[:3, :3])
+        frame_text.content = f"Frame `{index}/{len(frames) - 1}`  \nSafe trajectory time: `{record['trajectory_time_s']:.3f} s`  \nPalm position error: `{record['palm_position_error_m'] * 1000.0:.3f} mm`  \nPalm orientation error: `{record['palm_orientation_error_deg']:.3f} deg`"
+        rendered = index
+    while True:
+        selected = int(slider.value)
+        if selected != rendered:
+            render(selected)
+        if bool(autoplay.value):
+            now = time.monotonic()
+            if now - last_step >= 1.0 / max(float(speed.value), 1.0):
+                next_frame = rendered + 1
+                if next_frame >= len(frames):
+                    if bool(loop.value):
+                        next_frame = 0
+                    else:
+                        next_frame = len(frames) - 1
+                        autoplay.value = False
+                slider.value = next_frame
+                last_step = now
+        else:
+            last_step = time.monotonic()
+        time.sleep(0.01)
+
+def fb_parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--hand-pkl', type=Path, default=fb_DEFAULT_HAND_PKL)
+    parser.add_argument('--rs-pkl', type=Path, default=fb_DEFAULT_RS_PKL)
+    parser.add_argument('--urdf', type=Path, default=fb_DEFAULT_URDF)
+    parser.add_argument('--merged-pkl', type=Path, default=fb_DEFAULT_MERGED_PKL)
+    parser.add_argument('--ik-pkl', type=Path, default=fb_DEFAULT_IK_PKL)
+    parser.add_argument('--merge-only', action='store_true')
+    parser.add_argument('--solve-only', action='store_true')
+    parser.add_argument('--viser-only', action='store_true', help='Replay an existing --ik-pkl without rebuilding or solving it.')
+    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--ik-iterations', type=int, default=60)
+    parser.add_argument('--outer-iterations', type=int, default=2)
+    parser.add_argument('--arm-smoothing-cutoff-hz', type=float, default=4.0)
+    parser.add_argument('--hand-smoothing-cutoff-hz', type=float, default=2.0)
+    parser.add_argument('--velocity-limit-fraction', type=float, default=0.75)
+    parser.add_argument('--acceleration-limit-rad-s2', type=float, default=20.0)
+    parser.add_argument('--jerk-limit-rad-s3', type=float, default=60.0)
+    parser.add_argument('--joint-limit-margin-rad', type=float, default=0.005)
+    parser.add_argument('--viser', action='store_true')
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=8127)
+    parser.add_argument('--fps', type=float, default=12.0)
+    return parser.parse_args()
+
+def fb_main() -> None:
+    args = fb_parse_args()
+    mode_count = sum((bool(value) for value in (args.merge_only, args.solve_only, args.viser_only)))
+    if mode_count > 1:
+        raise ValueError('--merge-only, --solve-only, and --viser-only are mutually exclusive')
+    hand_path = args.hand_pkl.expanduser().resolve()
+    rs_path = args.rs_pkl.expanduser().resolve()
+    urdf_path = args.urdf.expanduser().resolve()
+    merged_path = args.merged_pkl.expanduser().resolve()
+    ik_path = args.ik_pkl.expanduser().resolve()
+    if args.viser_only:
+        if not ik_path.is_file():
+            raise FileNotFoundError(ik_path)
+        fb_run_viser(ik_path, str(args.host), int(args.port), float(args.fps))
+        return
+    if not args.solve_only:
+        for path in (hand_path, rs_path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        print('[INFO] Loading hand trajectory')
+        hand = fb_load_hand_trajectory(hand_path)
+        print('[INFO] Loading RS trajectory')
+        rs = fb_load_rs_trajectory(rs_path)
+        merged = fb_build_merged_trajectory(hand, rs)
+        fb_write_merged_pkl(merged_path, merged, hand_path, rs_path, bool(args.overwrite))
+        print(f'[INFO] Saved merged PKL: {merged_path} frames={len(merged.timestamps)} size={merged_path.stat().st_size / 1024 ** 2:.2f}MiB')
+        if args.merge_only:
+            return
+    else:
+        if not merged_path.is_file():
+            raise FileNotFoundError(merged_path)
+        merged = fb_load_merged_pkl(merged_path)
+    if not urdf_path.is_file():
+        raise FileNotFoundError(urdf_path)
+    (result, candidates, joint_names, _, _) = fb_solve_virtual_base_ik(merged, urdf_path, max(int(args.ik_iterations), 1), max(int(args.outer_iterations), 1))
+    safe = fb_postprocess_qpos_for_hardware(result, merged, urdf_path, joint_names, arm_cutoff_hz=float(args.arm_smoothing_cutoff_hz), hand_cutoff_hz=float(args.hand_smoothing_cutoff_hz), velocity_limit_fraction=float(args.velocity_limit_fraction), acceleration_limit_rad_s2=float(args.acceleration_limit_rad_s2), jerk_limit_rad_s3=float(args.jerk_limit_rad_s3), joint_limit_margin_rad=float(args.joint_limit_margin_rad))
+    fb_write_ik_pkl(ik_path, merged_path, merged, result, safe, candidates, urdf_path, joint_names, bool(args.overwrite))
+    print(f'[INFO] Saved IK PKL: {ik_path} frames={len(result.qpos)} size={ik_path.stat().st_size / 1024 ** 2:.2f}MiB')
+    print('[RESULT] T_link_base_rs_camera (virtual Viser gauge):')
+    print(np.array2string(result.base_from_camera, precision=9, suppress_small=True))
+    print('[RESULT] metrics:')
+    print(json.dumps(result.metrics, indent=2, ensure_ascii=False))
+    print('[RESULT] hardware-safe postprocess:')
+    print(json.dumps(safe.metrics, indent=2, ensure_ascii=False))
+    if args.viser:
+        fb_run_viser(ik_path, str(args.host), int(args.port), float(args.fps))
+
+full_body = SimpleNamespace(
+    DEFAULT_URDF=fb_DEFAULT_URDF,
+    FINGER_NAMES=fb_FINGER_NAMES,
+    MERGED_FORMAT=fb_MERGED_FORMAT,
+    MergedTrajectory=fb_MergedTrajectory,
+    PALM_CUBE_KEY=fb_PALM_CUBE_KEY,
+    THREE_FINGER_JOINT_NAMES=fb_THREE_FINGER_JOINT_NAMES,
+    normalized_time=fb_normalized_time,
+    postprocess_qpos_for_hardware=fb_postprocess_qpos_for_hardware,
+    solve_virtual_base_ik=fb_solve_virtual_base_ik,
+    validate_transform=fb_validate_transform,
+    write_ik_pkl=fb_write_ik_pkl,
+    write_merged_pkl=fb_write_merged_pkl,
+)
+
+import argparse
+import json
+import pickle
+import time
+from pathlib import Path
+from typing import Any
+import numpy as np
+from scipy.spatial.transform import Rotation
+solve_FILE_PATH = Path(__file__).resolve()
+solve_REPO_ROOT = APRILCUBE_ROOT.parent.parent
+solve_DEFAULT_RAW = solve_REPO_ROOT / 'recordings/multi_cam_record_0717_010151.pkl'
+solve_DEFAULT_SIDECAR = solve_REPO_ROOT / 'recordings/multi_cam_record_0717_010151_020_pose_sidecar.pkl'
+solve_DEFAULT_RETARGET_NPZ = solve_REPO_ROOT / 'outputs/retargeting/multi_cam_record_0717_010151/three_finger_joint_temporal_optimal/three_finger_se3.npz'
+solve_DEFAULT_RETARGET_PKL = solve_DEFAULT_RETARGET_NPZ.with_suffix('.pkl')
+solve_DEFAULT_OUTPUT_DIR = solve_REPO_ROOT / 'outputs/retargeting/multi_cam_record_0717_010151/xarm7_wuji_left_optimal'
+solve_DEFAULT_MERGED = solve_DEFAULT_OUTPUT_DIR / 'full_body_merged.pkl'
+solve_DEFAULT_IK = solve_DEFAULT_OUTPUT_DIR / 'xarm7_wuji_left_full_qpos.pkl'
+solve_RAW_FORMAT = 'consens_multi_camera_sync_stream'
+solve_SIDECAR_FORMAT = 'consensv2_multi_cam_020_pose_sidecar_v1'
+solve_RETARGET_FORMAT = 'consens.left_wuji_three_finger_retarget.compact.v2'
+solve_DEFAULT_NOMINAL_ARM_DEG = (0.0, -59.1, 0.0, 29.1, 0.0, 89.7, 0.0)
+
+def solve_parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--raw-pkl', type=Path, default=solve_DEFAULT_RAW)
+    parser.add_argument('--sidecar-pkl', type=Path, default=solve_DEFAULT_SIDECAR)
+    parser.add_argument('--retarget-npz', type=Path, default=solve_DEFAULT_RETARGET_NPZ)
+    parser.add_argument('--retarget-pkl', type=Path, default=solve_DEFAULT_RETARGET_PKL)
+    parser.add_argument('--urdf', type=Path, default=full_body.DEFAULT_URDF)
+    parser.add_argument('--merged-pkl', type=Path, default=solve_DEFAULT_MERGED)
+    parser.add_argument('--ik-pkl', type=Path, default=solve_DEFAULT_IK)
+    parser.add_argument('--ik-iterations', type=int, default=60)
+    parser.add_argument('--outer-iterations', type=int, default=2)
+    parser.add_argument('--arm-smoothing-cutoff-hz', type=float, default=4.0)
+    parser.add_argument('--hand-smoothing-cutoff-hz', type=float, default=2.0)
+    parser.add_argument('--velocity-limit-fraction', type=float, default=0.75)
+    parser.add_argument('--acceleration-limit-rad-s2', type=float, default=20.0)
+    parser.add_argument('--jerk-limit-rad-s3', type=float, default=60.0)
+    parser.add_argument('--joint-limit-margin-rad', type=float, default=0.005)
+    parser.add_argument('--nominal-arm-deg', type=float, nargs=7, metavar=('J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'J7'), default=solve_DEFAULT_NOMINAL_ARM_DEG, help='Desired center posture used to place the virtual RS trajectory.')
+    parser.add_argument('--anchor-frame', type=int, default=-1, help='Frame mapped to the nominal arm posture; negative selects an SE(3) medoid.')
+    parser.add_argument('--arm-rest-weight', type=float, default=0.15, help='Light arm-joint centering weight around --nominal-arm-deg.')
+    parser.add_argument('--overwrite', action='store_true')
+    return parser.parse_args()
+
+def solve_load_raw_header(path: Path) -> dict[str, Any]:
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+    if not isinstance(header, dict) or header.get('format') != solve_RAW_FORMAT:
+        raise ValueError(f"Unsupported raw PKL format: {header.get('format')}")
+    return header
+
+def solve_load_retarget(npz_path: Path, pkl_path: Path) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+    with np.load(npz_path, allow_pickle=False) as archive:
+        finger_names = [str(value) for value in archive['finger_names']]
+        timestamps = np.asarray(archive['timestamps'], dtype=np.float64)
+        poses_hand_back_obj = np.asarray(archive['T_hand_back_cube_obj'], dtype=np.float64)
+    if finger_names != list(full_body.FINGER_NAMES):
+        raise ValueError(f'Unexpected retarget finger order: {finger_names}')
+    qpos: list[np.ndarray] = []
+    frame_indices: list[int] = []
+    with pkl_path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('format') != solve_RETARGET_FORMAT:
+            raise ValueError(f"Unsupported retarget PKL format: {header.get('format')}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if isinstance(record, dict) and record.get('type') == 'frame':
+                frame_indices.append(int(record['frame_index']))
+                qpos.append(np.asarray(record['wujihand_qpos'], dtype=np.float64))
+    expected_indices = list(range(len(qpos)))
+    if frame_indices != expected_indices:
+        raise ValueError('Retarget frame indices are not contiguous from zero')
+    hand_qpos = np.asarray(qpos, dtype=np.float64)
+    frame_count = len(timestamps)
+    if poses_hand_back_obj.shape != (frame_count, 3, 4, 4):
+        raise ValueError(f'Unexpected T_hand_back_cube_obj shape: {poses_hand_back_obj.shape}')
+    if hand_qpos.shape != (frame_count, len(full_body.THREE_FINGER_JOINT_NAMES)):
+        raise ValueError(f'Unexpected hand qpos shape: {hand_qpos.shape}')
+    return (header, timestamps, poses_hand_back_obj, hand_qpos)
+
+def solve_load_wrist_poses(path: Path, raw_path: Path, frame_count: int) -> tuple[dict[str, Any], np.ndarray, list[dict[str, Any]]]:
+    poses: list[np.ndarray] = []
+    quality: list[dict[str, Any]] = []
+    footer: dict[str, Any] | None = None
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get('format') != solve_SIDECAR_FORMAT:
+            raise ValueError(f"Unsupported sidecar format: {header.get('format')}")
+        final_smoothing = header.get('metadata', {}).get('final_global_smoothing', {})
+        required_targets = {'wrist_Q', 'index_Q', 'thumb_Q', 'middle_Q'}
+        applied_counts = final_smoothing.get('applied_counts', {}) or {}
+        if not bool(final_smoothing.get('complete', False)) or not bool(final_smoothing.get('completion_barrier_passed', False)) or int(final_smoothing.get('frame_count', -1)) != frame_count or (set(final_smoothing.get('targets', [])) != required_targets) or any((int(applied_counts.get(name, -1)) != frame_count for name in required_targets)):
+            raise ValueError('Full-body IK requires a complete stage13 globally-smoothed multi-camera sidecar')
+        raw_stat = raw_path.stat()
+        expected_identity = {'size': int(raw_stat.st_size), 'mtime_ns': int(raw_stat.st_mtime_ns)}
+        if header.get('source_multi_cam_identity') != expected_identity:
+            raise ValueError('Sidecar source identity does not match raw PKL')
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get('type') == 'footer':
+                footer = record
+                continue
+            if record.get('type') not in ('frame', 'pose_frame'):
+                continue
+            frame_index = len(poses)
+            if int(record.get('sample_index', frame_index)) != frame_index:
+                raise ValueError('Sidecar sample indices are not contiguous from zero')
+            result = record.get('pose_results', {}).get('wrist_Q', {})
+            pose = result.get('pose', {}) or {}
+            if not pose.get('success', False) or pose.get('T') is None:
+                raise ValueError(f'Sidecar wrist_Q frame {frame_index} has no pose')
+            if not bool(pose.get('final_global_smoothing_applied', False)):
+                raise ValueError(f'Sidecar wrist_Q frame {frame_index} bypassed mandatory final global smoothing')
+            transform = full_body.validate_transform(pose['T'], f'sidecar wrist_Q frame {frame_index}').copy()
+            transform[:3, 3] /= 1000.0
+            poses.append(transform)
+            quality.append({'pose_source': str(pose.get('pose_source', '')), 'quality_level': str(pose.get('quality_level', '')), 'quality_reason': str(pose.get('quality_reason', '')), 'pose_filled': bool(pose.get('pose_filled', False)), 'reproj_error_px': float(pose.get('reproj_error', float('nan'))), 'temporal_smoothed': bool(pose.get('temporal_smoothed', False))})
+    if footer is None:
+        raise ValueError('Sidecar is missing its footer')
+    if len(poses) != frame_count:
+        raise ValueError(f'Sidecar/retarget frame count mismatch: {len(poses)} != {frame_count}')
+    required_targets = {'wrist_Q', 'index_Q', 'thumb_Q', 'middle_Q'}
+    success_counts = footer.get('success_counts', {}) or {}
+    applied_counts = footer.get('final_global_smoothing_applied_counts', {}) or {}
+    if not bool(footer.get('final_global_smoothing_complete', False)) or any((int(success_counts.get(name, -1)) != frame_count for name in required_targets)) or any((int(applied_counts.get(name, -1)) != frame_count for name in required_targets)):
+        raise ValueError('Sidecar footer does not certify complete stage13 smoothing for every target/frame')
+    return (header, np.asarray(poses, dtype=np.float64), quality)
+
+def solve_build_merged(raw_path: Path, sidecar_path: Path, retarget_npz_path: Path, retarget_pkl_path: Path) -> full_body.MergedTrajectory:
+    solve_load_raw_header(raw_path)
+    (retarget_header, timestamps, poses_hand_back_obj, hand_qpos) = solve_load_retarget(retarget_npz_path, retarget_pkl_path)
+    (sidecar_header, poses_camera_hand_back, rs_quality) = solve_load_wrist_poses(sidecar_path, raw_path, len(timestamps))
+    if np.any(np.diff(timestamps) <= 0.0):
+        raise ValueError('Retarget timestamps must be strictly increasing')
+    palm_from_hand_back = full_body.validate_transform(retarget_header[full_body.PALM_CUBE_KEY], f'retarget header {full_body.PALM_CUBE_KEY}')
+    poses_camera_obj = np.einsum('tij,tfjk->tfik', poses_camera_hand_back, poses_hand_back_obj)
+    poses_camera_palm = np.einsum('tij,jk->tik', poses_camera_hand_back, np.linalg.inv(palm_from_hand_back))
+    frame_count = len(timestamps)
+    source_indices = np.arange(frame_count, dtype=np.int32)
+    source_validation = retarget_header.get('source_validation', {})
+    expected_sidecar = Path(str(source_validation.get('pose_sidecar', ''))).resolve()
+    if expected_sidecar != sidecar_path.resolve():
+        raise ValueError(f'Retarget references a different sidecar: {expected_sidecar}')
+    metadata = {'type': 'header', 'format': full_body.MERGED_FORMAT, 'created_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'frame_convention': 'A_T_B maps coordinates from frame B into frame A', 'translation_unit': 'm', 'rotation_storage': '4x4 rotation matrix', 'master_timeline': 'synchronized multi-camera sample timeline', 'temporal_alignment': 'exact sample_index correspondence; no interpolation', 'output_frame_count': frame_count, 'output_fps': float((frame_count - 1) / (timestamps[-1] - timestamps[0])), 'hand_qpos_joint_names': list(full_body.THREE_FINGER_JOINT_NAMES), 'T_left_palm_link_hand_back_cube': palm_from_hand_back, 'source_raw_pkl': str(raw_path), 'source_sidecar_pkl': str(sidecar_path), 'source_retarget_npz': str(retarget_npz_path), 'source_retarget_pkl': str(retarget_pkl_path), 'source_sidecar_created_wall_time': sidecar_header.get('created_wall_time')}
+    hand_quality = [{'source_frame_index': int(index), 'exact_sample_match': True} for index in source_indices]
+    return full_body.MergedTrajectory(header=metadata, timestamps=timestamps, phase=full_body.normalized_time(timestamps), poses_camera_hand_back=poses_camera_hand_back, poses_hand_back_obj=poses_hand_back_obj, poses_camera_obj=poses_camera_obj, poses_camera_palm=poses_camera_palm, hand_qpos=hand_qpos, hand_qpos_joint_names=list(full_body.THREE_FINGER_JOINT_NAMES), palm_from_hand_back=palm_from_hand_back, hand_bracket_indices=np.stack([source_indices, source_indices], axis=-1), hand_interpolation_alpha=np.zeros(frame_count, dtype=np.float64), rs_quality=rs_quality, hand_quality=hand_quality)
+
+def solve_choose_se3_medoid(poses: np.ndarray) -> int:
+    """Return the observed palm pose closest to the trajectory's SE(3) center."""
+    poses = np.asarray(poses, dtype=np.float64)
+    translations = poses[:, :3, 3]
+    position_distance = np.linalg.norm(translations[:, None, :] - translations[None, :, :], axis=-1)
+    relative_rotations = np.einsum('aji,bjk->abik', poses[:, :3, :3], poses[:, :3, :3])
+    rotation_distance = Rotation.from_matrix(relative_rotations.reshape(-1, 3, 3)).magnitude().reshape(len(poses), len(poses))
+    distance = position_distance / 0.1 + rotation_distance / 0.5
+    return int(np.argmin(np.sum(distance, axis=1)))
+
+def solve_main() -> None:
+    args = solve_parse_args()
+    raw_path = args.raw_pkl.expanduser().resolve()
+    sidecar_path = args.sidecar_pkl.expanduser().resolve()
+    retarget_npz_path = args.retarget_npz.expanduser().resolve()
+    retarget_pkl_path = args.retarget_pkl.expanduser().resolve()
+    urdf_path = args.urdf.expanduser().resolve()
+    merged_path = args.merged_pkl.expanduser().resolve()
+    ik_path = args.ik_pkl.expanduser().resolve()
+    for path in (raw_path, sidecar_path, retarget_npz_path, retarget_pkl_path, urdf_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    print('[INFO] Loading synchronized multi-camera retarget')
+    merged = solve_build_merged(raw_path, sidecar_path, retarget_npz_path, retarget_pkl_path)
+    full_body.write_merged_pkl(merged_path, merged, retarget_pkl_path, sidecar_path, bool(args.overwrite))
+    nominal_arm_deg = np.asarray(args.nominal_arm_deg, dtype=np.float64)
+    nominal_arm = np.deg2rad(nominal_arm_deg)
+    anchor_index = int(args.anchor_frame)
+    if anchor_index < 0:
+        anchor_index = solve_choose_se3_medoid(merged.poses_camera_palm)
+    if not 0 <= anchor_index < len(merged.timestamps):
+        raise ValueError(f'--anchor-frame is outside [0, {len(merged.timestamps)}): {anchor_index}')
+    print(f'[INFO] Solving {len(merged.timestamps)} full-body IK frames')
+    print(f'[INFO] Virtual gauge center: anchor_frame={anchor_index} nominal_arm_deg={nominal_arm_deg.tolist()} arm_rest_weight={float(args.arm_rest_weight):.4f}')
+    (result, candidates, joint_names, _, _) = full_body.solve_virtual_base_ik(merged, urdf_path, max(int(args.ik_iterations), 1), max(int(args.outer_iterations), 1), nominal_postures=[('requested_initial_position', nominal_arm)], anchor_index=anchor_index, arm_rest_weight=float(args.arm_rest_weight))
+    safe = full_body.postprocess_qpos_for_hardware(result, merged, urdf_path, joint_names, arm_cutoff_hz=float(args.arm_smoothing_cutoff_hz), hand_cutoff_hz=float(args.hand_smoothing_cutoff_hz), velocity_limit_fraction=float(args.velocity_limit_fraction), acceleration_limit_rad_s2=float(args.acceleration_limit_rad_s2), jerk_limit_rad_s3=float(args.jerk_limit_rad_s3), joint_limit_margin_rad=float(args.joint_limit_margin_rad))
+    full_body.write_ik_pkl(ik_path, merged_path, merged, result, safe, candidates, urdf_path, joint_names, bool(args.overwrite))
+    report = {'ik_pkl': str(ik_path), 'frames': len(merged.timestamps), 'selected_candidate': result.name, 'requested_nominal_arm_deg': nominal_arm_deg.tolist(), 'anchor_frame_index': anchor_index, 'arm_rest_weight': float(args.arm_rest_weight), 'T_link_base_rs_camera': result.base_from_camera.tolist(), 'selection_metrics': result.metrics, 'hardware_safety': safe.metrics}
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Embedded complete-pose recovery patches used before stage13.
+#
+# These are the exact middle temporal/flow, strict index, and wrist
+# bidirectional-flow implementations that produced the frozen reference
+# sidecar, namespace-prefixed and detached from their former script modules.
+# -----------------------------------------------------------------------------
+import argparse
+import copy
+import importlib.util
+import json
+import math
+import pickle
+import sys
+import time
+from pathlib import Path
+from typing import Any
+import cv2
+import numpy as np
+rgb_FILE_PATH = Path(__file__).resolve()
+rgb_PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
+if str(rgb_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(rgb_PROJECT_ROOT))
+rgb_FINALIZE_020_PATH = rgb_PROJECT_ROOT / 'thirdparty' / 'aprilcube' / 'src' / '020_finalize_pose_postprocess.py'
+rgb_DEFAULT_SOURCE = rgb_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151.pkl'
+rgb_DEFAULT_SIDECAR = rgb_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151_020_pose_sidecar.pkl'
+rgb_DEFAULT_OUTPUT = rgb_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151_020_pose_sidecar_middle_rgb_flow_candidate.pkl'
+rgb_DEFAULT_QA_DIR = rgb_PROJECT_ROOT / 'recordings' / 'qa_multi_cam_record_0717_010151_020'
+rgb_DEFAULT_TARGET_NAME = 'middle_Q'
+
+def rgb_load_finalize_020() -> Any:
+    spec = importlib.util.spec_from_file_location('middle_rgb_flow_finalize_020', rgb_FINALIZE_020_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(rgb_FINALIZE_020_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+def rgb_load_sidecar(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    footer: dict[str, Any] | None = None
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get('type') == 'frame':
+                frames.append(record)
+            elif record.get('type') == 'footer':
+                footer = record
+                break
+    if not isinstance(header, dict) or header.get('type') != 'header':
+        raise ValueError(f'Invalid sidecar header: {path}')
+    if footer is None:
+        raise ValueError(f'Sidecar has no complete footer: {path}')
+    if int(footer.get('frame_count', -1)) != len(frames):
+        raise ValueError('Sidecar footer frame_count mismatch')
+    if any((int(frame.get('sample_index', -1)) != index for (index, frame) in enumerate(frames))):
+        raise ValueError('Sidecar sample_index is not contiguous')
+    return (header, frames, footer)
+
+def rgb_load_source_samples(path: Path) -> Any:
+    with path.open('rb') as stream:
+        first_record = pickle.load(stream)
+    if mcstream_is_stream_header(first_record):
+        index = mcstream_scan_stream_index(path)
+        if not index.complete:
+            raise ValueError(f'Streaming source has no complete footer: {path}')
+        return mcstream_StreamingSampleSequence(index)
+    if not isinstance(first_record, dict) or not isinstance(first_record.get('samples'), list):
+        raise ValueError(f'Unsupported source recording: {path}')
+    return first_record['samples']
+
+def rgb_detection_runtime(finalize020: Any, target_metadata: dict[str, Any]) -> dict[str, Any]:
+    intrinsics = finalize020.realsense_load_intrinsics_yaml(target_metadata['intrinsics_yaml'])
+    image_size = tuple((int(value) for value in target_metadata['image_size']))
+    if tuple(intrinsics['image_size']) != image_size:
+        raise ValueError(f"Target intrinsics/image-size mismatch: {intrinsics['image_size']} != {image_size}")
+    undistort_pack = finalize020.realsense_create_undistort_maps(intrinsics, image_size)
+    camera_matrix = np.asarray(undistort_pack[2], dtype=np.float64).reshape(3, 3) if undistort_pack is not None else np.asarray(intrinsics['K'], dtype=np.float64).reshape(3, 3)
+    cube_cfg = Path(target_metadata['cube_cfg']).expanduser().resolve()
+    (config, face_id_sets) = finalize020.aprilcube.load_cube_config(str(cube_cfg / 'config.json'))
+    return {'intrinsics': intrinsics, 'image_size': image_size, 'undistort_pack': undistort_pack, 'camera_matrix': camera_matrix, 'dist_coeffs': np.zeros(5, dtype=np.float64), 'cube_cfg': cube_cfg, 'config': config, 'face_id_sets': face_id_sets, 'tag_corner_map': finalize020.aprilcube.build_tag_corner_map(config)}
+
+def rgb_detection_frame(finalize020: Any, image: np.ndarray, runtime: dict[str, Any]) -> np.ndarray:
+    (target_width, target_height) = runtime['image_size']
+    if image.shape[:2] != (target_height, target_width):
+        raise ValueError(f'Target raw image is {image.shape[1]}x{image.shape[0]}, but the selected calibration is {target_width}x{target_height}')
+    return finalize020.realsense_undistort_frame(image, runtime['undistort_pack'])
+
+def rgb_rotation_delta_deg(rvec_a: Any, rvec_b: Any) -> float:
+    (rotation_a, _) = cv2.Rodrigues(np.asarray(rvec_a, dtype=np.float64).reshape(3, 1))
+    (rotation_b, _) = cv2.Rodrigues(np.asarray(rvec_b, dtype=np.float64).reshape(3, 1))
+    relative = rotation_b @ rotation_a.T
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+def rgb_best_quad_corner_agreement(first: np.ndarray, second: np.ndarray) -> float:
+    first = np.asarray(first, dtype=np.float64).reshape(4, 2)
+    second = np.asarray(second, dtype=np.float64).reshape(4, 2)
+    scores: list[float] = []
+    for candidate in (second, second[::-1]):
+        for shift in range(4):
+            shifted = np.roll(candidate, shift, axis=0)
+            scores.append(float(np.mean(np.linalg.norm(first - shifted, axis=1))))
+    return min(scores)
+
+def rgb_recover_pose(*, finalize020: Any, anchor_image: np.ndarray, target_image: np.ndarray, anchor_pose: dict[str, Any], runtime: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    anchor_tag_ids = [int(value) for value in anchor_pose.get('tag_ids', []) or []]
+    if len(anchor_tag_ids) != 1:
+        raise ValueError(f'Anchor must contain exactly one tag, got {anchor_tag_ids}')
+    tag_id = anchor_tag_ids[0]
+    if tag_id not in runtime['tag_corner_map']:
+        raise ValueError(f'Anchor tag {tag_id} is not in the target cube config')
+    object_points = np.asarray(runtime['tag_corner_map'][tag_id], dtype=np.float64).reshape(4, 3)
+    camera_matrix = runtime['camera_matrix']
+    dist_coeffs = runtime['dist_coeffs']
+    anchor_rvec = np.asarray(anchor_pose['rvec'], dtype=np.float64).reshape(3, 1)
+    anchor_tvec = np.asarray(anchor_pose['tvec'], dtype=np.float64).reshape(3, 1)
+    (anchor_quad, _) = cv2.projectPoints(object_points, anchor_rvec, anchor_tvec, camera_matrix, dist_coeffs)
+    anchor_quad = anchor_quad.reshape(4, 2).astype(np.float32)
+    anchor_gray = cv2.cvtColor(anchor_image, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
+    feature_mask = np.zeros_like(anchor_gray)
+    feature_mask_scale = float(getattr(args, 'feature_mask_scale', 1.0))
+    if not 0.0 < feature_mask_scale <= 1.0:
+        raise ValueError(f'feature_mask_scale must be in (0, 1], got {feature_mask_scale}')
+    feature_center = anchor_quad.mean(axis=0, keepdims=True)
+    feature_quad = feature_center + feature_mask_scale * (anchor_quad - feature_center)
+    cv2.fillConvexPoly(feature_mask, np.rint(feature_quad).astype(np.int32), 255)
+    anchor_points = cv2.goodFeaturesToTrack(anchor_gray, maxCorners=int(args.max_features), qualityLevel=float(args.feature_quality), minDistance=float(args.feature_min_distance), mask=feature_mask, blockSize=5)
+    if anchor_points is None or len(anchor_points) < int(args.min_features):
+        count = 0 if anchor_points is None else len(anchor_points)
+        raise RuntimeError(f'Not enough anchor features: {count} < {args.min_features}')
+    lk_parameters = {'winSize': (int(args.lk_window), int(args.lk_window)), 'maxLevel': int(args.lk_levels), 'criteria': (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)}
+    (target_points, forward_status, _forward_error) = cv2.calcOpticalFlowPyrLK(anchor_gray, target_gray, anchor_points, None, **lk_parameters)
+    if target_points is None or forward_status is None:
+        raise RuntimeError('Forward LK optical flow failed')
+    (backward_points, backward_status, _backward_error) = cv2.calcOpticalFlowPyrLK(target_gray, anchor_gray, target_points, None, **lk_parameters)
+    if backward_points is None or backward_status is None:
+        raise RuntimeError('Backward LK optical flow failed')
+    anchor_xy = anchor_points.reshape(-1, 2)
+    target_xy = target_points.reshape(-1, 2)
+    backward_xy = backward_points.reshape(-1, 2)
+    fb_error = np.linalg.norm(anchor_xy - backward_xy, axis=1)
+    finite_points = np.isfinite(target_xy).all(axis=1) & np.isfinite(fb_error)
+    good = (forward_status.reshape(-1) > 0) & (backward_status.reshape(-1) > 0) & finite_points & (fb_error <= float(args.max_fb_error))
+    good_count = int(good.sum())
+    if good_count < int(args.min_good_tracks):
+        raise RuntimeError(f'Not enough FB-consistent tracks: {good_count} < {args.min_good_tracks}')
+    (homography, homography_mask) = cv2.findHomography(anchor_xy[good], target_xy[good], cv2.RANSAC, float(args.homography_ransac_px))
+    if homography is None or homography_mask is None:
+        raise RuntimeError('RANSAC homography failed')
+    inlier_mask = homography_mask.reshape(-1).astype(bool)
+    inlier_count = int(inlier_mask.sum())
+    inlier_ratio = float(inlier_count / max(good_count, 1))
+    if inlier_count < int(args.min_homography_inliers):
+        raise RuntimeError(f'Not enough homography inliers: {inlier_count} < {args.min_homography_inliers}')
+    if inlier_ratio < float(args.min_homography_inlier_ratio):
+        raise RuntimeError(f'Homography inlier ratio too small: {inlier_ratio:.3f} < {args.min_homography_inlier_ratio:.3f}')
+    predicted_tracks = cv2.perspectiveTransform(anchor_xy[good].reshape(-1, 1, 2), homography).reshape(-1, 2)
+    homography_errors = np.linalg.norm(predicted_tracks - target_xy[good], axis=1)
+    homography_median_px = float(np.median(homography_errors[inlier_mask]))
+    fb_median_px = float(np.median(fb_error[good]))
+    if homography_median_px > float(args.max_homography_median_px):
+        raise RuntimeError(f'Homography residual too high: {homography_median_px:.3f} > {args.max_homography_median_px:.3f}')
+    if fb_median_px > float(args.max_fb_median_px):
+        raise RuntimeError(f'FB residual too high: {fb_median_px:.3f} > {args.max_fb_median_px:.3f}')
+    target_quad = cv2.perspectiveTransform(anchor_quad.reshape(-1, 1, 2), homography).reshape(4, 2)
+    (height, width) = target_gray.shape[:2]
+    corners_inside = int(np.sum((target_quad[:, 0] >= 0.0) & (target_quad[:, 0] < width) & (target_quad[:, 1] >= 0.0) & (target_quad[:, 1] < height)))
+    min_corners_inside = int(getattr(args, 'min_tag_corners_inside', 4))
+    if not 0 <= min_corners_inside <= 4:
+        raise ValueError(f'min_tag_corners_inside must be in [0, 4], got {min_corners_inside}')
+    if corners_inside < min_corners_inside:
+        raise RuntimeError(f'Propagated tag has too few in-image corners: {corners_inside}/4 < {min_corners_inside}/4')
+    detected = [] if bool(getattr(args, 'skip_current_tag_detection', False)) else finalize020.pose_recovery_detect_sweep(target_gray, config=runtime['config'], valid_ids=set((int(value) for value in runtime['tag_corner_map'])))
+    detected_by_id = {int(detected_id): np.asarray(corners, dtype=np.float64).reshape(4, 2) for (detected_id, corners) in detected}
+    current_tag_detected = tag_id in detected_by_id
+    if not current_tag_detected and (not bool(args.allow_missing_current_tag)):
+        raise RuntimeError(f'Current frame did not independently decode anchor tag {tag_id}')
+    current_tag_agreement_px = rgb_best_quad_corner_agreement(target_quad, detected_by_id[tag_id]) if current_tag_detected else float('nan')
+    if current_tag_detected and current_tag_agreement_px > float(args.max_current_tag_agreement_px):
+        raise RuntimeError(f'Current-frame tag/flow disagreement too high: {current_tag_agreement_px:.2f} > {args.max_current_tag_agreement_px:.2f} px')
+    (ok, rvec, tvec) = cv2.solvePnP(object_points, target_quad.astype(np.float64), camera_matrix, dist_coeffs, anchor_rvec.copy(), anchor_tvec.copy(), True, cv2.SOLVEPNP_ITERATIVE)
+    if not ok or float(np.asarray(tvec).reshape(3)[2]) <= 0.0:
+        raise RuntimeError('Tracked-corner PnP failed')
+    try:
+        (rvec, tvec) = cv2.solvePnPRefineLM(object_points, target_quad.astype(np.float64), camera_matrix, dist_coeffs, rvec, tvec)
+    except cv2.error:
+        pass
+    (projected_quad, _) = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+    corner_errors = np.linalg.norm(projected_quad.reshape(4, 2) - target_quad, axis=1)
+    flow_corner_reproj_px = float(np.mean(corner_errors))
+    translation_delta_mm = float(np.linalg.norm(np.asarray(tvec).reshape(3) - anchor_tvec.reshape(3)))
+    rotation_delta = rgb_rotation_delta_deg(anchor_rvec, rvec)
+    provisional_pose = {'success': True, 'rvec': rvec, 'tvec': tvec}
+    edge_score = float(finalize020.pose_recovery_edge_alignment_score(target_gray, provisional_pose, config=runtime['config'], camera_matrix=camera_matrix, dist_coeffs=dist_coeffs))
+    gates = {'flow_corner_reproj_px': (flow_corner_reproj_px, float(args.max_flow_corner_reproj_px)), 'translation_delta_mm': (translation_delta_mm, float(args.max_translation_delta_mm)), 'rotation_delta_deg': (rotation_delta, float(args.max_rotation_delta_deg))}
+    for (name, (value, maximum)) in gates.items():
+        if not math.isfinite(value) or value > maximum:
+            raise RuntimeError(f'{name} too high: {value:.3f} > {maximum:.3f}')
+    if edge_score < float(args.min_edge_score):
+        raise RuntimeError(f'RGB cube-edge score too low: {edge_score:.3f} < {args.min_edge_score:.3f}')
+    faces = sorted((str(face) for (face, ids) in runtime['face_id_sets'].items() if tag_id in {int(value) for value in ids}))
+    quality_reason = f'anchor:{args.anchor_frame};tag:{tag_id};tracks:{good_count};inliers:{inlier_count}/{good_count};fb:{fb_median_px:.3f}px;H:{homography_median_px:.3f}px;flow_reproj:{flow_corner_reproj_px:.3f}px;current_tag_agreement:{current_tag_agreement_px:.2f}px;edge:{edge_score:.3f};dt:{translation_delta_mm:.3f}mm;dr:{rotation_delta:.3f}deg'
+    pose = {'success': True, 'failure_reason': '', 'pose_source': 'stage12_backward_rgb_flow_tag_pnp', 'quality_level': 'T', 'quality_reason': quality_reason, 'pose_filled': True, 'predicted': True, 'temporal_recovery': True, 'single_frame_only': False, 'rvec': np.asarray(rvec, dtype=np.float64).reshape(3, 1), 'tvec': np.asarray(tvec, dtype=np.float64).reshape(3, 1), 'T': finalize020.pose_recovery_pose_transform(rvec, tvec), 'reproj_error': flow_corner_reproj_px, 'reproj_metric': 'optical_flow_propagated_tag_corner_mean_px', 'n_tags': 1, 'tag_ids': [tag_id], 'visible_faces': faces, 'edge_score': edge_score, 'flow_anchor_frame': int(args.anchor_frame), 'flow_target_frame': int(args.target_frame), 'flow_anchor_pose_source': str(anchor_pose.get('pose_source', '')), 'flow_anchor_tag_id': tag_id, 'flow_feature_count': int(len(anchor_points)), 'flow_good_track_count': good_count, 'flow_homography_inlier_count': inlier_count, 'flow_homography_inlier_ratio': inlier_ratio, 'flow_fb_median_px': fb_median_px, 'flow_homography_median_px': homography_median_px, 'flow_corner_reproj_error': flow_corner_reproj_px, 'flow_current_tag_corner_agreement_px': current_tag_agreement_px, 'flow_translation_delta_mm': translation_delta_mm, 'flow_rotation_delta_deg': rotation_delta, 'flow_target_tag_corners': target_quad.astype(np.float64), 'detected_tag_ids': sorted(detected_by_id), 'current_frame_tag_anchor_used': current_tag_detected}
+    metrics = {'anchor_frame': int(args.anchor_frame), 'target_frame': int(args.target_frame), 'tag_id': tag_id, 'feature_count': int(len(anchor_points)), 'good_track_count': good_count, 'homography_inlier_count': inlier_count, 'homography_inlier_ratio': inlier_ratio, 'fb_median_px': fb_median_px, 'homography_median_px': homography_median_px, 'flow_corner_reproj_px': flow_corner_reproj_px, 'current_tag_corner_agreement_px': current_tag_agreement_px, 'edge_score': edge_score, 'translation_delta_mm': translation_delta_mm, 'rotation_delta_deg': rotation_delta, 'depth_mm': float(np.asarray(tvec).reshape(3)[2]), 'tag_corners_inside': corners_inside, 'detected_tag_ids': sorted(detected_by_id), 'current_tag_detected': current_tag_detected, 'quality_reason': quality_reason}
+    return (pose, metrics)
+
+def rgb_make_overlay(*, finalize020: Any, image: np.ndarray, pose: dict[str, Any], runtime: dict[str, Any], metrics: dict[str, Any], target_name: str) -> np.ndarray:
+    output = image.copy()
+    (corners, _) = cv2.projectPoints(finalize020.pose_recovery_cube_corners(runtime['config']), np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1), np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1), runtime['camera_matrix'], runtime['dist_coeffs'])
+    corners = corners.reshape(-1, 2)
+    for (first, second) in finalize020.POSE_RECOVERY_CUBE_EDGES:
+        point_a = tuple((int(round(value)) for value in corners[first]))
+        point_b = tuple((int(round(value)) for value in corners[second]))
+        cv2.line(output, point_a, point_b, (255, 0, 255), 8, cv2.LINE_AA)
+    cv2.rectangle(output, (0, 0), (output.shape[1], 118), (0, 0, 0), -1)
+    lines = [f"{target_name} frame {metrics['target_frame']}: backward RGB-flow recovery (predicted/filled)", f"inliers={metrics['homography_inlier_count']}/{metrics['good_track_count']} FB={metrics['fb_median_px']:.3f}px H={metrics['homography_median_px']:.3f}px flow-reproj={metrics['flow_corner_reproj_px']:.3f}px", f"edge={metrics['edge_score']:.3f} current-tag-agreement={metrics['current_tag_corner_agreement_px']:.2f}px dt={metrics['translation_delta_mm']:.3f}mm dr={metrics['rotation_delta_deg']:.3f}deg"]
+    for (line_index, line) in enumerate(lines):
+        cv2.putText(output, line, (18, 34 + line_index * 36), cv2.FONT_HERSHEY_SIMPLEX, 0.76, (255, 255, 255), 2, cv2.LINE_AA)
+    return output
+
+def rgb_encode_jpeg(image: np.ndarray, quality: int=95) -> bytes:
+    (ok, encoded) = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError('cv2.imencode failed')
+    return encoded.tobytes()
+
+def rgb_recompute_footer(frames: list[dict[str, Any]], old_footer: dict[str, Any], *, recovered_frame: int, target_name: str) -> dict[str, Any]:
+    target_names = list(frames[0].get('pose_results', {}))
+    success_counts = {name: 0 for name in target_names}
+    source_counts: dict[str, dict[str, int]] = {name: {} for name in target_names}
+    for frame in frames:
+        for name in target_names:
+            pose = frame['pose_results'][name].get('pose', {}) or {}
+            success_counts[name] += int(bool(pose.get('success', False)))
+            source = str(pose.get('pose_source', ''))
+            source_counts[name][source] = source_counts[name].get(source, 0) + 1
+    reprocessed = [str(value) for value in old_footer.get('reprocessed_targets', []) or []]
+    if target_name not in reprocessed:
+        reprocessed.append(target_name)
+    return {**copy.deepcopy(old_footer), 'type': 'footer', 'frame_count': len(frames), 'success_counts': success_counts, 'pose_source_counts': source_counts, 'reprocessed_targets': reprocessed, 'leading_rgb_flow_recovered_frames': {target_name: [int(recovered_frame)]}, 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+def rgb_write_sidecar_atomic(path: Path, header: dict[str, Any], frames: list[dict[str, Any]], footer: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + '.tmp')
+    temporary_path.unlink(missing_ok=True)
+    try:
+        with temporary_path.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame in frames:
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(footer, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary_path.replace(path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+def rgb_json_default(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+def rgb_run(args: argparse.Namespace) -> None:
+    source_path = args.source.expanduser().resolve()
+    sidecar_path = args.sidecar.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+    qa_dir = args.qa_dir.expanduser().resolve()
+    target_name = str(args.target_name)
+    if int(args.target_frame) != int(args.anchor_frame) - 1:
+        raise ValueError('This conservative recovery supports only the frame immediately before anchor')
+    finalize020 = rgb_load_finalize_020()
+    (header, frames, old_footer) = rgb_load_sidecar(sidecar_path)
+    samples = rgb_load_source_samples(source_path)
+    if len(samples) != len(frames):
+        raise ValueError(f'Source/sidecar frame mismatch: {len(samples)} != {len(frames)}')
+    source_identity = header.get('source_multi_cam_identity', {}) or {}
+    source_stat = source_path.stat()
+    if int(source_identity.get('size', -1)) != int(source_stat.st_size):
+        raise ValueError('Sidecar source identity does not match the raw PKL size')
+    if int(source_identity.get('mtime_ns', -1)) != int(source_stat.st_mtime_ns):
+        raise ValueError('Sidecar source identity does not match the raw PKL mtime')
+    target_metadata = header['metadata']['targets'][target_name]
+    runtime = rgb_detection_runtime(finalize020, target_metadata)
+    anchor_result = frames[int(args.anchor_frame)]['pose_results'][target_name]
+    target_result = frames[int(args.target_frame)]['pose_results'][target_name]
+    anchor_pose = anchor_result.get('pose', {}) or {}
+    target_old_pose = target_result.get('pose', {}) or {}
+    if not bool(anchor_pose.get('success', False)) or bool(anchor_pose.get('pose_filled', False)):
+        raise ValueError('Anchor pose must be a successful, directly measured pose')
+    if bool(target_old_pose.get('success', False)):
+        raise ValueError('Target frame already has a successful pose; refusing to overwrite it')
+    worker_name = str(target_metadata['worker_name'])
+    camera_name = str(target_metadata['camera_name'])
+    anchor_raw = samples[int(args.anchor_frame)]['worker_raw_frames'][worker_name][camera_name]
+    target_raw = samples[int(args.target_frame)]['worker_raw_frames'][worker_name][camera_name]
+    anchor_image = rgb_detection_frame(finalize020, np.asarray(anchor_raw), runtime)
+    target_image = rgb_detection_frame(finalize020, np.asarray(target_raw), runtime)
+    (recovered_pose, metrics) = rgb_recover_pose(finalize020=finalize020, anchor_image=anchor_image, target_image=target_image, anchor_pose=anchor_pose, runtime=runtime, args=args)
+    recovered_pose['fill_original_failure_reason'] = str(target_old_pose.get('failure_reason', ''))
+    overlay = rgb_make_overlay(finalize020=finalize020, image=target_image, pose=recovered_pose, runtime=runtime, metrics=metrics, target_name=target_name)
+    target_result['pose_before_backward_rgb_flow'] = copy.deepcopy(target_old_pose)
+    target_result['pose'] = recovered_pose
+    target_result['selected_stage'] = 'stage12_backward_rgb_flow_tag_pnp'
+    target_result['overlay_shape'] = tuple((int(value) for value in overlay.shape))
+    target_result['overlay_format'] = 'jpeg_bgr'
+    target_result['overlay_jpeg'] = rgb_encode_jpeg(overlay)
+    target_result.setdefault('pose_candidates', {})['stage12_backward_rgb_flow_tag_pnp'] = copy.deepcopy(recovered_pose)
+    frames[int(args.target_frame)]['poses'][target_name] = copy.deepcopy(recovered_pose)
+    output_header = copy.deepcopy(header)
+    output_header['created_wall_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    metadata = output_header.setdefault('metadata', {})
+    update_history = list(metadata.get('update_history', []) or [])
+    update_history.append({'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'script': str(rgb_FILE_PATH), 'method': 'one-frame backward RGB LK flow + homography + tag-plane PnP', 'target': target_name, 'recovered_frames': [int(args.target_frame)], 'anchor_frame': int(args.anchor_frame), 'pose_marking': {'predicted': True, 'pose_filled': True}, 'metrics': copy.deepcopy(metrics)})
+    metadata['update_history'] = update_history
+    recoveries = metadata.setdefault('leading_rgb_flow_recoveries', {})
+    recoveries[target_name] = {'script': str(rgb_FILE_PATH), 'source_sidecar': str(sidecar_path), 'recovered_frames': [int(args.target_frame)], 'metrics': copy.deepcopy(metrics)}
+    output_footer = rgb_recompute_footer(frames, old_footer, recovered_frame=int(args.target_frame), target_name=target_name)
+    rgb_write_sidecar_atomic(output_path, output_header, frames, output_footer)
+    (verified_header, verified_frames, verified_footer) = rgb_load_sidecar(output_path)
+    verified_pose = verified_frames[int(args.target_frame)]['pose_results'][target_name]['pose']
+    if not bool(verified_pose.get('success', False)):
+        raise RuntimeError('Written sidecar did not retain the recovered pose')
+    if verified_footer['success_counts'].get(target_name) != old_footer['success_counts'].get(target_name, 0) + 1:
+        raise RuntimeError('Written sidecar success count did not increase by exactly one')
+    if verified_header.get('source_multi_cam_identity') != header.get('source_multi_cam_identity'):
+        raise RuntimeError('Written sidecar changed the raw source identity')
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    diagnostic_path = qa_dir / f'{target_name}_frame{int(args.target_frame)}_backward_rgb_flow_overlay.png'
+    if not cv2.imwrite(str(diagnostic_path), overlay):
+        raise RuntimeError(f'Could not write {diagnostic_path}')
+    report = {'source_pkl': str(source_path), 'input_sidecar': str(sidecar_path), 'output_sidecar': str(output_path), 'target': target_name, 'status': 'accepted', 'recovered_frames': [int(args.target_frame)], 'remaining_failed_frames': list(range(0, int(args.target_frame))), 'pose_marking': {'predicted': True, 'pose_filled': True}, 'metrics': metrics, 'diagnostic_overlay': str(diagnostic_path), 'footer': verified_footer}
+    report_path = qa_dir / f'{target_name}_leading_rgb_flow_recovery.json'
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=rgb_json_default) + '\n', encoding='utf-8')
+    print(f'[OK] recovered {target_name} frame {args.target_frame} from frame {args.anchor_frame}')
+    print(f'[OK] output: {output_path}')
+    print(f'[OK] diagnostic: {diagnostic_path}')
+    print(f'[OK] report: {report_path}')
+    print(json.dumps(metrics, indent=2, ensure_ascii=False, default=rgb_json_default))
+
+def rgb_build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, default=rgb_DEFAULT_SOURCE)
+    parser.add_argument('--sidecar', type=Path, default=rgb_DEFAULT_SIDECAR)
+    parser.add_argument('--output', type=Path, default=rgb_DEFAULT_OUTPUT)
+    parser.add_argument('--qa-dir', type=Path, default=rgb_DEFAULT_QA_DIR)
+    parser.add_argument('--target-name', default=rgb_DEFAULT_TARGET_NAME)
+    parser.add_argument('--anchor-frame', type=int, default=1)
+    parser.add_argument('--target-frame', type=int, default=0)
+    parser.add_argument('--max-features', type=int, default=500)
+    parser.add_argument('--feature-quality', type=float, default=0.005)
+    parser.add_argument('--feature-min-distance', type=float, default=4.0)
+    parser.add_argument('--min-features', type=int, default=300)
+    parser.add_argument('--lk-window', type=int, default=41)
+    parser.add_argument('--lk-levels', type=int, default=5)
+    parser.add_argument('--max-fb-error', type=float, default=1.5)
+    parser.add_argument('--max-fb-median-px', type=float, default=0.25)
+    parser.add_argument('--min-good-tracks', type=int, default=250)
+    parser.add_argument('--homography-ransac-px', type=float, default=2.5)
+    parser.add_argument('--min-homography-inliers', type=int, default=200)
+    parser.add_argument('--min-homography-inlier-ratio', type=float, default=0.7)
+    parser.add_argument('--max-homography-median-px', type=float, default=1.0)
+    parser.add_argument('--max-current-tag-agreement-px', type=float, default=80.0)
+    parser.add_argument('--allow-missing-current-tag', action='store_true', help='Allow recovery when the target frame does not independently decode the anchor tag; all optical-flow, motion, PnP, and edge gates still apply.')
+    parser.add_argument('--max-flow-corner-reproj-px', type=float, default=0.5)
+    parser.add_argument('--max-translation-delta-mm', type=float, default=2.0)
+    parser.add_argument('--max-rotation-delta-deg', type=float, default=5.0)
+    parser.add_argument('--min-edge-score', type=float, default=0.04)
+    return parser
+
+rgb_flow = SimpleNamespace(
+    detection_frame=rgb_detection_frame,
+    detection_runtime=rgb_detection_runtime,
+    load_finalize_020=rgb_load_finalize_020,
+    load_sidecar=rgb_load_sidecar,
+    load_source_samples=rgb_load_source_samples,
+    recover_pose=rgb_recover_pose,
+)
+
+import argparse
+import copy
+import importlib.util
+import json
+import pickle
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+import cv2
+import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
+mid_FILE_PATH = Path(__file__).resolve()
+mid_PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
+if str(mid_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(mid_PROJECT_ROOT))
+mid_FINALIZE_020_PATH = mid_PROJECT_ROOT / 'thirdparty/aprilcube/src/020_finalize_pose_postprocess.py'
+mid_RGB_FLOW_PATH = Path(__file__).resolve()
+mid_DEFAULT_SOURCE = mid_PROJECT_ROOT / 'recordings/multi_cam_record_0717_010151.pkl'
+mid_DEFAULT_SIDECAR = mid_PROJECT_ROOT / 'recordings/multi_cam_record_0717_010151_020_pose_sidecar.pkl'
+mid_DEFAULT_OUTPUT = mid_PROJECT_ROOT / 'recordings/multi_cam_record_0717_010151_020_pose_sidecar_middle_candidate.pkl'
+mid_DEFAULT_QA = mid_PROJECT_ROOT / 'outputs/diagnostics/middle_finger_cam_jitter_0717/reprocess_middle_q.json'
+
+def mid_load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+def mid_valid_pose(pose: dict[str, Any]) -> bool:
+    if not bool(pose.get('success', False)):
+        return False
+    try:
+        values = np.r_[np.asarray(pose['rvec'], dtype=np.float64).reshape(3), np.asarray(pose['tvec'], dtype=np.float64).reshape(3)]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.all(np.isfinite(values)))
+
+def mid_rotation_delta_deg(first: Any, second: Any) -> float:
+    first_rotation = Rotation.from_rotvec(np.asarray(first, dtype=np.float64).reshape(3))
+    second_rotation = Rotation.from_rotvec(np.asarray(second, dtype=np.float64).reshape(3))
+    return float(np.degrees((first_rotation.inv() * second_rotation).magnitude()))
+
+def mid_interpolate_pose(before: dict[str, Any], after: dict[str, Any], alpha: float) -> tuple[np.ndarray, np.ndarray]:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    before_t = np.asarray(before['tvec'], dtype=np.float64).reshape(3)
+    after_t = np.asarray(after['tvec'], dtype=np.float64).reshape(3)
+    tvec = ((1.0 - alpha) * before_t + alpha * after_t).reshape(3, 1)
+    rotations = Rotation.from_rotvec(np.stack([np.asarray(before['rvec'], dtype=np.float64).reshape(3), np.asarray(after['rvec'], dtype=np.float64).reshape(3)]))
+    rvec = Slerp([0.0, 1.0], rotations)([alpha]).as_rotvec()[0].reshape(3, 1)
+    return (rvec, tvec)
+
+def mid_frame_timestamp(frame: dict[str, Any], target_name: str) -> float:
+    result = frame['pose_results'][target_name]
+    value = result.get('capture_timestamp')
+    if value is None:
+        value = frame.get('time_monotonic')
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError(f"Non-finite timestamp at sample {frame.get('sample_index')}")
+    return value
+
+def mid_failure_pose(reason: str, **metadata: Any) -> dict[str, Any]:
+    return {'success': False, 'pose_source': 'fused_failed', 'quality_level': 'Z', 'quality_reason': reason, 'failure_reason': reason, 'pose_filled': False, 'single_frame_only': False, 'reproj_error': float('inf'), **metadata}
+
+def mid_set_pose(frame: dict[str, Any], target_name: str, pose: dict[str, Any], stage: str) -> None:
+    result = frame['pose_results'][target_name]
+    result['pose'] = pose
+    result['selected_stage'] = stage
+    frame['poses'][target_name] = copy.deepcopy(pose)
+
+def mid_reset_temporal_results(frames: list[dict[str, Any]], target_name: str) -> list[int]:
+    removed: list[int] = []
+    for (idx, frame) in enumerate(frames):
+        result = frame['pose_results'][target_name]
+        pose = result.get('pose', {}) or {}
+        if bool(pose.get('temporal_smoothed', False)) and mid_valid_pose(result.get('pose_before_temporal_smoothing', {}) or {}):
+            pose = copy.deepcopy(result['pose_before_temporal_smoothing'])
+            mid_set_pose(frame, target_name, pose, result.get('selected_stage_before_temporal_smoothing', ''))
+        source = str(pose.get('pose_source', ''))
+        is_temporal = bool(pose.get('pose_filled', False)) or bool(pose.get('predicted', False)) or 'temporal' in source or ('rgb_flow' in source) or ('interpolation' in source)
+        if is_temporal:
+            result['pose_before_middle_q_reset'] = copy.deepcopy(pose)
+            mid_set_pose(frame, target_name, mid_failure_pose('removed_old_temporal_pose'), 'middle_q_remove_old_temporal_pose')
+            removed.append(idx)
+    return removed
+
+def mid_gate_stage8(frames: list[dict[str, Any]], target_name: str, *, max_neighbor_seconds: float, min_translation_threshold_mm: float, min_rotation_threshold_deg: float) -> dict[int, dict[str, float]]:
+    poses = [frame['pose_results'][target_name].get('pose', {}) or {} for frame in frames]
+    timestamps = [mid_frame_timestamp(frame, target_name) for frame in frames]
+    valid_indices = [idx for (idx, pose) in enumerate(poses) if mid_valid_pose(pose)]
+    rejected: dict[int, dict[str, float]] = {}
+    for (position, idx) in enumerate(valid_indices):
+        pose = poses[idx]
+        if 'stage8_apriltag_single_tag_cfg_edge' not in str(pose.get('pose_source', '')):
+            continue
+        if position == 0 or position + 1 >= len(valid_indices):
+            pose['stage8_temporal_consistency_verified'] = False
+            pose['stage8_temporal_consistency_reason'] = 'missing_two_sided_neighbor'
+            continue
+        before_idx = valid_indices[position - 1]
+        after_idx = valid_indices[position + 1]
+        before_dt = timestamps[idx] - timestamps[before_idx]
+        after_dt = timestamps[after_idx] - timestamps[idx]
+        if before_dt <= 0.0 or after_dt <= 0.0 or before_dt > float(max_neighbor_seconds) or (after_dt > float(max_neighbor_seconds)):
+            pose['stage8_temporal_consistency_verified'] = False
+            pose['stage8_temporal_consistency_reason'] = 'neighbor_time_gap_too_large'
+            continue
+        alpha = (timestamps[idx] - timestamps[before_idx]) / (timestamps[after_idx] - timestamps[before_idx])
+        (predicted_rvec, predicted_tvec) = mid_interpolate_pose(poses[before_idx], poses[after_idx], alpha)
+        translation_residual = float(np.linalg.norm(np.asarray(pose['tvec'], dtype=np.float64).reshape(3) - predicted_tvec.reshape(3)))
+        rotation_residual = mid_rotation_delta_deg(pose['rvec'], predicted_rvec)
+        bracket_translation = float(np.linalg.norm(np.asarray(poses[before_idx]['tvec'], dtype=np.float64).reshape(3) - np.asarray(poses[after_idx]['tvec'], dtype=np.float64).reshape(3)))
+        bracket_rotation = mid_rotation_delta_deg(poses[before_idx]['rvec'], poses[after_idx]['rvec'])
+        translation_threshold = max(float(min_translation_threshold_mm), 0.75 * bracket_translation + 0.3)
+        rotation_threshold = max(float(min_rotation_threshold_deg), 0.75 * bracket_rotation + 0.5)
+        metrics = {'before_frame': int(before_idx), 'after_frame': int(after_idx), 'alpha': float(alpha), 'translation_residual_mm': translation_residual, 'rotation_residual_deg': rotation_residual, 'translation_threshold_mm': translation_threshold, 'rotation_threshold_deg': rotation_threshold}
+        if translation_residual > translation_threshold or rotation_residual > rotation_threshold:
+            rejected[idx] = metrics
+        else:
+            pose['stage8_temporal_consistency_verified'] = True
+            pose['stage8_temporal_consistency_metrics'] = metrics
+    for (idx, metrics) in rejected.items():
+        result = frames[idx]['pose_results'][target_name]
+        original = copy.deepcopy(result.get('pose', {}))
+        result.setdefault('pose_candidates', {})['stage8_temporal_consistency_rejected'] = {**copy.deepcopy(original), **metrics}
+        mid_set_pose(frames[idx], target_name, mid_failure_pose('stage8_temporal_inconsistent', stage8_temporal_consistency_metrics=metrics), 'stage8_temporal_consistency_rejected')
+    return rejected
+
+def mid_failed_runs(frames: list[dict[str, Any]], target_name: str) -> list[list[int]]:
+    output: list[list[int]] = []
+    current: list[int] = []
+    for (idx, frame) in enumerate(frames):
+        pose = frame['pose_results'][target_name].get('pose', {}) or {}
+        if not mid_valid_pose(pose):
+            current.append(idx)
+        elif current:
+            output.append(current)
+            current = []
+    if current:
+        output.append(current)
+    return output
+
+def mid_flow_args(anchor_frame: int, target_frame: int, args: argparse.Namespace) -> Any:
+    return SimpleNamespace(anchor_frame=int(anchor_frame), target_frame=int(target_frame), max_features=int(args.flow_max_features), feature_quality=float(args.flow_feature_quality), feature_min_distance=float(args.flow_feature_min_distance), min_features=int(args.flow_min_features), lk_window=int(args.flow_lk_window), lk_levels=int(args.flow_lk_levels), max_fb_error=float(args.flow_max_fb_error), max_fb_median_px=float(args.flow_max_fb_median_px), min_good_tracks=int(args.flow_min_good_tracks), homography_ransac_px=float(args.flow_homography_ransac_px), min_homography_inliers=int(args.flow_min_homography_inliers), min_homography_inlier_ratio=float(args.flow_min_homography_inlier_ratio), max_homography_median_px=float(args.flow_max_homography_median_px), max_current_tag_agreement_px=float(args.flow_max_current_tag_agreement_px), allow_missing_current_tag=True, max_flow_corner_reproj_px=float(args.flow_max_corner_reproj_px), max_translation_delta_mm=float(args.flow_max_translation_delta_mm), max_rotation_delta_deg=float(args.flow_max_rotation_delta_deg), min_edge_score=float(args.flow_min_edge_score), min_tag_corners_inside=int(args.flow_min_tag_corners_inside), skip_current_tag_detection=bool(args.flow_skip_current_tag_detection), feature_mask_scale=float(args.flow_feature_mask_scale))
+
+def mid_recover_one_flow(*, finalize020: Any, rgb_flow: Any, samples: Any, frames: list[dict[str, Any]], runtime: dict[str, Any], target_name: str, preferred_tag_id: int, anchor_idx: int, target_idx: int, args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    anchor_pose = copy.deepcopy(frames[anchor_idx]['pose_results'][target_name].get('pose', {}) or {})
+    if not mid_valid_pose(anchor_pose):
+        raise RuntimeError('invalid anchor pose')
+    anchor_tag_ids = [int(value) for value in anchor_pose.get('tag_ids', []) or []]
+    if int(preferred_tag_id) in anchor_tag_ids:
+        flow_tag_id = int(preferred_tag_id)
+    elif anchor_tag_ids:
+        flow_tag_id = int(anchor_tag_ids[0])
+    else:
+        raise RuntimeError('anchor pose has no measured tag id')
+    anchor_pose['tag_ids'] = [flow_tag_id]
+    worker_name = str(runtime['worker_name'])
+    camera_name = str(runtime['camera_name'])
+    anchor_raw = samples[anchor_idx]['worker_raw_frames'][worker_name][camera_name]
+    target_raw = samples[target_idx]['worker_raw_frames'][worker_name][camera_name]
+    anchor_image = rgb_flow.detection_frame(finalize020, np.asarray(anchor_raw), runtime)
+    target_image = rgb_flow.detection_frame(finalize020, np.asarray(target_raw), runtime)
+    (pose, metrics) = rgb_flow.recover_pose(finalize020=finalize020, anchor_image=anchor_image, target_image=target_image, anchor_pose=anchor_pose, runtime=runtime, args=mid_flow_args(anchor_idx, target_idx, args))
+    pose['pose_source'] = 'stage10_adjacent_rgb_flow_tag_pnp'
+    pose['quality_level'] = 'T'
+    pose['flow_anchor_is_filled'] = bool(anchor_pose.get('pose_filled', False))
+    return (pose, metrics)
+
+def mid_recover_gap_edges_with_flow(*, finalize020: Any, rgb_flow: Any, samples: Any, frames: list[dict[str, Any]], runtime: dict[str, Any], target_name: str, preferred_tag_id: int, args: argparse.Namespace) -> tuple[dict[int, dict[str, Any]], dict[int, str]]:
+    recovered: dict[int, dict[str, Any]] = {}
+    failures: dict[int, str] = {}
+    for run in mid_failed_runs(frames, target_name):
+        if run[0] == 0 and len(run) <= int(args.max_flow_gap_frames) and (run[-1] + 1 < len(frames)):
+            right_anchor = run[-1] + 1
+            for target_idx in reversed(run):
+                try:
+                    (pose, metrics) = mid_recover_one_flow(finalize020=finalize020, rgb_flow=rgb_flow, samples=samples, frames=frames, runtime=runtime, target_name=target_name, preferred_tag_id=preferred_tag_id, anchor_idx=right_anchor, target_idx=target_idx, args=args)
+                    pose['flow_metrics'] = metrics
+                    mid_set_pose(frames[target_idx], target_name, pose, 'stage10_adjacent_rgb_flow_tag_pnp')
+                    recovered[target_idx] = metrics
+                    right_anchor = target_idx
+                except Exception as exc:
+                    failures[target_idx] = f'leading_flow:{type(exc).__name__}:{exc}'
+                    break
+            continue
+        if run[-1] + 1 == len(frames) and len(run) <= int(args.max_flow_gap_frames) and (run[0] > 0):
+            left_anchor = run[0] - 1
+            for target_idx in run:
+                try:
+                    (pose, metrics) = mid_recover_one_flow(finalize020=finalize020, rgb_flow=rgb_flow, samples=samples, frames=frames, runtime=runtime, target_name=target_name, preferred_tag_id=preferred_tag_id, anchor_idx=left_anchor, target_idx=target_idx, args=args)
+                    pose['flow_metrics'] = metrics
+                    mid_set_pose(frames[target_idx], target_name, pose, 'stage10_adjacent_rgb_flow_tag_pnp')
+                    recovered[target_idx] = metrics
+                    left_anchor = target_idx
+                except Exception as exc:
+                    failures[target_idx] = f'trailing_flow:{type(exc).__name__}:{exc}'
+                    break
+            continue
+        if len(run) < 2 or len(run) > int(args.max_flow_gap_frames):
+            continue
+        if run[0] == 0 or run[-1] + 1 >= len(frames):
+            continue
+        left_anchor = run[0] - 1
+        right_anchor = run[-1] + 1
+        edge_count = len(run) // 2
+        for target_idx in run[:edge_count]:
+            try:
+                (pose, metrics) = mid_recover_one_flow(finalize020=finalize020, rgb_flow=rgb_flow, samples=samples, frames=frames, runtime=runtime, target_name=target_name, preferred_tag_id=preferred_tag_id, anchor_idx=left_anchor, target_idx=target_idx, args=args)
+                pose['flow_metrics'] = metrics
+                mid_set_pose(frames[target_idx], target_name, pose, 'stage10_adjacent_rgb_flow_tag_pnp')
+                recovered[target_idx] = metrics
+                left_anchor = target_idx
+            except Exception as exc:
+                failures[target_idx] = f'left_flow:{type(exc).__name__}:{exc}'
+                break
+        for target_idx in reversed(run[-edge_count:]):
+            try:
+                (pose, metrics) = mid_recover_one_flow(finalize020=finalize020, rgb_flow=rgb_flow, samples=samples, frames=frames, runtime=runtime, target_name=target_name, preferred_tag_id=preferred_tag_id, anchor_idx=right_anchor, target_idx=target_idx, args=args)
+                pose['flow_metrics'] = metrics
+                mid_set_pose(frames[target_idx], target_name, pose, 'stage10_adjacent_rgb_flow_tag_pnp')
+                recovered[target_idx] = metrics
+                right_anchor = target_idx
+            except Exception as exc:
+                failures[target_idx] = f'right_flow:{type(exc).__name__}:{exc}'
+                break
+    return (recovered, failures)
+
+def mid_fill_short_local_gaps(frames: list[dict[str, Any]], target_name: str, finalize020: Any, *, max_bracket_gap: int) -> list[int]:
+    filled: list[int] = []
+    timestamps = [mid_frame_timestamp(frame, target_name) for frame in frames]
+    for run in mid_failed_runs(frames, target_name):
+        if run[0] == 0 or run[-1] + 1 >= len(frames):
+            continue
+        before_idx = run[0] - 1
+        after_idx = run[-1] + 1
+        if after_idx - before_idx > int(max_bracket_gap):
+            continue
+        before_pose = frames[before_idx]['pose_results'][target_name]['pose']
+        after_pose = frames[after_idx]['pose_results'][target_name]['pose']
+        for idx in run:
+            alpha = (timestamps[idx] - timestamps[before_idx]) / (timestamps[after_idx] - timestamps[before_idx])
+            (rvec, tvec) = mid_interpolate_pose(before_pose, after_pose, alpha)
+            pose = {'success': True, 'pose_source': 'stage11_local_timestamp_se3_interpolation', 'quality_level': 'F', 'quality_reason': f'local_timestamp_se3_interpolation;bracket:{before_idx}-{after_idx};alpha:{alpha:.6f}', 'pose_filled': True, 'predicted': True, 'local_temporal_interpolation': True, 'single_frame_only': False, 'rvec': rvec, 'tvec': tvec, 'T': finalize020.temporal_completion_make_pose_transform(rvec, tvec), 'reproj_error': float('nan'), 'n_tags': 0, 'tag_ids': [], 'visible_faces': [], 'prev_success_frame': int(before_idx), 'next_success_frame': int(after_idx), 'interpolation_alpha': float(alpha), 'interpolation_clock': 'capture_timestamp'}
+            mid_set_pose(frames[idx], target_name, pose, 'stage11_local_timestamp_se3_interpolation')
+            filled.append(idx)
+    return filled
+
+def mid_frame_image(finalize020: Any, rgb_flow: Any, samples: Any, runtime: dict[str, Any], idx: int) -> np.ndarray:
+    raw = samples[idx]['worker_raw_frames'][runtime['worker_name']][runtime['camera_name']]
+    return rgb_flow.detection_frame(finalize020, np.asarray(raw), runtime)
+
+def mid_smooth_by_timestamp(*, finalize020: Any, rgb_flow: Any, samples: Any, frames: list[dict[str, Any]], runtime: dict[str, Any], target_name: str, args: argparse.Namespace) -> dict[str, Any]:
+    timestamps = [mid_frame_timestamp(frame, target_name) for frame in frames]
+    source_poses = [copy.deepcopy(frame['pose_results'][target_name]['pose']) for frame in frames]
+    output: list[dict[str, Any]] = []
+    edge_rejected: list[int] = []
+    translation_deltas: list[float] = []
+    rotation_deltas: list[float] = []
+    for (idx, source_pose) in enumerate(source_poses):
+        neighbors = [(neighbor_idx, timestamps[neighbor_idx], source_poses[neighbor_idx]) for neighbor_idx in range(max(0, idx - int(args.smoothing_window_radius)), min(len(frames), idx + int(args.smoothing_window_radius) + 1)) if abs(timestamps[neighbor_idx] - timestamps[idx]) <= float(args.smoothing_window_seconds)]
+        (rvec, tvec, source_count) = finalize020.temporal_smoothing_weighted_pose(neighbors, target_idx=idx, target_timestamp=timestamps[idx], sigma_frames=1.0, sigma_seconds=float(args.smoothing_sigma_seconds))
+        filled = bool(source_pose.get('pose_filled', False))
+        (rvec, tvec, _translation_delta, _rotation_delta) = finalize020.temporal_smoothing_limit_pose_delta(source_pose, rvec, tvec, max_translation_delta_mm=float(args.smoothing_max_filled_translation_mm) if filled else float(args.smoothing_max_measured_translation_mm), max_rotation_delta_deg=float(args.smoothing_max_filled_rotation_deg) if filled else float(args.smoothing_max_measured_rotation_deg))
+        image = mid_frame_image(finalize020, rgb_flow, samples, runtime, idx)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        source_edge = finalize020.pose_recovery_edge_alignment_score(gray, source_pose, config=runtime['config'], camera_matrix=runtime['camera_matrix'], dist_coeffs=runtime['dist_coeffs'])
+        candidate_edge = finalize020.pose_recovery_edge_alignment_score(gray, {'success': True, 'rvec': rvec, 'tvec': tvec}, config=runtime['config'], camera_matrix=runtime['camera_matrix'], dist_coeffs=runtime['dist_coeffs'])
+        blend = 1.0
+        while candidate_edge < source_edge - float(args.smoothing_max_edge_drop) and blend > 0.125:
+            blend *= 0.5
+            (rvec, tvec) = finalize020.temporal_smoothing_blend_from_source(source_pose, rvec, tvec, 0.5)
+            candidate_edge = finalize020.pose_recovery_edge_alignment_score(gray, {'success': True, 'rvec': rvec, 'tvec': tvec}, config=runtime['config'], camera_matrix=runtime['camera_matrix'], dist_coeffs=runtime['dist_coeffs'])
+        if candidate_edge < source_edge - float(args.smoothing_max_edge_drop):
+            rvec = np.asarray(source_pose['rvec'], dtype=np.float64).reshape(3, 1)
+            tvec = np.asarray(source_pose['tvec'], dtype=np.float64).reshape(3, 1)
+            candidate_edge = source_edge
+            edge_rejected.append(idx)
+        translation_delta = float(np.linalg.norm(np.asarray(source_pose['tvec'], dtype=np.float64).reshape(3) - tvec.reshape(3)))
+        rotation_delta = mid_rotation_delta_deg(source_pose['rvec'], rvec)
+        smoothed = copy.deepcopy(source_pose)
+        smoothed.update({'rvec': rvec, 'tvec': tvec, 'T': finalize020.temporal_completion_make_pose_transform(rvec, tvec), 'temporal_smoothed': bool(translation_delta > 1e-09 or rotation_delta > 1e-09), 'temporal_smoothing_clock': 'capture_timestamp', 'temporal_smoothing_source_count': int(source_count), 'temporal_smoothing_window_seconds': float(args.smoothing_window_seconds), 'temporal_smoothing_sigma_seconds': float(args.smoothing_sigma_seconds), 'temporal_smoothing_translation_delta_mm': translation_delta, 'temporal_smoothing_rotation_delta_deg': rotation_delta, 'temporal_smoothing_edge_before': float(source_edge), 'temporal_smoothing_edge_after': float(candidate_edge), 'temporal_smoothing_edge_rejected': idx in edge_rejected})
+        output.append(smoothed)
+        translation_deltas.append(translation_delta)
+        rotation_deltas.append(rotation_delta)
+    for (idx, pose) in enumerate(output):
+        result = frames[idx]['pose_results'][target_name]
+        result['pose_before_temporal_smoothing'] = source_poses[idx]
+        result['selected_stage_before_temporal_smoothing'] = result.get('selected_stage', '')
+        mid_set_pose(frames[idx], target_name, pose, 'stage12_timestamp_se3_smoothing')
+    return {'smoothed_frames': int(sum((bool(pose.get('temporal_smoothed')) for pose in output))), 'edge_rejected_frames': edge_rejected, 'translation_delta_mm_max': float(max(translation_deltas, default=0.0)), 'rotation_delta_deg_max': float(max(rotation_deltas, default=0.0))}
+
+def mid_draw_overlay(*, finalize020: Any, image: np.ndarray, pose: dict[str, Any], runtime: dict[str, Any], idx: int) -> bytes:
+    output = image.copy()
+    (corners, _) = cv2.projectPoints(finalize020.pose_recovery_cube_corners(runtime['config']), np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1), np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1), runtime['camera_matrix'], runtime['dist_coeffs'])
+    corners = corners.reshape(-1, 2)
+    for (first, second) in finalize020.POSE_RECOVERY_CUBE_EDGES:
+        point_a = tuple((int(round(value)) for value in corners[first]))
+        point_b = tuple((int(round(value)) for value in corners[second]))
+        cv2.line(output, point_a, point_b, (0, 255, 255), 7, cv2.LINE_AA)
+    cv2.rectangle(output, (0, 0), (output.shape[1], 82), (0, 0, 0), -1)
+    lines = [f"middle_Q frame {idx}: {pose.get('pose_source', '')}", f"timestamp smoothing dt={float(pose.get('temporal_smoothing_translation_delta_mm', 0.0)):.3f}mm dr={float(pose.get('temporal_smoothing_rotation_delta_deg', 0.0)):.3f}deg"]
+    for (line_idx, line) in enumerate(lines):
+        cv2.putText(output, line, (18, 32 + line_idx * 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    (ok, encoded) = cv2.imencode('.jpg', output, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError('cv2.imencode failed')
+    return encoded.tobytes()
+
+def mid_temporal_residuals(frames: list[dict[str, Any]], target_name: str) -> dict[str, float]:
+    translations: list[float] = []
+    rotations: list[float] = []
+    timestamps = [mid_frame_timestamp(frame, target_name) for frame in frames]
+    poses = [frame['pose_results'][target_name]['pose'] for frame in frames]
+    for idx in range(1, len(frames) - 1):
+        alpha = (timestamps[idx] - timestamps[idx - 1]) / (timestamps[idx + 1] - timestamps[idx - 1])
+        (rvec, tvec) = mid_interpolate_pose(poses[idx - 1], poses[idx + 1], alpha)
+        translations.append(float(np.linalg.norm(np.asarray(poses[idx]['tvec'], dtype=np.float64).reshape(3) - tvec.reshape(3))))
+        rotations.append(mid_rotation_delta_deg(poses[idx]['rvec'], rvec))
+    return {'translation_median_mm': float(np.median(translations)), 'translation_p95_mm': float(np.percentile(translations, 95)), 'translation_max_mm': float(np.max(translations)), 'rotation_median_deg': float(np.median(rotations)), 'rotation_p95_deg': float(np.percentile(rotations, 95)), 'rotation_max_deg': float(np.max(rotations))}
+
+def mid_source_counts(frames: list[dict[str, Any]], target_name: str) -> dict[str, int]:
+    return dict(Counter((str(frame['pose_results'][target_name]['pose'].get('pose_source', '')) for frame in frames)))
+
+def mid_recompute_footer(frames: list[dict[str, Any]], old_footer: dict[str, Any]) -> dict[str, Any]:
+    target_names = list(frames[0]['pose_results'])
+    success_counts = {name: 0 for name in target_names}
+    pose_source_counts = {name: {} for name in target_names}
+    for frame in frames:
+        for name in target_names:
+            pose = frame['pose_results'][name].get('pose', {}) or {}
+            success_counts[name] += int(mid_valid_pose(pose))
+            source = str(pose.get('pose_source', ''))
+            counts = pose_source_counts[name]
+            counts[source] = counts.get(source, 0) + 1
+    reprocessed = list(old_footer.get('reprocessed_targets', []) or [])
+    if 'middle_Q' not in reprocessed:
+        reprocessed.append('middle_Q')
+    return {'type': 'footer', 'frame_count': len(frames), 'success_counts': success_counts, 'pose_source_counts': pose_source_counts, 'reprocessed_targets': reprocessed, 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+def mid_write_sidecar(path: Path, header: dict[str, Any], frames: list[dict[str, Any]], footer: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame in frames:
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(footer, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def mid_json_default(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+def mid_run(args: argparse.Namespace) -> None:
+    source_path = args.source.expanduser().resolve()
+    sidecar_path = args.sidecar.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+    qa_path = args.qa.expanduser().resolve()
+    target_name = str(args.target_name)
+    finalize020 = mid_load_module('middle_q_temporal_finalize020', mid_FINALIZE_020_PATH)
+    rgb_flow = mid_load_module('middle_q_temporal_rgb_flow', mid_RGB_FLOW_PATH)
+    (header, frames, old_footer) = rgb_flow.load_sidecar(sidecar_path)
+    samples = rgb_flow.load_source_samples(source_path)
+    if len(samples) != len(frames):
+        raise ValueError(f'Source/sidecar frame mismatch: {len(samples)} != {len(frames)}')
+    target_metadata = header['metadata']['targets'][target_name]
+    runtime = rgb_flow.detection_runtime(finalize020, target_metadata)
+    runtime['worker_name'] = target_metadata['worker_name']
+    runtime['camera_name'] = target_metadata['camera_name']
+    counts_before = mid_source_counts(frames, target_name)
+    removed = mid_reset_temporal_results(frames, target_name)
+    stage8_rejected = mid_gate_stage8(frames, target_name, max_neighbor_seconds=float(args.stage8_max_neighbor_seconds), min_translation_threshold_mm=float(args.stage8_translation_threshold_mm), min_rotation_threshold_deg=float(args.stage8_rotation_threshold_deg))
+    (flow_recovered, flow_failures) = mid_recover_gap_edges_with_flow(finalize020=finalize020, rgb_flow=rgb_flow, samples=samples, frames=frames, runtime=runtime, target_name=target_name, preferred_tag_id=int(args.preferred_tag_id), args=args)
+    locally_filled = mid_fill_short_local_gaps(frames, target_name, finalize020, max_bracket_gap=int(args.local_max_bracket_gap))
+    remaining_failed = [run for run in mid_failed_runs(frames, target_name)]
+    if remaining_failed:
+        raise RuntimeError(f'middle_Q remains incomplete after conservative recovery: {remaining_failed}; flow_failures={flow_failures}')
+    residuals_before_smoothing = mid_temporal_residuals(frames, target_name)
+    smoothing = mid_smooth_by_timestamp(finalize020=finalize020, rgb_flow=rgb_flow, samples=samples, frames=frames, runtime=runtime, target_name=target_name, args=args)
+    for (idx, frame) in enumerate(frames):
+        pose = frame['pose_results'][target_name]['pose']
+        image = mid_frame_image(finalize020, rgb_flow, samples, runtime, idx)
+        result = frame['pose_results'][target_name]
+        result['overlay_jpeg'] = mid_draw_overlay(finalize020=finalize020, image=image, pose=pose, runtime=runtime, idx=idx)
+        result['overlay_format'] = 'jpeg_bgr'
+        result['overlay_shape'] = tuple((int(value) for value in image.shape))
+    residuals_after_smoothing = mid_temporal_residuals(frames, target_name)
+    counts_after = mid_source_counts(frames, target_name)
+    if any(('global_temporal' in source for source in counts_after)):
+        raise RuntimeError('Old global temporal data survived middle_Q cleanup')
+    if any((not mid_valid_pose(frame['pose_results'][target_name]['pose']) for frame in frames)):
+        raise RuntimeError('Output contains an invalid middle_Q pose')
+    output_header = copy.deepcopy(header)
+    output_header['created_wall_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    history = output_header.setdefault('metadata', {}).setdefault('update_history', [])
+    history.append({'updated_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'script': str(mid_FILE_PATH), 'method': 'stage8 timestamp consistency gate; adjacent tag-2 RGB flow; short local timestamp interpolation; timestamp-domain SE(3) smoothing', 'target': target_name, 'removed_old_temporal_frames': removed, 'stage8_rejected_frames': sorted(stage8_rejected), 'rgb_flow_recovered_frames': sorted(flow_recovered), 'local_interpolated_frames': locally_filled})
+    footer = mid_recompute_footer(frames, old_footer)
+    mid_write_sidecar(output_path, output_header, frames, footer)
+    report = {'source_pkl': source_path, 'input_sidecar': sidecar_path, 'output_sidecar': output_path, 'frame_count': len(frames), 'preferred_tag_id': int(args.preferred_tag_id), 'source_counts_before': counts_before, 'removed_old_temporal_frames': removed, 'stage8_rejected_frames': sorted(stage8_rejected), 'stage8_rejection_metrics': stage8_rejected, 'rgb_flow_recovered_frames': sorted(flow_recovered), 'rgb_flow_metrics': flow_recovered, 'rgb_flow_failures': flow_failures, 'local_interpolated_frames': locally_filled, 'source_counts_after': counts_after, 'residuals_before_smoothing': residuals_before_smoothing, 'smoothing': smoothing, 'residuals_after_smoothing': residuals_after_smoothing, 'footer': footer}
+    qa_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=mid_json_default) + '\n', encoding='utf-8')
+    print(json.dumps(report, indent=2, ensure_ascii=False, default=mid_json_default))
+
+def mid_build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, default=mid_DEFAULT_SOURCE)
+    parser.add_argument('--sidecar', type=Path, default=mid_DEFAULT_SIDECAR)
+    parser.add_argument('--output', type=Path, default=mid_DEFAULT_OUTPUT)
+    parser.add_argument('--qa', type=Path, default=mid_DEFAULT_QA)
+    parser.add_argument('--target-name', default='middle_Q')
+    parser.add_argument('--preferred-tag-id', type=int, default=2)
+    parser.add_argument('--stage8-max-neighbor-seconds', type=float, default=0.25)
+    parser.add_argument('--stage8-translation-threshold-mm', type=float, default=1.5)
+    parser.add_argument('--stage8-rotation-threshold-deg', type=float, default=2.5)
+    parser.add_argument('--max-flow-gap-frames', type=int, default=5)
+    parser.add_argument('--local-max-bracket-gap', type=int, default=3)
+    parser.add_argument('--flow-max-features', type=int, default=500)
+    parser.add_argument('--flow-feature-quality', type=float, default=0.005)
+    parser.add_argument('--flow-feature-min-distance', type=float, default=4.0)
+    parser.add_argument('--flow-min-features', type=int, default=80)
+    parser.add_argument('--flow-lk-window', type=int, default=41)
+    parser.add_argument('--flow-lk-levels', type=int, default=5)
+    parser.add_argument('--flow-max-fb-error', type=float, default=1.5)
+    parser.add_argument('--flow-max-fb-median-px', type=float, default=0.5)
+    parser.add_argument('--flow-min-good-tracks', type=int, default=60)
+    parser.add_argument('--flow-homography-ransac-px', type=float, default=2.5)
+    parser.add_argument('--flow-min-homography-inliers', type=int, default=40)
+    parser.add_argument('--flow-min-homography-inlier-ratio', type=float, default=0.2)
+    parser.add_argument('--flow-max-homography-median-px', type=float, default=1.5)
+    parser.add_argument('--flow-max-current-tag-agreement-px', type=float, default=80.0)
+    parser.add_argument('--flow-max-corner-reproj-px', type=float, default=5.5)
+    parser.add_argument('--flow-max-translation-delta-mm', type=float, default=6.0)
+    parser.add_argument('--flow-max-rotation-delta-deg', type=float, default=10.0)
+    parser.add_argument('--flow-min-edge-score', type=float, default=0.04)
+    parser.add_argument('--flow-min-tag-corners-inside', type=int, default=4)
+    parser.add_argument('--flow-skip-current-tag-detection', action='store_true')
+    parser.add_argument('--flow-feature-mask-scale', type=float, default=1.0)
+    parser.add_argument('--smoothing-window-radius', type=int, default=4)
+    parser.add_argument('--smoothing-window-seconds', type=float, default=0.18)
+    parser.add_argument('--smoothing-sigma-seconds', type=float, default=0.075)
+    parser.add_argument('--smoothing-max-measured-translation-mm', type=float, default=1.5)
+    parser.add_argument('--smoothing-max-measured-rotation-deg', type=float, default=2.0)
+    parser.add_argument('--smoothing-max-filled-translation-mm', type=float, default=3.0)
+    parser.add_argument('--smoothing-max-filled-rotation-deg', type=float, default=4.0)
+    parser.add_argument('--smoothing-max-edge-drop', type=float, default=0.04)
+    return parser
+
+import argparse
+import copy
+import importlib.util
+import json
+import pickle
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Any
+import cv2
+import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
+idx_FILE_PATH = Path(__file__).resolve()
+idx_PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
+idx_FINALIZE_020_PATH = idx_PROJECT_ROOT / 'thirdparty/aprilcube/src/020_finalize_pose_postprocess.py'
+
+def idx_load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+def idx_load_stream(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    footer: dict[str, Any] | None = None
+    with path.open('rb') as stream:
+        header = pickle.load(stream)
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get('type') == 'frame':
+                frames.append(record)
+            elif record.get('type') == 'footer':
+                footer = record
+                break
+    if not isinstance(header, dict) or header.get('type') != 'header':
+        raise ValueError(f'Invalid stream header: {path}')
+    if footer is None or int(footer.get('frame_count', -1)) != len(frames):
+        raise ValueError(f'Incomplete stream: {path}')
+    return (header, frames, footer)
+
+def idx_valid_pose(pose: dict[str, Any]) -> bool:
+    if not bool(pose.get('success', False)):
+        return False
+    try:
+        values = np.r_[np.asarray(pose['rvec'], dtype=np.float64).reshape(3), np.asarray(pose['tvec'], dtype=np.float64).reshape(3)]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.all(np.isfinite(values)))
+
+def idx_pose_transform(rvec: Any, tvec: Any) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = Rotation.from_rotvec(np.asarray(rvec, dtype=np.float64).reshape(3)).as_matrix()
+    transform[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+    return transform
+
+def idx_interpolate_pose(before: dict[str, Any], after: dict[str, Any], alpha: float) -> tuple[np.ndarray, np.ndarray]:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    before_t = np.asarray(before['tvec'], dtype=np.float64).reshape(3)
+    after_t = np.asarray(after['tvec'], dtype=np.float64).reshape(3)
+    tvec = ((1.0 - alpha) * before_t + alpha * after_t).reshape(3, 1)
+    rotations = Rotation.from_rotvec(np.stack([np.asarray(before['rvec'], dtype=np.float64).reshape(3), np.asarray(after['rvec'], dtype=np.float64).reshape(3)]))
+    rvec = Slerp([0.0, 1.0], rotations)([alpha]).as_rotvec()[0].reshape(3, 1)
+    return (rvec, tvec)
+
+def idx_rotation_delta_deg(first: Any, second: Any) -> float:
+    a = Rotation.from_rotvec(np.asarray(first, dtype=np.float64).reshape(3))
+    b = Rotation.from_rotvec(np.asarray(second, dtype=np.float64).reshape(3))
+    return float(np.degrees((a.inv() * b).magnitude()))
+
+def idx_pose_deltas(poses: list[dict[str, Any]]) -> dict[str, Any]:
+    translation: list[float] = []
+    rotation: list[float] = []
+    for (before, after) in zip(poses, poses[1:]):
+        translation.append(float(np.linalg.norm(np.asarray(after['tvec'], dtype=np.float64).reshape(3) - np.asarray(before['tvec'], dtype=np.float64).reshape(3))))
+        rotation.append(idx_rotation_delta_deg(before['rvec'], after['rvec']))
+    return {'translation_mm_median': float(np.median(translation)), 'translation_mm_p95': float(np.percentile(translation, 95)), 'translation_mm_max': float(np.max(translation)), 'rotation_deg_median': float(np.median(rotation)), 'rotation_deg_p95': float(np.percentile(rotation, 95)), 'rotation_deg_max': float(np.max(rotation))}
+
+def idx_fill_short_gaps(poses: list[dict[str, Any]], timestamps: list[float], max_gap_frames: int) -> list[int]:
+    filled: list[int] = []
+    idx = 0
+    while idx < len(poses):
+        if idx_valid_pose(poses[idx]):
+            idx += 1
+            continue
+        start = idx
+        while idx < len(poses) and (not idx_valid_pose(poses[idx])):
+            idx += 1
+        end = idx - 1
+        gap_length = end - start + 1
+        if start == 0 or idx >= len(poses) or gap_length > int(max_gap_frames):
+            raise RuntimeError(f'Unfillable strict-pose gap {start}-{end} length={gap_length}')
+        before_index = start - 1
+        after_index = idx
+        for frame_index in range(start, end + 1):
+            alpha = (timestamps[frame_index] - timestamps[before_index]) / (timestamps[after_index] - timestamps[before_index])
+            (rvec, tvec) = idx_interpolate_pose(poses[before_index], poses[after_index], alpha)
+            poses[frame_index] = {'success': True, 'failure_reason': '', 'pose_source': 'strict_single_tag_local_timestamp_se3_interpolation', 'quality_level': 'F', 'quality_reason': f'isolated_strict_gap;anchors:{before_index}-{after_index};alpha:{alpha:.6f}', 'pose_filled': True, 'predicted': True, 'single_frame_only': False, 'rvec': rvec, 'tvec': tvec, 'T': idx_pose_transform(rvec, tvec), 'reproj_error': float('nan'), 'n_tags': 0, 'tag_ids': [], 'visible_faces': [], 'prev_success_frame': before_index, 'next_success_frame': after_index, 'interpolation_alpha': float(alpha), 'interpolation_clock': 'capture_timestamp'}
+            filled.append(frame_index)
+    return filled
+
+def idx_draw_cube_overlay(finalize020: Any, jpeg: bytes, pose: dict[str, Any], config: Any, camera_matrix: np.ndarray, dist_coeffs: np.ndarray, frame_index: int) -> bytes:
+    image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f'Could not decode strict overlay for frame {frame_index}')
+    (corners, _) = cv2.projectPoints(finalize020.pose_recovery_cube_corners(config), np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1), np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1), camera_matrix, dist_coeffs)
+    corners = corners.reshape(-1, 2)
+    for (first, second) in finalize020.POSE_RECOVERY_CUBE_EDGES:
+        a = tuple((int(round(v)) for v in corners[first]))
+        b = tuple((int(round(v)) for v in corners[second]))
+        cv2.line(image, a, b, (0, 255, 255), 6, cv2.LINE_AA)
+    cv2.putText(image, f'index_Q frame {frame_index}: local timestamp interpolation', (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+    (ok, encoded) = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError('cv2.imencode failed')
+    return encoded.tobytes()
+
+def idx_recompute_footer(frames: list[dict[str, Any]], old_footer: dict[str, Any], target_name: str) -> dict[str, Any]:
+    target_names = list(frames[0]['pose_results'])
+    success_counts = {name: 0 for name in target_names}
+    source_counts: dict[str, Counter[str]] = {name: Counter() for name in target_names}
+    for frame in frames:
+        for name in target_names:
+            pose = frame['pose_results'][name].get('pose', {}) or {}
+            success_counts[name] += int(idx_valid_pose(pose))
+            source_counts[name][str(pose.get('pose_source', ''))] += 1
+    reprocessed = list(old_footer.get('reprocessed_targets', []) or [])
+    if target_name not in reprocessed:
+        reprocessed.append(target_name)
+    return {'type': 'footer', 'frame_count': len(frames), 'success_counts': success_counts, 'pose_source_counts': {name: dict(counts) for (name, counts) in source_counts.items()}, 'reprocessed_targets': reprocessed, 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+def idx_write_sidecar(path: Path, header: dict[str, Any], frames: list[dict[str, Any]], footer: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame in frames:
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(footer, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def idx_json_default(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+def idx_run(args: argparse.Namespace) -> None:
+    sidecar_path = args.sidecar.expanduser().resolve()
+    strict_path = args.strict.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+    qa_path = args.qa.expanduser().resolve()
+    target_name = str(args.target_name)
+    finalize020 = idx_load_module('strict_sidecar_finalize020', idx_FINALIZE_020_PATH)
+    (header, frames, old_footer) = idx_load_stream(sidecar_path)
+    (strict_header, strict_frames, _strict_footer) = idx_load_stream(strict_path)
+    if len(frames) != len(strict_frames):
+        raise ValueError(f'Sidecar/strict frame mismatch: {len(frames)} != {len(strict_frames)}')
+    source_target = strict_header.get('source_metadata', {}).get('pose_target')
+    if source_target != target_name:
+        raise ValueError(f'Strict stream target mismatch: {source_target} != {target_name}')
+    timestamps = [float(frame['pose_results'][target_name]['capture_timestamp']) for frame in frames]
+    if any((right <= left for (left, right) in zip(timestamps, timestamps[1:]))):
+        raise ValueError('Target timestamps are not strictly increasing')
+    poses: list[dict[str, Any]] = []
+    for (frame_index, strict_frame) in enumerate(strict_frames):
+        if int(strict_frame.get('frame_index', -1)) != frame_index:
+            raise ValueError(f'Strict frame index mismatch at {frame_index}')
+        strict_pose = copy.deepcopy(strict_frame.get('pose', {}) or {})
+        if idx_valid_pose(strict_pose):
+            strict_pose.update({'pose_source': 'strict_aprilcube_single_tag_observation', 'strict_original_pose_source': strict_pose.get('pose_source', ''), 'quality_level': 'A', 'quality_reason': 'current_frame_decoded_apriltag_single_face', 'pose_filled': False, 'predicted': False, 'single_frame_only': True})
+        poses.append(strict_pose)
+    direct_count = sum((idx_valid_pose(pose) for pose in poses))
+    filled = idx_fill_short_gaps(poses, timestamps, int(args.max_gap_frames))
+    if any((not idx_valid_pose(pose) for pose in poses)):
+        raise RuntimeError('Output pose list remains incomplete')
+    deltas = idx_pose_deltas(poses)
+    if deltas['translation_mm_max'] > float(args.max_step_translation_mm):
+        raise RuntimeError(f'Translation step gate failed: {deltas}')
+    if deltas['rotation_deg_max'] > float(args.max_step_rotation_deg):
+        raise RuntimeError(f'Rotation step gate failed: {deltas}')
+    (config, _face_sets) = finalize020.aprilcube.load_cube_config(str(Path(strict_header['metadata']['cube_cfg']) / 'config.json'))
+    camera_matrix = np.asarray(strict_header['metadata']['detection_camera_matrix'], dtype=np.float64).reshape(3, 3)
+    dist_coeffs = np.asarray(strict_header['metadata']['detector_dist_coeffs'], dtype=np.float64).reshape(-1)
+    for (frame_index, (frame, strict_frame, pose)) in enumerate(zip(frames, strict_frames, poses)):
+        result = frame['pose_results'][target_name]
+        result['pose_before_strict_single_tag_merge'] = copy.deepcopy(result.get('pose', {}) or {})
+        result['pose'] = pose
+        result['selected_stage'] = str(pose['pose_source'])
+        result['overlay_jpeg'] = idx_draw_cube_overlay(finalize020, strict_frame['overlay_jpeg'], pose, config, camera_matrix, dist_coeffs, frame_index) if frame_index in filled else strict_frame['overlay_jpeg']
+        result['overlay_format'] = strict_frame.get('overlay_format', 'jpeg_bgr')
+        result['overlay_shape'] = strict_frame.get('overlay_shape')
+        frame['poses'][target_name] = copy.deepcopy(pose)
+    output_header = copy.deepcopy(header)
+    output_header['created_wall_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    history = output_header.setdefault('metadata', {}).setdefault('update_history', [])
+    history.append({'updated_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'script': str(idx_FILE_PATH), 'target': target_name, 'strict_pose_stream': str(strict_path), 'method': 'direct strict single-tag observations; isolated timestamp SE(3) fill', 'direct_observation_count': direct_count, 'locally_filled_frames': filled})
+    footer = idx_recompute_footer(frames, old_footer, target_name)
+    idx_write_sidecar(output_path, output_header, frames, footer)
+    report = {'input_sidecar': sidecar_path, 'strict_pose_stream': strict_path, 'output_sidecar': output_path, 'target_name': target_name, 'frame_count': len(frames), 'direct_observation_count': direct_count, 'locally_filled_frames': filled, 'pose_deltas': deltas, 'footer': footer}
+    qa_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=idx_json_default) + '\n', encoding='utf-8')
+    print(json.dumps(report, indent=2, ensure_ascii=False, default=idx_json_default))
+
+def idx_build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--sidecar', type=Path, required=True)
+    parser.add_argument('--strict', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--qa', type=Path, required=True)
+    parser.add_argument('--target-name', default='index_Q')
+    parser.add_argument('--max-gap-frames', type=int, default=2)
+    parser.add_argument('--max-step-translation-mm', type=float, default=8.0)
+    parser.add_argument('--max-step-rotation-deg', type=float, default=20.0)
+    return parser
+
+import argparse
+import copy
+import importlib.util
+import json
+import pickle
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+import cv2
+import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
+wrist_FILE_PATH = Path(__file__).resolve()
+wrist_PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
+wrist_RGB_FLOW_PATH = Path(__file__).resolve()
+
+def wrist_load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+def wrist_valid_pose(pose: dict[str, Any]) -> bool:
+    if not bool(pose.get('success', False)):
+        return False
+    try:
+        values = np.r_[np.asarray(pose['rvec'], dtype=np.float64).reshape(3), np.asarray(pose['tvec'], dtype=np.float64).reshape(3)]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.all(np.isfinite(values)))
+
+def wrist_rotation_delta_deg(first: Any, second: Any) -> float:
+    a = Rotation.from_rotvec(np.asarray(first, dtype=np.float64).reshape(3))
+    b = Rotation.from_rotvec(np.asarray(second, dtype=np.float64).reshape(3))
+    return float(np.degrees((a.inv() * b).magnitude()))
+
+def wrist_pose_transform(rvec: Any, tvec: Any) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = Rotation.from_rotvec(np.asarray(rvec, dtype=np.float64).reshape(3)).as_matrix()
+    transform[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+    return transform
+
+def wrist_blend_poses(left: dict[str, Any], right: dict[str, Any], alpha: float) -> tuple[np.ndarray, np.ndarray]:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    left_t = np.asarray(left['tvec'], dtype=np.float64).reshape(3)
+    right_t = np.asarray(right['tvec'], dtype=np.float64).reshape(3)
+    tvec = ((1.0 - alpha) * left_t + alpha * right_t).reshape(3, 1)
+    rotations = Rotation.from_rotvec(np.stack([np.asarray(left['rvec'], dtype=np.float64).reshape(3), np.asarray(right['rvec'], dtype=np.float64).reshape(3)]))
+    rvec = Slerp([0.0, 1.0], rotations)([alpha]).as_rotvec()[0].reshape(3, 1)
+    return (rvec, tvec)
+
+def wrist_flow_args(args: argparse.Namespace) -> Any:
+    return SimpleNamespace(anchor_frame=0, target_frame=0, max_features=int(args.flow_max_features), feature_quality=float(args.flow_feature_quality), feature_min_distance=float(args.flow_feature_min_distance), min_features=int(args.flow_min_features), lk_window=int(args.flow_lk_window), lk_levels=int(args.flow_lk_levels), max_fb_error=float(args.flow_max_fb_error), max_fb_median_px=float(args.flow_max_fb_median_px), min_good_tracks=int(args.flow_min_good_tracks), homography_ransac_px=float(args.flow_homography_ransac_px), min_homography_inliers=int(args.flow_min_homography_inliers), min_homography_inlier_ratio=float(args.flow_min_homography_inlier_ratio), max_homography_median_px=float(args.flow_max_homography_median_px), max_current_tag_agreement_px=80.0, allow_missing_current_tag=True, max_flow_corner_reproj_px=float(args.flow_max_corner_reproj_px), max_translation_delta_mm=float(args.flow_max_translation_delta_mm), max_rotation_delta_deg=float(args.flow_max_rotation_delta_deg), min_edge_score=float(args.flow_min_edge_score), min_tag_corners_inside=4, skip_current_tag_detection=True, feature_mask_scale=1.0)
+
+def wrist_propagate(*, rgb_flow: Any, finalize020: Any, runtime: dict[str, Any], images: dict[int, np.ndarray], anchor_pose: dict[str, Any], start: int, end: int, step: int, tag_id: int, args: argparse.Namespace) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+    poses = {start: copy.deepcopy(anchor_pose)}
+    metrics: dict[int, dict[str, Any]] = {}
+    settings = wrist_flow_args(args)
+    for frame_index in range(start + step, end + step, step):
+        anchor_index = frame_index - step
+        settings.anchor_frame = anchor_index
+        settings.target_frame = frame_index
+        flow_anchor = copy.deepcopy(poses[anchor_index])
+        flow_anchor['tag_ids'] = [int(tag_id)]
+        (pose, frame_metrics) = rgb_flow.recover_pose(finalize020=finalize020, anchor_image=images[anchor_index], target_image=images[frame_index], anchor_pose=flow_anchor, runtime=runtime, args=settings)
+        poses[frame_index] = pose
+        metrics[frame_index] = frame_metrics
+    return (poses, metrics)
+
+def wrist_draw_overlay(finalize020: Any, image: np.ndarray, pose: dict[str, Any], runtime: dict[str, Any], frame_index: int) -> bytes:
+    output = image.copy()
+    (corners, _) = cv2.projectPoints(finalize020.pose_recovery_cube_corners(runtime['config']), np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1), np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1), runtime['camera_matrix'], runtime['dist_coeffs'])
+    corners = corners.reshape(-1, 2)
+    for (first, second) in finalize020.POSE_RECOVERY_CUBE_EDGES:
+        a = tuple((int(round(value)) for value in corners[first]))
+        b = tuple((int(round(value)) for value in corners[second]))
+        cv2.line(output, a, b, (0, 255, 255), 5, cv2.LINE_AA)
+    cv2.rectangle(output, (0, 0), (output.shape[1], 56), (0, 0, 0), -1)
+    cv2.putText(output, f'wrist_Q frame {frame_index}: bidirectional RGB-flow fusion', (15, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    (ok, encoded) = cv2.imencode('.jpg', output, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError('cv2.imencode failed')
+    return encoded.tobytes()
+
+def wrist_sequence_deltas(poses: list[dict[str, Any]]) -> dict[str, float]:
+    translation: list[float] = []
+    rotation: list[float] = []
+    for (before, after) in zip(poses, poses[1:]):
+        translation.append(float(np.linalg.norm(np.asarray(after['tvec'], dtype=np.float64).reshape(3) - np.asarray(before['tvec'], dtype=np.float64).reshape(3))))
+        rotation.append(wrist_rotation_delta_deg(before['rvec'], after['rvec']))
+    return {'translation_mm_median': float(np.median(translation)), 'translation_mm_p95': float(np.percentile(translation, 95)), 'translation_mm_max': float(np.max(translation)), 'rotation_deg_median': float(np.median(rotation)), 'rotation_deg_p95': float(np.percentile(rotation, 95)), 'rotation_deg_max': float(np.max(rotation))}
+
+def wrist_recompute_footer(frames: list[dict[str, Any]], old_footer: dict[str, Any], target_name: str) -> dict[str, Any]:
+    target_names = list(frames[0]['pose_results'])
+    success_counts = {name: 0 for name in target_names}
+    source_counts: dict[str, Counter[str]] = {name: Counter() for name in target_names}
+    for frame in frames:
+        for name in target_names:
+            pose = frame['pose_results'][name].get('pose', {}) or {}
+            success_counts[name] += int(wrist_valid_pose(pose))
+            source_counts[name][str(pose.get('pose_source', ''))] += 1
+    reprocessed = list(old_footer.get('reprocessed_targets', []) or [])
+    if target_name not in reprocessed:
+        reprocessed.append(target_name)
+    return {'type': 'footer', 'frame_count': len(frames), 'success_counts': success_counts, 'pose_source_counts': {name: dict(counts) for (name, counts) in source_counts.items()}, 'reprocessed_targets': reprocessed, 'stopped_wall_time': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+def wrist_write_sidecar(path: Path, header: dict[str, Any], frames: list[dict[str, Any]], footer: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open('wb') as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame in frames:
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(footer, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+def wrist_json_default(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+def wrist_run(args: argparse.Namespace) -> None:
+    source_path = args.source.expanduser().resolve()
+    sidecar_path = args.sidecar.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+    qa_path = args.qa.expanduser().resolve()
+    target_name = str(args.target_name)
+    start = int(args.start_anchor)
+    end = int(args.end_anchor)
+    if end <= start + 1:
+        raise ValueError('The anchor interval must contain at least one inner frame')
+    rgb_flow = wrist_load_module('wrist_bidirectional_rgb_flow', wrist_RGB_FLOW_PATH)
+    finalize020 = rgb_flow.load_finalize_020()
+    (header, frames, old_footer) = rgb_flow.load_sidecar(sidecar_path)
+    samples = rgb_flow.load_source_samples(source_path)
+    if len(samples) != len(frames):
+        raise ValueError(f'Source/sidecar mismatch: {len(samples)} != {len(frames)}')
+    target_metadata = header['metadata']['targets'][target_name]
+    runtime = rgb_flow.detection_runtime(finalize020, target_metadata)
+    worker_name = str(target_metadata['worker_name'])
+    camera_name = str(target_metadata['camera_name'])
+    start_pose = copy.deepcopy(frames[start]['poses'][target_name])
+    end_pose = copy.deepcopy(frames[end]['poses'][target_name])
+    if not wrist_valid_pose(start_pose) or not wrist_valid_pose(end_pose):
+        raise ValueError('Both wrist anchors must have finite poses')
+    if not start_pose.get('tag_ids') or not end_pose.get('tag_ids'):
+        raise ValueError('Both wrist anchors must be direct tag observations')
+    images: dict[int, np.ndarray] = {}
+    timestamps: dict[int, float] = {}
+    for frame_index in range(start, end + 1):
+        raw = samples[frame_index]['worker_raw_frames'][worker_name][camera_name]
+        images[frame_index] = rgb_flow.detection_frame(finalize020, np.asarray(raw), runtime)
+        timestamps[frame_index] = float(frames[frame_index]['pose_results'][target_name]['capture_timestamp'])
+    (left, left_metrics) = wrist_propagate(rgb_flow=rgb_flow, finalize020=finalize020, runtime=runtime, images=images, anchor_pose=start_pose, start=start, end=end - 1, step=1, tag_id=int(args.tag_id), args=args)
+    (right, right_metrics) = wrist_propagate(rgb_flow=rgb_flow, finalize020=finalize020, runtime=runtime, images=images, anchor_pose=end_pose, start=end, end=start + 1, step=-1, tag_id=int(args.tag_id), args=args)
+    disagreements: dict[int, dict[str, float]] = {}
+    fused: dict[int, dict[str, Any]] = {}
+    duration = timestamps[end] - timestamps[start]
+    for frame_index in range(start + 1, end):
+        alpha = (timestamps[frame_index] - timestamps[start]) / duration
+        left_pose = left[frame_index]
+        right_pose = right[frame_index]
+        translation_disagreement = float(np.linalg.norm(np.asarray(left_pose['tvec'], dtype=np.float64).reshape(3) - np.asarray(right_pose['tvec'], dtype=np.float64).reshape(3)))
+        rotation_disagreement = wrist_rotation_delta_deg(left_pose['rvec'], right_pose['rvec'])
+        disagreements[frame_index] = {'translation_mm': translation_disagreement, 'rotation_deg': rotation_disagreement}
+        if translation_disagreement > float(args.max_bidirectional_translation_mm):
+            raise RuntimeError(f'Bidirectional translation gate failed at {frame_index}')
+        if rotation_disagreement > float(args.max_bidirectional_rotation_deg):
+            raise RuntimeError(f'Bidirectional rotation gate failed at {frame_index}')
+        (rvec, tvec) = wrist_blend_poses(left_pose, right_pose, alpha)
+        fused[frame_index] = {'success': True, 'failure_reason': '', 'pose_source': 'wrist_bidirectional_adjacent_rgb_flow_se3_fusion', 'quality_level': 'T', 'quality_reason': f'direct_anchors:{start}-{end};tag:{int(args.tag_id)};alpha:{alpha:.6f};left_right_dt:{translation_disagreement:.3f}mm;left_right_dr:{rotation_disagreement:.3f}deg', 'pose_filled': True, 'predicted': True, 'temporal_recovery': True, 'single_frame_only': False, 'rvec': rvec, 'tvec': tvec, 'T': wrist_pose_transform(rvec, tvec), 'reproj_error': float('nan'), 'reproj_metric': 'bidirectional_adjacent_rgb_flow_fusion', 'n_tags': 1, 'tag_ids': [int(args.tag_id)], 'visible_faces': [], 'left_anchor_frame': start, 'right_anchor_frame': end, 'fusion_alpha': float(alpha), 'left_flow_metrics': left_metrics[frame_index], 'right_flow_metrics': right_metrics[frame_index], 'bidirectional_translation_disagreement_mm': translation_disagreement, 'bidirectional_rotation_disagreement_deg': rotation_disagreement}
+    for (frame_index, pose) in fused.items():
+        result = frames[frame_index]['pose_results'][target_name]
+        result['pose_before_wrist_bidirectional_recovery'] = copy.deepcopy(result.get('pose', {}) or {})
+        result['pose'] = pose
+        result['selected_stage'] = str(pose['pose_source'])
+        result['overlay_jpeg'] = wrist_draw_overlay(finalize020, images[frame_index], pose, runtime, frame_index)
+        result['overlay_format'] = 'jpeg_bgr'
+        result['overlay_shape'] = tuple((int(value) for value in images[frame_index].shape))
+        frames[frame_index]['poses'][target_name] = copy.deepcopy(pose)
+    all_poses = [frame['poses'][target_name] for frame in frames]
+    if any((not wrist_valid_pose(pose) for pose in all_poses)):
+        raise RuntimeError('wrist_Q is still incomplete after recovery')
+    deltas = wrist_sequence_deltas(all_poses)
+    output_header = copy.deepcopy(header)
+    output_header['created_wall_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
+    output_header.setdefault('metadata', {}).setdefault('update_history', []).append({'updated_wall_time': time.strftime('%Y-%m-%d %H:%M:%S'), 'script': str(wrist_FILE_PATH), 'target': target_name, 'method': 'two direct anchors; adjacent RGB flow; timestamp SE(3) fusion', 'start_anchor': start, 'end_anchor': end, 'tag_id': int(args.tag_id), 'recovered_frames': sorted(fused)})
+    footer = wrist_recompute_footer(frames, old_footer, target_name)
+    wrist_write_sidecar(output_path, output_header, frames, footer)
+    report = {'source_pkl': source_path, 'input_sidecar': sidecar_path, 'output_sidecar': output_path, 'target_name': target_name, 'anchors': [start, end], 'tag_id': int(args.tag_id), 'recovered_frames': sorted(fused), 'bidirectional_disagreements': disagreements, 'maximum_bidirectional_translation_mm': max((value['translation_mm'] for value in disagreements.values())), 'maximum_bidirectional_rotation_deg': max((value['rotation_deg'] for value in disagreements.values())), 'full_sequence_pose_deltas': deltas, 'footer': footer}
+    qa_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=wrist_json_default) + '\n', encoding='utf-8')
+    print(json.dumps(report, indent=2, ensure_ascii=False, default=wrist_json_default))
+
+def wrist_build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source', type=Path, required=True)
+    parser.add_argument('--sidecar', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--qa', type=Path, required=True)
+    parser.add_argument('--target-name', default='wrist_Q')
+    parser.add_argument('--start-anchor', type=int, default=31)
+    parser.add_argument('--end-anchor', type=int, default=50)
+    parser.add_argument('--tag-id', type=int, default=118)
+    parser.add_argument('--max-bidirectional-translation-mm', type=float, default=12.0)
+    parser.add_argument('--max-bidirectional-rotation-deg', type=float, default=8.0)
+    parser.add_argument('--flow-max-features', type=int, default=250)
+    parser.add_argument('--flow-feature-quality', type=float, default=0.001)
+    parser.add_argument('--flow-feature-min-distance', type=float, default=2.0)
+    parser.add_argument('--flow-min-features', type=int, default=10)
+    parser.add_argument('--flow-lk-window', type=int, default=31)
+    parser.add_argument('--flow-lk-levels', type=int, default=4)
+    parser.add_argument('--flow-max-fb-error', type=float, default=2.0)
+    parser.add_argument('--flow-max-fb-median-px', type=float, default=1.0)
+    parser.add_argument('--flow-min-good-tracks', type=int, default=8)
+    parser.add_argument('--flow-homography-ransac-px', type=float, default=2.5)
+    parser.add_argument('--flow-min-homography-inliers', type=int, default=6)
+    parser.add_argument('--flow-min-homography-inlier-ratio', type=float, default=0.15)
+    parser.add_argument('--flow-max-homography-median-px', type=float, default=2.0)
+    parser.add_argument('--flow-max-corner-reproj-px', type=float, default=6.0)
+    parser.add_argument('--flow-max-translation-delta-mm', type=float, default=15.0)
+    parser.add_argument('--flow-max-rotation-delta-deg', type=float, default=20.0)
+    parser.add_argument('--flow-min-edge-score', type=float, default=0.0)
+    return parser
+
+def rgb_load_finalize_020() -> Any:
+    return sys.modules[__name__]
+
+def mid_load_module(name: str, path: Path) -> Any:
+    return rgb_flow if "rgb_flow" in name or "rgb_flow" in str(path) else sys.modules[__name__]
+
+def idx_load_module(name: str, path: Path) -> Any:
+    return sys.modules[__name__]
+
+def wrist_load_module(name: str, path: Path) -> Any:
+    return rgb_flow
+
+
+def embedded_wrist_anchor_interval(
+    sidecar_path: Path, target_name: str = "wrist_Q"
+) -> tuple[int, int, int] | None:
+    """Find direct tag anchors around the longest remaining wrist gap."""
+    _header, frames, _footer = rgb_load_sidecar(sidecar_path)
+    missing = [
+        index
+        for index, frame in enumerate(frames)
+        if not wrist_valid_pose(frame["pose_results"][target_name].get("pose", {}) or {})
+    ]
+    if not missing:
+        return None
+    start_missing, end_missing = min(missing), max(missing)
+    left_candidates = range(start_missing - 1, -1, -1)
+    right_candidates = range(end_missing + 1, len(frames))
+    for left in left_candidates:
+        left_pose = frames[left]["pose_results"][target_name].get("pose", {}) or {}
+        left_tags = {int(value) for value in left_pose.get("tag_ids", [])}
+        if not wrist_valid_pose(left_pose) or not left_tags or bool(left_pose.get("pose_filled", False)):
+            continue
+        for right in right_candidates:
+            right_pose = frames[right]["pose_results"][target_name].get("pose", {}) or {}
+            right_tags = {int(value) for value in right_pose.get("tag_ids", [])}
+            common = sorted(left_tags & right_tags)
+            if wrist_valid_pose(right_pose) and common and not bool(right_pose.get("pose_filled", False)):
+                # The dorsal wrist cube's tag 118 is the validated tracking
+                # face for bidirectional recovery.  Keep the anchor search
+                # data-driven, but prefer that face when both anchors see it.
+                tag_id = 118 if 118 in common else common[0]
+                return left, right, tag_id
+    raise RuntimeError(
+        f"Could not find two direct wrist tag anchors around frames {start_missing}-{end_missing}"
+    )
+
+
+def run_embedded_pose_recovery_patches(
+    *,
+    source_path: Path,
+    initial_sidecar: Path,
+    strict_index_stream: Path,
+    output_sidecar: Path,
+    work_dir: Path,
+) -> dict[str, Any]:
+    """Apply the frozen-reference recovery sequence without external scripts."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    middle_sidecar = work_dir / "middle_recovered.pkl"
+    index_middle_sidecar = work_dir / "index_middle_recovered.pkl"
+    middle_args = mid_build_parser().parse_args([])
+    middle_args.source = source_path
+    middle_args.sidecar = initial_sidecar
+    middle_args.output = middle_sidecar
+    middle_args.qa = work_dir / "middle_recovery_qa.json"
+    # Parameters used by the validated full-sequence middle recovery.  They
+    # affect the LK feature set (900 points) and permit adjacent propagation
+    # through the long trailing occlusion while keeping motion/PnP gates.
+    middle_args.max_flow_gap_frames = 303
+    middle_args.flow_max_features = 900
+    middle_args.flow_feature_quality = 0.0025
+    middle_args.flow_feature_min_distance = 3.0
+    middle_args.flow_min_features = 50
+    middle_args.flow_lk_window = 45
+    middle_args.flow_lk_levels = 5
+    middle_args.flow_max_fb_error = 3.0
+    middle_args.flow_max_fb_median_px = 1.5
+    middle_args.flow_min_good_tracks = 35
+    middle_args.flow_homography_ransac_px = 3.0
+    middle_args.flow_min_homography_inliers = 22
+    middle_args.flow_min_homography_inlier_ratio = 0.12
+    middle_args.flow_max_homography_median_px = 2.5
+    middle_args.flow_max_corner_reproj_px = 20.0
+    middle_args.flow_max_translation_delta_mm = 10.0
+    middle_args.flow_max_rotation_delta_deg = 20.0
+    middle_args.flow_min_edge_score = 0.0
+    middle_args.flow_min_tag_corners_inside = 2
+    middle_args.flow_skip_current_tag_detection = True
+    print("[INFO] Embedded complete recovery: middle_Q", flush=True)
+    mid_run(middle_args)
+
+    index_args = idx_build_parser().parse_args(
+        [
+            "--sidecar",
+            str(middle_sidecar),
+            "--strict",
+            str(strict_index_stream),
+            "--output",
+            str(index_middle_sidecar),
+            "--qa",
+            str(work_dir / "index_recovery_qa.json"),
+        ]
+    )
+    print("[INFO] Embedded complete recovery: index_Q", flush=True)
+    idx_run(index_args)
+
+    anchor = embedded_wrist_anchor_interval(index_middle_sidecar)
+    if anchor is None:
+        shutil.copy2(index_middle_sidecar, output_sidecar)
+    else:
+        start, end, tag_id = anchor
+        wrist_args = wrist_build_parser().parse_args(
+            [
+                "--source",
+                str(source_path),
+                "--sidecar",
+                str(index_middle_sidecar),
+                "--output",
+                str(output_sidecar),
+                "--qa",
+                str(work_dir / "wrist_recovery_qa.json"),
+                "--start-anchor",
+                str(start),
+                "--end-anchor",
+                str(end),
+                "--tag-id",
+                str(tag_id),
+            ]
+        )
+        print(
+            "[INFO] Embedded complete recovery: wrist_Q "
+            f"anchors={start}-{end} tag={tag_id}",
+            flush=True,
+        )
+        wrist_run(wrist_args)
+    header, frames, footer = stage13_load_sidecar(output_sidecar)
+    del header
+    stage13_assert_complete(frames, STAGE13_TARGETS)
+    return {
+        "frame_count": len(frames),
+        "success_counts": copy.deepcopy(footer.get("success_counts", {})),
+        "pose_source_counts": copy.deepcopy(footer.get("pose_source_counts", {})),
+    }
+# -----------------------------------------------------------------------------
+# Embedded stage13: completion barrier + timestamp SE(3) smoothing with RGB gate.
+# -----------------------------------------------------------------------------
+
+STAGE13_TARGETS = ("wrist_Q", "index_Q", "thumb_Q", "middle_Q")
+
+
+def stage13_valid_pose(pose: dict[str, Any]) -> bool:
+    if not bool(pose.get("success", False)):
+        return False
+    try:
+        values = np.r_[
+            np.asarray(pose["rvec"], dtype=np.float64).reshape(3),
+            np.asarray(pose["tvec"], dtype=np.float64).reshape(3),
+        ]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(np.all(np.isfinite(values)))
+
+
+def stage13_load_sidecar(
+    path: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    footer: dict[str, Any] | None = None
+    with path.open("rb") as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get("format") != mc_POSE_SIDECAR_FORMAT:
+            raise ValueError(f"Unsupported sidecar format: {header.get('format')}")
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get("type") == "frame":
+                frames.append(record)
+            elif record.get("type") == "footer":
+                footer = record
+    if footer is None:
+        raise ValueError(f"Sidecar has no footer: {path}")
+    if len(frames) != int(footer.get("frame_count", -1)):
+        raise ValueError("Sidecar frame/footer count mismatch")
+    return header, frames, footer
+
+
+def stage13_source_samples(path: Path) -> Sequence[dict[str, Any]]:
+    data = mc_load_source_recording(path)
+    samples = data.get("samples")
+    if not isinstance(samples, Sequence):
+        raise ValueError(f"Raw recording has no sample sequence: {path}")
+    return samples
+
+
+def stage13_source_pose(result: dict[str, Any]) -> dict[str, Any]:
+    current = result.get("pose", {}) or {}
+    before = result.get("pose_before_temporal_smoothing", {}) or {}
+    if bool(current.get("temporal_smoothed", False)) and stage13_valid_pose(before):
+        return copy.deepcopy(before)
+    return copy.deepcopy(current)
+
+
+def stage13_assert_complete(
+    frames: list[dict[str, Any]], target_names: Sequence[str]
+) -> None:
+    failures: dict[str, list[int]] = {}
+    for target_name in target_names:
+        missing = [
+            index
+            for index, frame in enumerate(frames)
+            if not stage13_valid_pose(
+                frame.get("pose_results", {})
+                .get(target_name, {})
+                .get("pose", {})
+                or {}
+            )
+        ]
+        if missing:
+            failures[target_name] = missing
+    if failures:
+        compact = {
+            name: {"count": len(indices), "frames": indices[:20]}
+            for name, indices in failures.items()
+        }
+        raise RuntimeError(
+            "Final global smoothing requires every cube pose on every frame; "
+            f"incomplete targets: {compact}"
+        )
+
+
+def stage13_frame_timestamp(frame: dict[str, Any], target_name: str) -> float:
+    result = frame["pose_results"][target_name]
+    value = result.get("capture_timestamp", frame.get("time_monotonic"))
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError(f"Non-finite timestamp at sample {frame.get('sample_index')}")
+    return value
+
+
+def stage13_rotation_delta_deg(first: Any, second: Any) -> float:
+    first_rotation = Rotation.from_rotvec(np.asarray(first, dtype=np.float64).reshape(3))
+    second_rotation = Rotation.from_rotvec(np.asarray(second, dtype=np.float64).reshape(3))
+    return float(np.degrees((first_rotation.inv() * second_rotation).magnitude()))
+
+
+def stage13_interpolate_pose(
+    before: dict[str, Any], after: dict[str, Any], alpha: float
+) -> tuple[np.ndarray, np.ndarray]:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    before_t = np.asarray(before["tvec"], dtype=np.float64).reshape(3)
+    after_t = np.asarray(after["tvec"], dtype=np.float64).reshape(3)
+    tvec = ((1.0 - alpha) * before_t + alpha * after_t).reshape(3, 1)
+    rotations = Rotation.from_rotvec(
+        np.stack(
+            [
+                np.asarray(before["rvec"], dtype=np.float64).reshape(3),
+                np.asarray(after["rvec"], dtype=np.float64).reshape(3),
+            ]
+        )
+    )
+    rvec = Slerp([0.0, 1.0], rotations)([alpha]).as_rotvec()[0].reshape(3, 1)
+    return rvec, tvec
+
+
+def stage13_detection_runtime(target_metadata: dict[str, Any]) -> dict[str, Any]:
+    intrinsics = realsense_load_intrinsics_yaml(target_metadata["intrinsics_yaml"])
+    image_size = tuple(int(value) for value in target_metadata["image_size"])
+    if tuple(intrinsics["image_size"]) != image_size:
+        raise ValueError(
+            "Target intrinsics/image-size mismatch: "
+            f"{intrinsics['image_size']} != {image_size}"
+        )
+    undistort_pack = realsense_create_undistort_maps(intrinsics, image_size)
+    camera_matrix = (
+        np.asarray(undistort_pack[2], dtype=np.float64).reshape(3, 3)
+        if undistort_pack is not None
+        else np.asarray(intrinsics["K"], dtype=np.float64).reshape(3, 3)
+    )
+    cube_cfg = Path(target_metadata["cube_cfg"]).expanduser().resolve()
+    config, face_id_sets = aprilcube.load_cube_config(str(cube_cfg / "config.json"))
+    return {
+        "intrinsics": intrinsics,
+        "image_size": image_size,
+        "undistort_pack": undistort_pack,
+        "camera_matrix": camera_matrix,
+        "dist_coeffs": np.zeros(5, dtype=np.float64),
+        "cube_cfg": cube_cfg,
+        "config": config,
+        "face_id_sets": face_id_sets,
+        "tag_corner_map": aprilcube.build_tag_corner_map(config),
+        "worker_name": target_metadata["worker_name"],
+        "camera_name": target_metadata["camera_name"],
+    }
+
+
+def stage13_detection_frame(image: np.ndarray, runtime: dict[str, Any]) -> np.ndarray:
+    target_width, target_height = runtime["image_size"]
+    if image.shape[:2] != (target_height, target_width):
+        raise ValueError(
+            f"Target raw image is {image.shape[1]}x{image.shape[0]}, "
+            f"but calibration is {target_width}x{target_height}"
+        )
+    return realsense_undistort_frame(image, runtime["undistort_pack"])
+
+
+def stage13_pose_step_metrics(poses: list[dict[str, Any]]) -> dict[str, float]:
+    translation: list[float] = []
+    rotation: list[float] = []
+    for before, after in zip(poses, poses[1:]):
+        translation.append(
+            float(
+                np.linalg.norm(
+                    np.asarray(after["tvec"], dtype=np.float64).reshape(3)
+                    - np.asarray(before["tvec"], dtype=np.float64).reshape(3)
+                )
+            )
+        )
+        rotation.append(stage13_rotation_delta_deg(before["rvec"], after["rvec"]))
+    return {
+        "translation_step_median_mm": float(np.median(translation)),
+        "translation_step_p95_mm": float(np.percentile(translation, 95)),
+        "translation_step_max_mm": float(np.max(translation)),
+        "rotation_step_median_deg": float(np.median(rotation)),
+        "rotation_step_p95_deg": float(np.percentile(rotation, 95)),
+        "rotation_step_max_deg": float(np.max(rotation)),
+    }
+
+
+def stage13_temporal_residuals(
+    frames: list[dict[str, Any]], target_name: str
+) -> dict[str, float]:
+    translations: list[float] = []
+    rotations: list[float] = []
+    timestamps = [stage13_frame_timestamp(frame, target_name) for frame in frames]
+    poses = [frame["pose_results"][target_name]["pose"] for frame in frames]
+    for index in range(1, len(frames) - 1):
+        alpha = (timestamps[index] - timestamps[index - 1]) / (
+            timestamps[index + 1] - timestamps[index - 1]
+        )
+        rvec, tvec = stage13_interpolate_pose(poses[index - 1], poses[index + 1], alpha)
+        translations.append(
+            float(
+                np.linalg.norm(
+                    np.asarray(poses[index]["tvec"], dtype=np.float64).reshape(3)
+                    - tvec.reshape(3)
+                )
+            )
+        )
+        rotations.append(stage13_rotation_delta_deg(poses[index]["rvec"], rvec))
+    return {
+        "translation_median_mm": float(np.median(translations)),
+        "translation_p95_mm": float(np.percentile(translations, 95)),
+        "translation_max_mm": float(np.max(translations)),
+        "rotation_median_deg": float(np.median(rotations)),
+        "rotation_p95_deg": float(np.percentile(rotations, 95)),
+        "rotation_max_deg": float(np.max(rotations)),
+    }
+
+
+def stage13_smooth_target(
+    *,
+    samples: Sequence[dict[str, Any]],
+    frames: list[dict[str, Any]],
+    runtime: dict[str, Any],
+    target_name: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    timestamps = [stage13_frame_timestamp(frame, target_name) for frame in frames]
+    source_poses = [
+        copy.deepcopy(frame["pose_results"][target_name]["pose"]) for frame in frames
+    ]
+    output: list[dict[str, Any]] = []
+    edge_rejected: list[int] = []
+    translation_deltas: list[float] = []
+    rotation_deltas: list[float] = []
+    for index, source_pose in enumerate(source_poses):
+        neighbors = [
+            (neighbor_index, timestamps[neighbor_index], source_poses[neighbor_index])
+            for neighbor_index in range(
+                max(0, index - int(args.window_radius)),
+                min(len(frames), index + int(args.window_radius) + 1),
+            )
+            if abs(timestamps[neighbor_index] - timestamps[index])
+            <= float(args.window_seconds)
+        ]
+        rvec, tvec, source_count = temporal_smoothing_weighted_pose(
+            neighbors,
+            target_idx=index,
+            target_timestamp=timestamps[index],
+            sigma_frames=1.0,
+            sigma_seconds=float(args.sigma_seconds),
+        )
+        filled = bool(source_pose.get("pose_filled", False))
+        rvec, tvec, _, _ = temporal_smoothing_limit_pose_delta(
+            source_pose,
+            rvec,
+            tvec,
+            max_translation_delta_mm=(
+                float(args.max_filled_translation_mm)
+                if filled
+                else float(args.max_measured_translation_mm)
+            ),
+            max_rotation_delta_deg=(
+                float(args.max_filled_rotation_deg)
+                if filled
+                else float(args.max_measured_rotation_deg)
+            ),
+        )
+        raw = samples[index]["worker_raw_frames"][runtime["worker_name"]][
+            runtime["camera_name"]
+        ]
+        image = stage13_detection_frame(np.asarray(raw), runtime)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        source_edge = pose_recovery_edge_alignment_score(
+            gray,
+            source_pose,
+            config=runtime["config"],
+            camera_matrix=runtime["camera_matrix"],
+            dist_coeffs=runtime["dist_coeffs"],
+        )
+        candidate_edge = pose_recovery_edge_alignment_score(
+            gray,
+            {"success": True, "rvec": rvec, "tvec": tvec},
+            config=runtime["config"],
+            camera_matrix=runtime["camera_matrix"],
+            dist_coeffs=runtime["dist_coeffs"],
+        )
+        blend = 1.0
+        while candidate_edge < source_edge - float(args.max_edge_score_drop) and blend > 0.125:
+            blend *= 0.5
+            rvec, tvec = temporal_smoothing_blend_from_source(source_pose, rvec, tvec, 0.5)
+            candidate_edge = pose_recovery_edge_alignment_score(
+                gray,
+                {"success": True, "rvec": rvec, "tvec": tvec},
+                config=runtime["config"],
+                camera_matrix=runtime["camera_matrix"],
+                dist_coeffs=runtime["dist_coeffs"],
+            )
+        if candidate_edge < source_edge - float(args.max_edge_score_drop):
+            rvec = np.asarray(source_pose["rvec"], dtype=np.float64).reshape(3, 1)
+            tvec = np.asarray(source_pose["tvec"], dtype=np.float64).reshape(3, 1)
+            candidate_edge = source_edge
+            edge_rejected.append(index)
+        translation_delta = float(
+            np.linalg.norm(
+                np.asarray(source_pose["tvec"], dtype=np.float64).reshape(3)
+                - tvec.reshape(3)
+            )
+        )
+        rotation_delta = stage13_rotation_delta_deg(source_pose["rvec"], rvec)
+        smoothed = copy.deepcopy(source_pose)
+        smoothed.update(
+            {
+                "rvec": rvec,
+                "tvec": tvec,
+                "T": temporal_completion_make_pose_transform(rvec, tvec),
+                "temporal_smoothed": bool(
+                    translation_delta > 1e-9 or rotation_delta > 1e-9
+                ),
+                "temporal_smoothing_clock": "capture_timestamp",
+                "temporal_smoothing_source_count": int(source_count),
+                "temporal_smoothing_window_seconds": float(args.window_seconds),
+                "temporal_smoothing_sigma_seconds": float(args.sigma_seconds),
+                "temporal_smoothing_translation_delta_mm": translation_delta,
+                "temporal_smoothing_rotation_delta_deg": rotation_delta,
+                "temporal_smoothing_edge_before": float(source_edge),
+                "temporal_smoothing_edge_after": float(candidate_edge),
+                "temporal_smoothing_edge_rejected": index in edge_rejected,
+            }
+        )
+        output.append(smoothed)
+        translation_deltas.append(translation_delta)
+        rotation_deltas.append(rotation_delta)
+    for index, pose in enumerate(output):
+        result = frames[index]["pose_results"][target_name]
+        result["pose_before_temporal_smoothing"] = source_poses[index]
+        result["selected_stage_before_temporal_smoothing"] = result.get(
+            "selected_stage", ""
+        )
+        result["pose"] = pose
+        result["selected_stage"] = "stage12_timestamp_se3_smoothing"
+        frames[index]["poses"][target_name] = copy.deepcopy(pose)
+    return {
+        "smoothed_frames": int(sum(bool(pose.get("temporal_smoothed")) for pose in output)),
+        "edge_rejected_frames": edge_rejected,
+        "translation_delta_mm_max": float(max(translation_deltas, default=0.0)),
+        "rotation_delta_deg_max": float(max(rotation_deltas, default=0.0)),
+    }
+
+
+def stage13_footer(
+    frames: list[dict[str, Any]], old_footer: dict[str, Any], target_names: Sequence[str]
+) -> dict[str, Any]:
+    all_names = list(frames[0]["pose_results"])
+    success_counts: dict[str, int] = {}
+    source_counts: dict[str, dict[str, int]] = {}
+    smoothed_counts: dict[str, int] = {}
+    applied_counts: dict[str, int] = {}
+    for name in all_names:
+        poses = [frame["pose_results"][name].get("pose", {}) or {} for frame in frames]
+        success_counts[name] = sum(stage13_valid_pose(pose) for pose in poses)
+        source_counts[name] = {}
+        for pose in poses:
+            source = str(pose.get("pose_source", ""))
+            source_counts[name][source] = source_counts[name].get(source, 0) + 1
+        smoothed_counts[name] = sum(
+            bool(pose.get("final_global_temporal_smoothed", False)) for pose in poses
+        )
+        applied_counts[name] = sum(
+            bool(pose.get("final_global_smoothing_applied", False)) for pose in poses
+        )
+    reprocessed = list(old_footer.get("reprocessed_targets", []) or [])
+    for target_name in target_names:
+        if target_name not in reprocessed:
+            reprocessed.append(target_name)
+    return {
+        "type": "footer",
+        "frame_count": len(frames),
+        "success_counts": success_counts,
+        "pose_source_counts": source_counts,
+        "final_global_smoothed_counts": smoothed_counts,
+        "final_global_smoothing_applied_counts": applied_counts,
+        "final_global_smoothing_complete": all(
+            applied_counts[name] == len(frames) for name in target_names
+        ),
+        "reprocessed_targets": reprocessed,
+        "stopped_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def stage13_write_sidecar(
+    path: Path,
+    header: dict[str, Any],
+    frames: list[dict[str, Any]],
+    footer: dict[str, Any],
+    overwrite: bool,
+) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists: {path}; pass --overwrite")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("wb") as stream:
+            pickle.dump(header, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            for frame in frames:
+                pickle.dump(frame, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(footer, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def stage13_run(args: argparse.Namespace) -> None:
+    source_path = Path(args.source).expanduser().resolve()
+    sidecar_path = Path(args.sidecar).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+    target_names = [str(value) for value in args.targets]
+    header, frames, old_footer = stage13_load_sidecar(sidecar_path)
+    missing_targets = sorted(
+        set(target_names) - set(header.get("metadata", {}).get("targets", {}))
+    )
+    if missing_targets:
+        raise KeyError(f"Targets absent from sidecar metadata: {missing_targets}")
+    raw_stat = source_path.stat()
+    expected_identity = {"size": int(raw_stat.st_size), "mtime_ns": int(raw_stat.st_mtime_ns)}
+    if header.get("source_multi_cam_identity") != expected_identity:
+        raise ValueError("Sidecar source identity does not match raw input")
+    stage13_assert_complete(frames, target_names)
+    samples = stage13_source_samples(source_path)
+    if len(samples) != len(frames):
+        raise ValueError(f"Raw/sidecar frame mismatch: {len(samples)} != {len(frames)}")
+    for target_name in target_names:
+        for frame in frames:
+            result = frame["pose_results"][target_name]
+            old_pose = copy.deepcopy(result.get("pose", {}) or {})
+            source_pose = stage13_source_pose(result)
+            result["pose_before_final_global_smoothing"] = source_pose
+            result["pose_before_previous_smoothing_reset"] = old_pose
+            result["pose"] = copy.deepcopy(source_pose)
+            result["selected_stage_before_final_global_smoothing"] = result.get(
+                "selected_stage", ""
+            )
+            result["selected_stage"] = str(
+                source_pose.get("pose_source", "recovered_pose")
+            )
+            frame["poses"][target_name] = copy.deepcopy(source_pose)
+    stage13_assert_complete(frames, target_names)
+    reports: dict[str, Any] = {}
+    for target_name in target_names:
+        print(f"[INFO] Embedded stage13 smoothing: {target_name}", flush=True)
+        runtime = stage13_detection_runtime(header["metadata"]["targets"][target_name])
+        before = stage13_temporal_residuals(frames, target_name)
+        before_steps = stage13_pose_step_metrics(
+            [frame["pose_results"][target_name]["pose"] for frame in frames]
+        )
+        smoothing = stage13_smooth_target(
+            samples=samples,
+            frames=frames,
+            runtime=runtime,
+            target_name=target_name,
+            args=args,
+        )
+        for frame in frames:
+            result = frame["pose_results"][target_name]
+            pose = result["pose"]
+            pose["final_global_temporal_smoothed"] = bool(
+                pose.get("temporal_smoothed", False)
+            )
+            pose["final_global_smoothing_version"] = 1
+            pose["final_global_smoothing_applied"] = True
+            pose["final_global_smoothing_completion_barrier"] = True
+            result["selected_stage"] = "stage13_final_complete_sidecar_se3_smoothing"
+            frame["poses"][target_name] = copy.deepcopy(pose)
+        reports[target_name] = {
+            "temporal_residuals_before": before,
+            "temporal_residuals_after": stage13_temporal_residuals(frames, target_name),
+            "pose_steps_before": before_steps,
+            "pose_steps_after": stage13_pose_step_metrics(
+                [frame["pose_results"][target_name]["pose"] for frame in frames]
+            ),
+            "smoothing": smoothing,
+        }
+    stage13_assert_complete(frames, target_names)
+    output_header = copy.deepcopy(header)
+    output_header["created_wall_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    output_metadata = output_header.setdefault("metadata", {})
+    output_metadata["final_global_smoothing"] = {
+        "schema": "consensv2.final_complete_sidecar_smoothing.v1",
+        "complete": True,
+        "completion_barrier_passed": True,
+        "frame_count": len(frames),
+        "targets": target_names,
+        "applied_counts": {name: len(frames) for name in target_names},
+        "input_sidecar": str(sidecar_path),
+        "script": str(Path(__file__).resolve()),
+        "window_seconds": float(args.window_seconds),
+        "sigma_seconds": float(args.sigma_seconds),
+        "rgb_edge_guard": True,
+        "target_reports": reports,
+    }
+    output_metadata.setdefault("update_history", []).append(
+        {
+            "updated_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "script": str(Path(__file__).resolve()),
+            "method": (
+                "completion barrier followed by symmetric capture-timestamp SE(3) "
+                "smoothing with current-frame RGB cube-edge guard"
+            ),
+            "input_sidecar": str(sidecar_path),
+            "targets": target_names,
+            "frame_count": len(frames),
+            "window_seconds": float(args.window_seconds),
+            "sigma_seconds": float(args.sigma_seconds),
+            "completion_barrier_passed": True,
+        }
+    )
+    footer = stage13_footer(frames, old_footer, target_names)
+    stage13_write_sidecar(output_path, output_header, frames, footer, bool(args.overwrite))
+    print(f"[INFO] Embedded stage13 output: {output_path}")
+
+
+# -----------------------------------------------------------------------------
+# Monolithic pose -> Wuji-left retarget -> xArm7 IK orchestration and embedding.
+# -----------------------------------------------------------------------------
+
+MONOLITHIC_QPOS_SCHEMA = "consensv2.multi_camera_wuji_left_xarm7_qpos.v1"
+DEFAULT_WUJI_LEFT_URDF = (
+    PROJECT_ROOT
+    / "thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf"
+)
+DEFAULT_WUJI_CONTACT_KEYPOINTS = (
+    PROJECT_ROOT / "configs/retarget/left_wuji_fingertip_contact_keypoints.yaml"
+)
+DEFAULT_XARM7_WUJI_LEFT_URDF = (
+    PROJECT_ROOT
+    / "thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye.urdf"
+)
+
+
+@contextlib.contextmanager
+def monolithic_argv(arguments: Sequence[str]):
+    previous = sys.argv
+    sys.argv = [str(Path(__file__).resolve()), *[str(value) for value in arguments]]
+    try:
+        yield
+    finally:
+        sys.argv = previous
+
+
+def monolithic_load_pickle_stream(
+    path: Path, expected_format: str
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+    frames: list[dict[str, Any]] = []
+    footer: dict[str, Any] | None = None
+    with path.open("rb") as stream:
+        header = pickle.load(stream)
+        if not isinstance(header, dict) or header.get("format") != expected_format:
+            raise ValueError(
+                f"Unexpected format for {path}: {header.get('format')} != {expected_format}"
+            )
+        while True:
+            try:
+                record = pickle.load(stream)
+            except EOFError:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get("type") == "frame":
+                frames.append(record)
+            elif record.get("type") == "footer":
+                footer = record
+    return header, frames, footer
+
+
+def monolithic_attach_qpos(
+    *,
+    pose_sidecar: Path,
+    output_path: Path,
+    retarget_pkl: Path,
+    ik_pkl: Path,
+    raw_path: Path,
+    overwrite: bool,
+) -> None:
+    pose_header, pose_frames, pose_footer = monolithic_load_pickle_stream(
+        pose_sidecar, mc_POSE_SIDECAR_FORMAT
+    )
+    retarget_header, retarget_frames, _ = monolithic_load_pickle_stream(
+        retarget_pkl, rt_COMPACT_PKL_FORMAT
+    )
+    ik_header, ik_frames, ik_footer = monolithic_load_pickle_stream(
+        ik_pkl, fb_IK_FORMAT
+    )
+    frame_count = len(pose_frames)
+    if len(retarget_frames) != frame_count or len(ik_frames) != frame_count:
+        raise ValueError(
+            "Pose/retarget/IK frame mismatch: "
+            f"{frame_count}/{len(retarget_frames)}/{len(ik_frames)}"
+        )
+    for index, (pose_frame, retarget_frame, ik_frame) in enumerate(
+        zip(pose_frames, retarget_frames, ik_frames)
+    ):
+        if int(pose_frame.get("sample_index", -1)) != index:
+            raise ValueError(f"Non-contiguous pose sample_index at {index}")
+        if int(retarget_frame.get("frame_index", -1)) != index:
+            raise ValueError(f"Non-contiguous retarget frame_index at {index}")
+        if int(ik_frame.get("frame_index", -1)) != index:
+            raise ValueError(f"Non-contiguous IK frame_index at {index}")
+        three_finger = np.asarray(
+            retarget_frame["wujihand_qpos"], dtype=np.float32
+        ).reshape(12)
+        safe_full = np.asarray(ik_frame["qpos"], dtype=np.float32).reshape(27)
+        raw_full = np.asarray(ik_frame["raw_ik_qpos"], dtype=np.float32).reshape(27)
+        if not np.all(np.isfinite(np.r_[three_finger, safe_full, raw_full])):
+            raise ValueError(f"Non-finite qpos at frame {index}")
+        qpos_result = {
+            "schema": MONOLITHIC_QPOS_SCHEMA,
+            "trajectory_time_s": float(ik_frame["trajectory_time_s"]),
+            "wuji_left_three_finger_retarget_qpos": three_finger,
+            "wuji_left_three_finger_safe_qpos": np.asarray(
+                ik_frame["wujihand_three_finger_qpos"], dtype=np.float32
+            ).reshape(12),
+            "wuji_left_qpos": np.asarray(
+                ik_frame["wujihand_qpos"], dtype=np.float32
+            ).reshape(20),
+            "xarm7_qpos": np.asarray(ik_frame["arm_qpos"], dtype=np.float32).reshape(7),
+            "xarm7_wuji_left_qpos": safe_full,
+            "xarm7_wuji_left_raw_ik_qpos": raw_full,
+            "palm_position_error_m": float(ik_frame["palm_position_error_m"]),
+            "palm_orientation_error_deg": float(
+                ik_frame["palm_orientation_error_deg"]
+            ),
+            "target_T_link_base_left_palm_link": np.asarray(
+                ik_frame["target_T_link_base_left_palm_link"], dtype=np.float64
+            ),
+            "fk_T_link_base_left_palm_link": np.asarray(
+                ik_frame["fk_T_link_base_left_palm_link"], dtype=np.float64
+            ),
+        }
+        pose_frame["qpos_results"] = qpos_result
+        # Direct aliases keep deployment and inspection code simple while the
+        # structured qpos_results field remains the canonical representation.
+        pose_frame["wujihand_qpos"] = qpos_result["wuji_left_qpos"]
+        pose_frame["xarm_qpos"] = qpos_result["xarm7_qpos"]
+        pose_frame["qpos"] = qpos_result["xarm7_wuji_left_qpos"]
+        pose_frame["raw_ik_qpos"] = qpos_result["xarm7_wuji_left_raw_ik_qpos"]
+    output_header = copy.deepcopy(pose_header)
+    output_header["created_wall_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    metadata = output_header.setdefault("metadata", {})
+    metadata["robot_qpos"] = {
+        "schema": MONOLITHIC_QPOS_SCHEMA,
+        "complete": True,
+        "frame_count": frame_count,
+        "handedness": "left",
+        "source_raw_pkl": str(raw_path),
+        "wuji_left_retarget": {
+            "format": retarget_header.get("format"),
+            "mode": retarget_header.get("mode"),
+            "best_start": retarget_header.get("best_start"),
+            "joint_names": list(retarget_header.get("wujihand_qpos_joint_order", [])),
+            "summary": copy.deepcopy(retarget_header.get("summary", {})),
+        },
+        "full_body_ik": {
+            "format": ik_header.get("format"),
+            "qpos_joint_names": list(ik_header.get("qpos_joint_names", [])),
+            "arm_joint_names": list(ik_header.get("arm_joint_names", [])),
+            "three_finger_joint_names": list(
+                ik_header.get("three_finger_joint_names", [])
+            ),
+            "T_left_palm_link_hand_back_cube": copy.deepcopy(
+                ik_header.get("T_left_palm_link_hand_back_cube")
+            ),
+            "T_link_base_rs_camera": copy.deepcopy(
+                ik_header.get("T_link_base_rs_camera")
+            ),
+            "selected_candidate": ik_header.get("selected_candidate"),
+            "selection_metrics": copy.deepcopy(ik_header.get("selection_metrics", {})),
+            "hardware_safety": copy.deepcopy(ik_header.get("hardware_safety", {})),
+            "urdf": str(DEFAULT_XARM7_WUJI_LEFT_URDF),
+        },
+    }
+    metadata.setdefault("update_history", []).append(
+        {
+            "updated_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "script": str(Path(__file__).resolve()),
+            "method": (
+                "embedded Wuji-left three-finger four-point retargeting, virtual "
+                "RS-to-xArm gauge optimization, full-body IK, and hardware-safe "
+                "velocity/acceleration/jerk postprocessing"
+            ),
+            "frame_count": frame_count,
+        }
+    )
+    output_footer = copy.deepcopy(pose_footer or {})
+    output_footer.update(
+        {
+            "type": "footer",
+            "frame_count": frame_count,
+            "robot_qpos_complete": True,
+            "robot_qpos_schema": MONOLITHIC_QPOS_SCHEMA,
+            "safe_playback_fps": None if ik_footer is None else ik_footer.get("safe_playback_fps"),
+            "safe_duration_s": None if ik_footer is None else ik_footer.get("safe_duration_s"),
+            "stopped_wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    stage13_write_sidecar(
+        output_path,
+        output_header,
+        pose_frames,
+        output_footer,
+        overwrite=overwrite or output_path == pose_sidecar,
+    )
+
+
+def run_monolithic_qpos_pipeline(
+    *,
+    raw_path: Path,
+    pose_sidecar: Path,
+    output_path: Path,
+    temp_root: Path,
+    overwrite: bool,
+    keep_temp: bool,
+) -> None:
+    for required in (
+        raw_path,
+        pose_sidecar,
+        DEFAULT_WUJI_LEFT_URDF,
+        DEFAULT_WUJI_CONTACT_KEYPOINTS,
+        DEFAULT_XARM7_WUJI_LEFT_URDF,
+    ):
+        if not required.is_file():
+            raise FileNotFoundError(required)
+    if temp_root.exists() and any(temp_root.iterdir()):
+        raise FileExistsError(f"Qpos temporary root is not empty: {temp_root}")
+    retarget_dir = temp_root / "wuji_left_retarget"
+    full_body_dir = temp_root / "xarm7_wuji_left"
+    retarget_pkl = retarget_dir / "three_finger_se3.pkl"
+    retarget_npz = retarget_dir / "three_finger_se3.npz"
+    merged_pkl = full_body_dir / "full_body_merged.pkl"
+    ik_pkl = full_body_dir / "xarm7_wuji_left_full_qpos.pkl"
+    temp_root.mkdir(parents=True, exist_ok=False)
+    try:
+        print("[INFO] Embedded Wuji-left three-finger retargeting", flush=True)
+        with monolithic_argv(
+            [
+                raw_path,
+                "--pose-sidecar",
+                pose_sidecar,
+                "--wrist-extrinsics",
+                rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS,
+                "--urdf",
+                DEFAULT_WUJI_LEFT_URDF,
+                "--contact-keypoints",
+                DEFAULT_WUJI_CONTACT_KEYPOINTS,
+                "--output-dir",
+                retarget_dir,
+                "--modes",
+                "se3",
+                "--joint-temporal-optimize",
+                "--overwrite",
+            ]
+        ):
+            rt_main()
+        print("[INFO] Embedded xArm7 + Wuji-left full-body IK", flush=True)
+        with monolithic_argv(
+            [
+                "--raw-pkl",
+                raw_path,
+                "--sidecar-pkl",
+                pose_sidecar,
+                "--retarget-npz",
+                retarget_npz,
+                "--retarget-pkl",
+                retarget_pkl,
+                "--urdf",
+                DEFAULT_XARM7_WUJI_LEFT_URDF,
+                "--merged-pkl",
+                merged_pkl,
+                "--ik-pkl",
+                ik_pkl,
+                "--overwrite",
+            ]
+        ):
+            solve_main()
+        monolithic_attach_qpos(
+            pose_sidecar=pose_sidecar,
+            output_path=output_path,
+            retarget_pkl=retarget_pkl,
+            ik_pkl=ik_pkl,
+            raw_path=raw_path,
+            overwrite=overwrite,
+        )
+        print(f"[INFO] Embedded robot qpos into final PKL: {output_path}")
+    finally:
+        if keep_temp:
+            print(f"[INFO] Keeping qpos temporary files: {temp_root}")
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            print(f"[INFO] Removed qpos temporary files: {temp_root}")
+
+def build_main_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone AprilCube offline pipeline. Multi-camera inputs are mapped "
+            "to wrist/index/thumb/middle targets and written as one post_progress PKL."
+        )
+    )
+    parser.add_argument("--input", type=Path, default=INPUT_PKL)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Default: <input-stem>_post_progress.pkl beside the input.",
+    )
+    parser.add_argument("--temp-root", type=Path, default=None)
+    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--pose-only",
+        action="store_true",
+        help="Stop after the complete stage13 pose sidecar; skip Wuji/xArm qpos.",
+    )
+    parser.add_argument(
+        "--reuse-complete-pose-sidecar",
+        type=Path,
+        default=None,
+        help=(
+            "Regression/debug option: skip image pose processing and run embedded "
+            "retargeting+IK from an existing complete stage13 sidecar."
+        ),
+    )
+    parser.add_argument(
+        "--skip-final-global-smoothing",
+        action="store_true",
+        help="Diagnostic only; the resulting pose sidecar is not valid for IK.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_main_parser().parse_args()
+    input_path = args.input.expanduser().resolve()
+    fmt = inspect_pkl_format(input_path)
     print(f"[INFO] Auto detected input format: {fmt}")
     if fmt == RAW_008_PKL_FORMAT:
+        if input_path != INPUT_PKL.expanduser().resolve():
+            raise ValueError(
+                "The legacy 008 path still uses the reproducible constants at the top "
+                "of this file; set INPUT_PKL for an 008 recording."
+            )
         output = process_008_recording()
     elif fmt in SUPPORTED_012_INPUT_PKL_FORMATS:
+        if input_path != INPUT_PKL.expanduser().resolve():
+            raise ValueError(
+                "The legacy 012 path still uses the reproducible constants at the top "
+                "of this file; set INPUT_PKL for a 012 recording."
+            )
         output = process_configured_recording()
+    elif fmt == "consens_multi_camera_sync_stream":
+        output_path = (
+            args.output.expanduser().resolve()
+            if args.output is not None
+            else input_path.with_name(f"{input_path.stem}_post_progress.pkl")
+        )
+        if output_path.exists() and not args.overwrite and not args.validate_only:
+            raise FileExistsError(f"Output already exists: {output_path}; pass --overwrite")
+        pose_temp_root = (
+            args.temp_root.expanduser().resolve()
+            if args.temp_root is not None
+            else Path("/dev/shm") / f"consensv2lab_020_{input_path.stem}"
+        )
+        if args.skip_final_global_smoothing and not args.pose_only:
+            raise ValueError("--skip-final-global-smoothing requires --pose-only")
+        if args.reuse_complete_pose_sidecar is None:
+            intermediate = (
+                pose_temp_root / f"{input_path.stem}_pose_sidecar_intermediate.pkl"
+            )
+            mc_run(
+                argparse.Namespace(
+                    input=input_path,
+                    output=intermediate,
+                    temp_root=pose_temp_root,
+                    max_frames=args.max_frames,
+                    targets=[target.name for target in mc_TARGETS],
+                    merge_existing=None,
+                    validate_only=bool(args.validate_only),
+                    keep_temp=bool(args.keep_temp),
+                    final_output=output_path,
+                    final_qa=None,
+                    skip_final_global_smoothing=bool(args.skip_final_global_smoothing),
+                )
+            )
+            pose_sidecar = (
+                output_path if not args.skip_final_global_smoothing else intermediate
+            )
+        else:
+            pose_sidecar = args.reuse_complete_pose_sidecar.expanduser().resolve()
+            if not pose_sidecar.is_file():
+                raise FileNotFoundError(pose_sidecar)
+            if args.validate_only:
+                stage13_load_sidecar(pose_sidecar)
+        if not args.validate_only and not args.pose_only:
+            qpos_temp_root = pose_temp_root.with_name(pose_temp_root.name + "_qpos")
+            run_monolithic_qpos_pipeline(
+                raw_path=input_path,
+                pose_sidecar=pose_sidecar,
+                output_path=output_path,
+                temp_root=qpos_temp_root,
+                overwrite=bool(args.overwrite),
+                keep_temp=bool(args.keep_temp),
+            )
+        output = pose_sidecar if args.pose_only else output_path
     else:
         raise ValueError(f"Unsupported input pkl format: {fmt}")
     print(f"[INFO] Done: {output}")
