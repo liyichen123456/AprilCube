@@ -66,13 +66,48 @@ def parse_args() -> argparse.Namespace:
         "--frame-yaw-deg",
         type=float,
         default=DEFAULT_FRAME_YAW_DEG,
-        help="New local frame's positive rotation about the original +z axis.",
+        help=(
+            "New local frame's positive rotation about the original +z axis. "
+            "Ignored when --frame-x/--frame-y are supplied."
+        ),
+    )
+    parser.add_argument(
+        "--frame-x",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "Positive local x-axis expressed in the original mesh coordinates. "
+            "Must be supplied together with --frame-y."
+        ),
+    )
+    parser.add_argument(
+        "--frame-y",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help=(
+            "Positive local y-axis expressed in the original mesh coordinates. "
+            "Local +z is computed as x cross y."
+        ),
     )
     parser.add_argument(
         "--mesh-yaw-deg",
         type=float,
         default=0.0,
         help="Active mesh rotation about the displayed local +z axis.",
+    )
+    parser.add_argument(
+        "--camera-view",
+        choices=("model", "photo-axes", "index-photo-axes"),
+        default="model",
+        help=(
+            "Initial camera view. 'photo-axes' projects +x upper-right, +y down, "
+            "and +z right. 'index-photo-axes' projects +x upper-right, +y up, "
+            "and +z upper-left, matching the index AprilCube reference photo."
+        ),
     )
     parser.add_argument(
         "--finger-objs",
@@ -110,7 +145,7 @@ def parse_args() -> argparse.Namespace:
         "--cube-edge-mm",
         type=float,
         default=DEFAULT_CUBE_EDGE_MM,
-        help="Reference-cube edge length in millimeters for multi-mesh mode.",
+        help="Reference-cube edge length in millimeters.",
     )
     parser.add_argument("--no-cube", action="store_true", help="Hide reference cubes.")
     parser.add_argument("--no-grid", action="store_true", help="Hide the reference grid.")
@@ -134,7 +169,7 @@ def load_mesh(
         raise TypeError(f"Unsupported mesh type {type(loaded)!r}: {path}")
     if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
         raise ValueError(f"Mesh is empty: {path}")
-    rgba = np.asarray([color[0], color[1], color[2], 230], dtype=np.uint8)
+    rgba = np.asarray([color[0], color[1], color[2], 255], dtype=np.uint8)
     mesh.visual.vertex_colors = np.tile(rgba, (len(mesh.vertices), 1))
     return mesh
 
@@ -144,7 +179,8 @@ def summary_markdown(
     mesh: trimesh.Trimesh,
     scale: float,
     origin: np.ndarray,
-    frame_yaw_deg: float,
+    frame_axes_in_mesh: np.ndarray,
+    frame_description: str,
     mesh_yaw_deg: float,
 ) -> str:
     bounds = np.asarray(mesh.bounds, dtype=np.float64)
@@ -159,8 +195,25 @@ def summary_markdown(
                 "**Local origin (mesh units):** "
                 f"`({origin[0]:.3f}, {origin[1]:.3f}, {origin[2]:.3f})`"
             ),
-            "**Local frame:** `+x/+y` lie on the flange plane; `+z` is its normal",
-            f"**Frame yaw about original +z:** `{frame_yaw_deg:.3f} deg`",
+            f"**Local frame:** `{frame_description}`",
+            (
+                "**+x in mesh coordinates:** "
+                f"`({frame_axes_in_mesh[0, 0]:.6f}, "
+                f"{frame_axes_in_mesh[0, 1]:.6f}, "
+                f"{frame_axes_in_mesh[0, 2]:.6f})`"
+            ),
+            (
+                "**+y in mesh coordinates:** "
+                f"`({frame_axes_in_mesh[1, 0]:.6f}, "
+                f"{frame_axes_in_mesh[1, 1]:.6f}, "
+                f"{frame_axes_in_mesh[1, 2]:.6f})`"
+            ),
+            (
+                "**+z in mesh coordinates:** "
+                f"`({frame_axes_in_mesh[2, 0]:.6f}, "
+                f"{frame_axes_in_mesh[2, 1]:.6f}, "
+                f"{frame_axes_in_mesh[2, 2]:.6f})`"
+            ),
             f"**Active mesh yaw about displayed +z:** `{mesh_yaw_deg:.3f} deg`",
             (
                 "**Bounds (mesh units):** "
@@ -172,6 +225,57 @@ def summary_markdown(
                 f"`({extents[0]:.3f}, {extents[1]:.3f}, {extents[2]:.3f})`"
             ),
         ]
+    )
+
+
+def resolve_local_frame(
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Return (mesh-to-local rotation, local axes in mesh coordinates, label)."""
+    if (args.frame_x is None) != (args.frame_y is None):
+        raise ValueError("--frame-x and --frame-y must be supplied together.")
+
+    if args.frame_x is not None:
+        x_axis = np.asarray(args.frame_x, dtype=np.float64)
+        y_axis = np.asarray(args.frame_y, dtype=np.float64)
+        if not np.all(np.isfinite(x_axis)) or not np.all(np.isfinite(y_axis)):
+            raise ValueError("--frame-x/--frame-y must contain finite values.")
+        x_norm = float(np.linalg.norm(x_axis))
+        y_norm = float(np.linalg.norm(y_axis))
+        if x_norm <= 1e-12 or y_norm <= 1e-12:
+            raise ValueError("--frame-x/--frame-y must be non-zero vectors.")
+        x_axis /= x_norm
+        y_axis /= y_norm
+        dot_xy = float(np.dot(x_axis, y_axis))
+        if abs(dot_xy) > 1e-4:
+            raise ValueError(
+                "--frame-x and --frame-y must be orthogonal; "
+                f"normalized dot product is {dot_xy:.6g}."
+            )
+        z_axis = np.cross(x_axis, y_axis)
+        z_axis /= np.linalg.norm(z_axis)
+        axes_in_mesh = np.stack((x_axis, y_axis, z_axis), axis=0)
+        return axes_in_mesh, axes_in_mesh, "explicit orthonormal x/y axes"
+
+    frame_yaw_deg = float(args.frame_yaw_deg)
+    if not np.isfinite(frame_yaw_deg):
+        raise ValueError(f"frame yaw must be finite, got {frame_yaw_deg}")
+    yaw = np.deg2rad(frame_yaw_deg)
+    cos_yaw = np.cos(yaw)
+    sin_yaw = np.sin(yaw)
+    # Rows are the displayed local basis vectors expressed in mesh coordinates.
+    axes_in_mesh = np.asarray(
+        [
+            [cos_yaw, sin_yaw, 0.0],
+            [-sin_yaw, cos_yaw, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return (
+        axes_in_mesh,
+        axes_in_mesh,
+        f"yaw {frame_yaw_deg:.3f} deg about mesh +z",
     )
 
 
@@ -427,26 +531,17 @@ def run_local_frame_viewer(args: argparse.Namespace) -> None:
     origin = np.asarray(args.origin, dtype=np.float64)
     if origin.shape != (3,) or not np.all(np.isfinite(origin)):
         raise ValueError(f"origin must contain three finite values, got {origin}")
-    frame_yaw_deg = float(args.frame_yaw_deg)
-    if not np.isfinite(frame_yaw_deg):
-        raise ValueError(f"frame yaw must be finite, got {frame_yaw_deg}")
+    rotation_new_from_old, frame_axes_in_mesh, frame_description = (
+        resolve_local_frame(args)
+    )
     mesh_yaw_deg = float(args.mesh_yaw_deg)
     if not np.isfinite(mesh_yaw_deg):
         raise ValueError(f"mesh yaw must be finite, got {mesh_yaw_deg}")
+    cube_edge_mm = float(args.cube_edge_mm)
+    if not np.isfinite(cube_edge_mm) or cube_edge_mm <= 0.0:
+        raise ValueError(f"cube edge must be positive, got {cube_edge_mm}")
 
-    # Express the mesh in a frame rotated positively about the original +z axis.
-    # Coordinate conversion therefore applies the inverse frame rotation.
-    inverse_yaw = np.deg2rad(-frame_yaw_deg)
-    cos_yaw = np.cos(inverse_yaw)
-    sin_yaw = np.sin(inverse_yaw)
-    rotation_new_from_old = np.asarray(
-        [
-            [cos_yaw, -sin_yaw, 0.0],
-            [sin_yaw, cos_yaw, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
+    # Coordinates in the displayed frame are dot products with its basis axes.
     display_mesh = mesh.copy()
     centered_vertices = np.asarray(display_mesh.vertices) - origin
     display_mesh.vertices = centered_vertices @ rotation_new_from_old.T
@@ -469,26 +564,52 @@ def run_local_frame_viewer(args: argparse.Namespace) -> None:
         [rotated_vertices.min(axis=0), rotated_vertices.max(axis=0)], axis=0
     ) * scale
     center_m = np.mean(bounds_m, axis=0)
-    extents_m = np.asarray(display_mesh.extents, dtype=np.float64) * scale
-    scene_size = max(float(np.max(extents_m)), 0.01)
+    bounds_dimensions_m = bounds_m[1] - bounds_m[0]
+    scene_size = max(float(np.max(bounds_dimensions_m)), 0.01)
 
     server = viser.ViserServer(host=str(args.host), port=int(args.port))
     server.gui.set_panel_label("STL Coordinate Viewer")
     server.scene.set_up_direction("+z")
     server.scene.world_axes.visible = False
-    server.initial_camera.position = tuple(
-        center_m + np.asarray([2.2, -2.5, 1.8]) * scene_size
-    )
-    server.initial_camera.look_at = tuple(center_m)
-    server.initial_camera.up = (0.0, 0.0, 1.0)
+    if str(args.camera_view) == "photo-axes":
+        # Nearest orthonormal camera basis fitted to the colored axes in the
+        # supplied reference image: red +x upper-right, green +y down, blue
+        # +z right. Values are expressed in the displayed local frame.
+        camera_offset = np.asarray(
+            [0.77482594, 0.44701497, -0.44701497], dtype=np.float64
+        )
+        camera_up = np.asarray(
+            [0.42350838, -0.89201824, -0.15793705], dtype=np.float64
+        )
+        camera_look_at = center_m * 0.45
+        camera_position = camera_look_at + camera_offset * scene_size * 2.0
+    elif str(args.camera_view) == "index-photo-axes":
+        # Camera basis fitted to the larger cube-center axes in the supplied
+        # index reference image: red +x upper-right, green +y up, blue +z
+        # upper-left. Values are expressed in the displayed local frame.
+        camera_offset = np.asarray(
+            [0.29652471, -0.87230564, 0.38878781], dtype=np.float64
+        )
+        camera_up = np.asarray(
+            [0.55571480, 0.48867859, 0.67258776], dtype=np.float64
+        )
+        camera_look_at = center_m * 0.45
+        camera_position = camera_look_at + camera_offset * scene_size * 2.0
+    else:
+        camera_look_at = center_m
+        camera_position = center_m + np.asarray([1.4, -1.6, 1.1]) * scene_size
+        camera_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    server.initial_camera.position = tuple(camera_position)
+    server.initial_camera.look_at = tuple(camera_look_at)
+    server.initial_camera.up = tuple(camera_up)
     server.initial_camera.near = max(scene_size * 0.002, 1e-5)
 
     root = "/mesh_local_frame"
     frame = server.scene.add_frame(
         root,
-        axes_length=scene_size * 0.75,
-        axes_radius=scene_size * 0.018,
-        origin_radius=scene_size * 0.04,
+        axes_length=scene_size * 0.4,
+        axes_radius=scene_size * 0.012,
+        origin_radius=scene_size * 0.028,
     )
     mesh_handle = server.scene.add_mesh_trimesh(
         f"{root}/mesh",
@@ -500,11 +621,19 @@ def run_local_frame_viewer(args: argparse.Namespace) -> None:
     )
     bounds_handle = server.scene.add_box(
         f"{root}/bounds",
-        dimensions=tuple(extents_m),
+        dimensions=tuple(bounds_dimensions_m),
         position=tuple(center_m),
         color=(245, 185, 45),
         opacity=0.12,
         side="double",
+        visible=False,
+    )
+    cube_handle = server.scene.add_line_segments(
+        f"{root}/reference_cube",
+        points=cube_wireframe_points(cube_edge_mm * 0.001),
+        colors=np.asarray((255, 210, 40), dtype=np.uint8),
+        line_width=3.0,
+        visible=not bool(args.no_cube),
     )
     grid_handle = server.scene.add_grid(
         "/reference_grid",
@@ -519,7 +648,11 @@ def run_local_frame_viewer(args: argparse.Namespace) -> None:
     with server.gui.add_folder("Visibility"):
         show_mesh = server.gui.add_checkbox("Mesh", initial_value=True)
         show_frame = server.gui.add_checkbox("Local axes", initial_value=True)
-        show_bounds = server.gui.add_checkbox("Bounds", initial_value=True)
+        show_bounds = server.gui.add_checkbox("Bounds", initial_value=False)
+        show_cube = server.gui.add_checkbox(
+            f"{cube_edge_mm:g}mm reference cube",
+            initial_value=not bool(args.no_cube),
+        )
         show_grid = server.gui.add_checkbox("Grid", initial_value=not bool(args.no_grid))
 
     with server.gui.add_folder("Transform"):
@@ -543,6 +676,10 @@ def run_local_frame_viewer(args: argparse.Namespace) -> None:
     def _on_bounds(_event: Any) -> None:
         bounds_handle.visible = bool(show_bounds.value)
 
+    @show_cube.on_update
+    def _on_cube(_event: Any) -> None:
+        cube_handle.visible = bool(show_cube.value)
+
     @show_grid.on_update
     def _on_grid(_event: Any) -> None:
         grid_handle.visible = bool(show_grid.value)
@@ -557,12 +694,20 @@ def run_local_frame_viewer(args: argparse.Namespace) -> None:
 
     server.gui.add_markdown(
         summary_markdown(
-            mesh_path, mesh, scale, origin, frame_yaw_deg, mesh_yaw_deg
+            mesh_path,
+            mesh,
+            scale,
+            origin,
+            frame_axes_in_mesh,
+            frame_description,
+            mesh_yaw_deg,
         )
     )
     print(f"[INFO] Mesh: {mesh_path}")
     print(f"[INFO] Local origin (mesh units): {origin.tolist()}")
-    print(f"[INFO] Frame yaw about original +z: {frame_yaw_deg:g} deg")
+    print(f"[INFO] Local frame: {frame_description}")
+    print(f"[INFO] Local axes in mesh coordinates: {frame_axes_in_mesh.tolist()}")
+    print(f"[INFO] Initial camera view: {args.camera_view}")
     print(f"[INFO] Active mesh yaw about displayed +z: {mesh_yaw_deg:g} deg")
     print(f"[INFO] Bounds: {mesh.bounds.tolist()}")
     print(f"[INFO] Extents: {mesh.extents.tolist()}")

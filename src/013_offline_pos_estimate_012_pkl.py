@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import pickle
 import sys
 import time
@@ -16,6 +18,7 @@ import viser
 THIS_FILE = Path(__file__).resolve()
 APRILCUBE_ROOT = THIS_FILE.parent.parent
 SCRIPT_012_PATH = THIS_FILE.parent / "012_rs_aprilcube_detect.py"
+SCRIPT_015_PATH = THIS_FILE.parent / "015_deeptag_012_pkl.py"
 DEFAULT_RECORDING_DIR = APRILCUBE_ROOT / "recordings"
 DEFAULT_PORT = 8094
 PLAYBACK_FPS = 15.0
@@ -36,9 +39,22 @@ def load_script012_module() -> Any:
     return module
 
 
+def load_script015_module() -> Any:
+    spec = importlib.util.spec_from_file_location("aprilcube_replay_015_deeptag", SCRIPT_015_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load DeepTag logic from {SCRIPT_015_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay 012 raw-frame pkl, run offline AprilCube pose detection, visualize with viser."
+        description=(
+            "Estimate offline AprilCube poses from a 012 raw-frame pkl, optionally "
+            "recover failed measurements with DeepTag, and visualize with viser."
+        )
     )
     parser.add_argument(
         "pkl_path",
@@ -74,6 +90,37 @@ def parse_args() -> argparse.Namespace:
         default=3.0,
         help="RANSAC reprojection threshold in pixels for fallback PnP.",
     )
+    parser.add_argument(
+        "--deeptag",
+        action="store_true",
+        help="Load the 015 DeepTag backend and use conservative robust-cluster recovery.",
+    )
+    parser.add_argument(
+        "--deeptag-mode",
+        choices=("fallback", "validate"),
+        default="fallback",
+        help=(
+            "fallback runs DeepTag only when AprilCube fails; validate runs it on every "
+            "frame for diagnostics but still keeps successful AprilCube measurements."
+        ),
+    )
+    parser.add_argument("--deeptag-cpu", action="store_true", help="Force DeepTag onto CPU.")
+    parser.add_argument(
+        "--deeptag-verbose",
+        action="store_true",
+        help="Keep DeepTag per-frame stdout instead of suppressing it.",
+    )
+    parser.add_argument(
+        "--deeptag-detect-scale",
+        type=float,
+        default=-1.0,
+        help="DeepTag detection scale; negative uses its default.",
+    )
+    parser.add_argument("--deeptag-min-tags", type=int, default=2)
+    parser.add_argument("--deeptag-max-reproj", type=float, default=6.0)
+    parser.add_argument("--deeptag-single-tag-max-reproj", type=float, default=4.0)
+    parser.add_argument("--deeptag-cluster-trans-mm", type=float, default=70.0)
+    parser.add_argument("--deeptag-cluster-rot-deg", type=float, default=55.0)
     parser.add_argument(
         "--no-fill-missing-pose",
         action="store_true",
@@ -317,6 +364,24 @@ def sanitize_result(result: dict[str, Any]) -> dict[str, Any]:
         "fallback_outlier_rejected_ids": [
             int(v) for v in result.get("fallback_outlier_rejected_ids", []) or []
         ],
+        "deeptag_attempted": bool(result.get("deeptag_attempted", False)),
+        "deeptag_selected": bool(result.get("deeptag_selected", False)),
+        "deeptag_success": bool(result.get("deeptag_success", False)),
+        "deeptag_failure_reason": str(result.get("deeptag_failure_reason", "")),
+        "deeptag_corner_order": str(result.get("deeptag_corner_order", "")),
+        "deeptag_n_tags": int(result.get("deeptag_n_tags", 0) or 0),
+        "deeptag_reproj_error": float(result.get("deeptag_reproj_error", float("inf"))),
+        "deeptag_elapsed_s": float(result.get("deeptag_elapsed_s", 0.0) or 0.0),
+        "deeptag_detection_stats": dict(result.get("deeptag_detection_stats", {}) or {}),
+        "deeptag_cluster_stats": dict(result.get("deeptag_cluster_stats", {}) or {}),
+        "deeptag_translation_delta_mm": scalar_or_none(
+            result.get("deeptag_translation_delta_mm", None)
+        ),
+        "deeptag_rotation_delta_deg": scalar_or_none(
+            result.get("deeptag_rotation_delta_deg", None)
+        ),
+        "aprilcube_pose_source": str(result.get("aprilcube_pose_source", "")),
+        "aprilcube_failure_reason": str(result.get("aprilcube_failure_reason", "")),
     }
 
 
@@ -339,6 +404,15 @@ def result_to_markdown(record: dict[str, Any], result: dict[str, Any], slider_id
         f"camera: `{record.get('camera_name', record.get('device_name', '?'))}`",
         f"timestamp: `{record.get('capture_timestamp', None)}`",
     ]
+    if result.get("deeptag_attempted", False):
+        lines.extend(
+            [
+                f"deeptag_success: `{result.get('deeptag_success', False)}`",
+                f"deeptag_selected: `{result.get('deeptag_selected', False)}`",
+                f"deeptag_tags/reproj: `{result.get('deeptag_n_tags', 0)} / "
+                f"{result.get('deeptag_reproj_error', None)}`",
+            ]
+        )
     if not result.get("success", False):
         tag_ids = result.get("tag_ids", [])
         lines.append(f"pose: `not detected`, tags=`{int(result.get('n_tags', 0))}`")
@@ -351,6 +425,7 @@ def result_to_markdown(record: dict[str, Any], result: dict[str, Any], slider_id
     lines.extend(
         [
             "pose: `detected`",
+            f"pose_source: `{result.get('pose_source', '')}`",
             f"t_mm: `({tvec[0]:.1f}, {tvec[1]:.1f}, {tvec[2]:.1f})`",
             f"reproj_px: `{float(result.get('reproj_error', float('nan'))):.3f}`",
             f"tags: `{int(result.get('n_tags', 0))}`",
@@ -726,10 +801,192 @@ class OfflineEstimator:
         return self.detector.draw_result(vis, result)
 
 
+class DeepTagPoseBackend:
+    """Conservative adapter around the standalone 015 DeepTag implementation."""
+
+    def __init__(
+        self,
+        script012: Any,
+        metadata: dict[str, Any],
+        args: argparse.Namespace,
+    ) -> None:
+        if int(args.deeptag_min_tags) < 2:
+            raise ValueError("--deeptag-min-tags must be at least 2 for conservative recovery.")
+        if float(args.deeptag_max_reproj) <= 0.0:
+            raise ValueError("--deeptag-max-reproj must be positive.")
+
+        self.script012 = script012
+        self.module = load_script015_module()
+        self.args = argparse.Namespace(
+            intrinsics_yaml=args.intrinsics_yaml,
+            cube_cfg=args.cube_cfg,
+            no_undistort=bool(args.no_undistort),
+            cpu=bool(args.deeptag_cpu),
+            detect_scale=float(args.deeptag_detect_scale),
+            min_center_score=0.2,
+            min_corner_score=0.2,
+            hamming_dist=8,
+            stg2_iter_num=2,
+            batch_size_stg2=4,
+            corner_order="rot180",
+            pose_mode="robust-cluster",
+            robust_min_tags=int(args.deeptag_min_tags),
+            robust_cluster_trans_mm=float(args.deeptag_cluster_trans_mm),
+            robust_cluster_rot_deg=float(args.deeptag_cluster_rot_deg),
+            robust_max_reproj=float(args.deeptag_max_reproj),
+            robust_single_tag_max_reproj=float(args.deeptag_single_tag_max_reproj),
+        )
+        self.quiet = not bool(args.deeptag_verbose)
+        self.runtime = self.module.make_runtime(script012, metadata, self.args)
+        tag_size_m = float(self.runtime["cube_config"].tag_size_mm) / 1000.0
+        print(f"[INFO] Loading integrated DeepTag backend from {self.module.DEEPTAG_ROOT}")
+        started = time.perf_counter()
+        self.engine = self.module.load_deeptag_engine(
+            camera_matrix=self.runtime["detection_camera_matrix"],
+            dist_coeffs=self.runtime["detector_dist_coeffs"],
+            tag_size_m=tag_size_m,
+            args=self.args,
+        )
+        print(f"[INFO] Integrated DeepTag loaded in {time.perf_counter() - started:.2f}s")
+        self.metadata = {
+            "enabled": True,
+            "backend_script": str(SCRIPT_015_PATH),
+            "mode": str(args.deeptag_mode),
+            "cpu": bool(args.deeptag_cpu),
+            "detect_scale": float(args.deeptag_detect_scale),
+            "min_tags": int(args.deeptag_min_tags),
+            "max_reproj": float(args.deeptag_max_reproj),
+            "single_tag_max_reproj": float(args.deeptag_single_tag_max_reproj),
+            "cluster_trans_mm": float(args.deeptag_cluster_trans_mm),
+            "cluster_rot_deg": float(args.deeptag_cluster_rot_deg),
+        }
+
+    def process_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        frame = self.module.detection_frame(
+            self.script012,
+            self.runtime,
+            np.asarray(record["image_bgr"], dtype=np.uint8),
+        )
+        started = time.perf_counter()
+        stream = io.StringIO()
+        output_context = contextlib.redirect_stdout(stream) if self.quiet else contextlib.nullcontext()
+        try:
+            with output_context:
+                decoded_tags = self.engine.process(
+                    frame,
+                    detect_scale=(
+                        None
+                        if float(self.args.detect_scale) < 0.0
+                        else float(self.args.detect_scale)
+                    ),
+                )
+            raw_detections, detection_stats = self.module.deeptag_detections_to_raw_corners(
+                self.engine,
+                decoded_tags,
+                valid_ids=set(int(v) for v in self.runtime["cube_config"].tag_ids),
+            )
+            pose, _detections, cluster_stats = self.module.robust_cluster_pose(
+                raw_detections,
+                self.runtime,
+                self.args,
+            )
+            pose = dict(pose)
+            if not self.module.finite_pose_success(pose):
+                pose["success"] = False
+                pose["rvec"] = None
+                pose["tvec"] = None
+                pose["T"] = None
+                pose["reproj_error"] = float("inf")
+                if not pose.get("failure_reason", ""):
+                    pose["failure_reason"] = "non_finite_or_failed_deeptag_pose"
+        except Exception as exc:
+            detection_stats = {}
+            cluster_stats = {}
+            pose = {
+                "success": False,
+                "failure_reason": f"deeptag_exception:{type(exc).__name__}:{exc}",
+                "rvec": None,
+                "tvec": None,
+                "T": None,
+                "reproj_error": float("inf"),
+                "n_tags": 0,
+                "tag_ids": [],
+                "detections": [],
+            }
+        elapsed = time.perf_counter() - started
+        pose["deeptag_elapsed_s"] = float(elapsed)
+        pose["deeptag_detection_stats"] = self.module._jsonish(detection_stats)
+        pose["deeptag_cluster_stats"] = self.module._jsonish(cluster_stats)
+        return {
+            "success": bool(pose.get("success", False)),
+            "n_tags": int(pose.get("n_tags", 0) or 0),
+            "result": pose,
+        }
+
+
+def pose_delta(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> tuple[float, float]:
+    first_t = np.asarray(first["tvec"], dtype=np.float64).reshape(3)
+    second_t = np.asarray(second["tvec"], dtype=np.float64).reshape(3)
+    translation_mm = float(np.linalg.norm(first_t - second_t))
+    first_rot, _ = cv2.Rodrigues(np.asarray(first["rvec"], dtype=np.float64).reshape(3, 1))
+    second_rot, _ = cv2.Rodrigues(np.asarray(second["rvec"], dtype=np.float64).reshape(3, 1))
+    cosine = float(np.clip((np.trace(first_rot.T @ second_rot) - 1.0) / 2.0, -1.0, 1.0))
+    rotation_deg = float(np.degrees(np.arccos(cosine)))
+    return translation_mm, rotation_deg
+
+
+def combine_aprilcube_and_deeptag(
+    april_item: dict[str, Any],
+    deeptag_item: dict[str, Any],
+) -> dict[str, Any]:
+    april_result = dict(april_item["result"])
+    deeptag_result = dict(deeptag_item["result"])
+    april_success = bool(april_result.get("success", False))
+    deeptag_success = bool(deeptag_result.get("success", False))
+
+    diagnostics = {
+        "deeptag_attempted": True,
+        "deeptag_selected": bool(deeptag_success and not april_success),
+        "deeptag_success": deeptag_success,
+        "deeptag_failure_reason": str(deeptag_result.get("failure_reason", "")),
+        "deeptag_n_tags": int(deeptag_result.get("n_tags", 0) or 0),
+        "deeptag_reproj_error": float(
+            deeptag_result.get("reproj_error", float("inf"))
+        ),
+        "deeptag_elapsed_s": float(deeptag_result.get("deeptag_elapsed_s", 0.0)),
+        "deeptag_detection_stats": dict(
+            deeptag_result.get("deeptag_detection_stats", {}) or {}
+        ),
+        "deeptag_cluster_stats": dict(
+            deeptag_result.get("deeptag_cluster_stats", {}) or {}
+        ),
+        "aprilcube_pose_source": str(april_result.get("pose_source", "")),
+        "aprilcube_failure_reason": str(april_result.get("failure_reason", "")),
+    }
+    if april_success and deeptag_success:
+        translation_mm, rotation_deg = pose_delta(april_result, deeptag_result)
+        diagnostics["deeptag_translation_delta_mm"] = translation_mm
+        diagnostics["deeptag_rotation_delta_deg"] = rotation_deg
+
+    selected = deeptag_result if deeptag_success and not april_success else april_result
+    selected = dict(selected)
+    selected.update(diagnostics)
+    return {
+        "success": bool(selected.get("success", False)),
+        "n_tags": int(selected.get("n_tags", 0) or 0),
+        "result": selected,
+    }
+
+
 def precompute_pose_cache(
     pkl_path: Path,
     offsets: list[int],
     estimator: OfflineEstimator,
+    deeptag_backend: DeepTagPoseBackend | None = None,
+    deeptag_mode: str = "fallback",
 ) -> list[dict[str, Any]]:
     cache: list[dict[str, Any]] = []
     total = len(offsets)
@@ -737,6 +994,13 @@ def precompute_pose_cache(
     for idx, offset in enumerate(offsets):
         record = load_frame_at(pkl_path, offset)
         pose = estimator.process_record(record)
+        should_run_deeptag = (
+            deeptag_backend is not None
+            and (deeptag_mode == "validate" or not bool(pose.get("success", False)))
+        )
+        if should_run_deeptag:
+            deeptag_pose = deeptag_backend.process_record(record)
+            pose = combine_aprilcube_and_deeptag(pose, deeptag_pose)
         cache.append(pose)
         done = idx + 1
         if done == total or done % 10 == 0:
@@ -744,7 +1008,9 @@ def precompute_pose_cache(
             fps = done / max(elapsed, 1e-9)
             print(
                 f"\r[INFO] Offline pose detection {done}/{total} "
-                f"success={sum(int(v['success']) for v in cache)} fps={fps:.1f}",
+                f"success={sum(int(v['success']) for v in cache)} "
+                f"deeptag_selected={sum(int(v['result'].get('deeptag_selected', False)) for v in cache)} "
+                f"fps={fps:.1f}",
                 end="",
                 flush=True,
             )
@@ -834,7 +1100,7 @@ def fill_missing_pose_cache(pose_cache: list[dict[str, Any]]) -> int:
 
 def default_output_pkl_path(source_pkl: Path) -> Path:
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    return source_pkl.with_name(f"014_offline_pose_vis_{source_pkl.stem}_{stamp}.pkl")
+    return source_pkl.with_name(f"013_offline_pose_{source_pkl.stem}_{stamp}.pkl")
 
 
 def write_processed_pkl(
@@ -848,6 +1114,7 @@ def write_processed_pkl(
     pose_cache: list[dict[str, Any]],
     jpeg_quality: int,
     save_raw_jpeg: bool,
+    deeptag_metadata: dict[str, Any] | None,
 ) -> None:
     output_pkl = output_pkl.expanduser().resolve()
     output_pkl.parent.mkdir(parents=True, exist_ok=True)
@@ -877,6 +1144,13 @@ def write_processed_pkl(
                     "fallback_layout": estimator.fallback_layout,
                     "fallback_max_reproj": float(estimator.fallback_max_reproj),
                     "fallback_ransac_reproj": float(estimator.fallback_ransac_reproj),
+                    "deeptag": dict(deeptag_metadata or {"enabled": False}),
+                    "deeptag_attempted_count": int(
+                        sum(bool(item["result"].get("deeptag_attempted", False)) for item in pose_cache)
+                    ),
+                    "deeptag_selected_count": int(
+                        sum(bool(item["result"].get("deeptag_selected", False)) for item in pose_cache)
+                    ),
                     "fill_missing_pose": any(
                         bool(item["result"].get("pose_filled", False)) for item in pose_cache
                     ),
@@ -974,7 +1248,18 @@ def main() -> None:
 
     script012 = load_script012_module()
     estimator = OfflineEstimator(script012, metadata, args)
-    pose_cache = precompute_pose_cache(pkl_path, offsets, estimator)
+    deeptag_backend = (
+        DeepTagPoseBackend(script012, metadata, args)
+        if bool(args.deeptag)
+        else None
+    )
+    pose_cache = precompute_pose_cache(
+        pkl_path,
+        offsets,
+        estimator,
+        deeptag_backend=deeptag_backend,
+        deeptag_mode=str(args.deeptag_mode),
+    )
     filled_count = 0
     if not args.no_fill_missing_pose:
         filled_count = fill_missing_pose_cache(pose_cache)
@@ -986,7 +1271,8 @@ def main() -> None:
     print(f"[INFO] cube_cfg={estimator.cube_cfg}")
     print(
         f"[INFO] offline pose success={success_count}/{len(pose_cache)} "
-        f"filled={filled_count}"
+        f"filled={filled_count} "
+        f"deeptag_selected={sum(int(item['result'].get('deeptag_selected', False)) for item in pose_cache)}"
     )
     if args.output_pkl is not None:
         output_pkl = args.output_pkl
@@ -1002,6 +1288,9 @@ def main() -> None:
             pose_cache=pose_cache,
             jpeg_quality=int(args.jpeg_quality),
             save_raw_jpeg=bool(args.save_raw_jpeg),
+            deeptag_metadata=(
+                None if deeptag_backend is None else deeptag_backend.metadata
+            ),
         )
         if not args.show_viser:
             return
@@ -1011,7 +1300,7 @@ def main() -> None:
     server = viser.ViserServer(host=args.host, port=int(args.port))
     server.scene.set_up_direction("-y")
     server.scene.world_axes.visible = False
-    server.gui.set_panel_label("AprilCube 012 PKL")
+    server.gui.set_panel_label("013 Offline AprilCube Pose")
     server.scene.add_frame(
         "/camera",
         wxyz=(1.0, 0.0, 0.0, 0.0),

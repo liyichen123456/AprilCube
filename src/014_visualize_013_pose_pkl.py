@@ -24,7 +24,7 @@ SUPPORTED_FORMATS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Visualize 014 offline pose visualization pkl with viser.")
+    parser = argparse.ArgumentParser(description="Visualize 013 offline pose result pkl with viser.")
     parser.add_argument("pkl_path", nargs="?", default=str(DEFAULT_PKL))
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8095)
@@ -33,12 +33,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_stream_index(path: Path) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
+def build_stream_index(
+    path: Path,
+    supported_formats: set[str] | None = None,
+) -> tuple[dict[str, Any], list[int], dict[str, Any] | None]:
     offsets: list[int] = []
     footer: dict[str, Any] | None = None
+    allowed_formats = SUPPORTED_FORMATS if supported_formats is None else supported_formats
     with path.open("rb") as f:
         header = pickle.load(f)
-        if not isinstance(header, dict) or header.get("format") not in SUPPORTED_FORMATS:
+        if not isinstance(header, dict) or header.get("format") not in allowed_formats:
             raise ValueError(f"Unsupported pkl format: {header.get('format', None)}")
 
         while True:
@@ -85,14 +89,41 @@ def find_raw_image_stream(
         if not source_path.is_file() or source_path == pkl_path:
             continue
         try:
-            _source_header, source_offsets, _source_footer = build_stream_index(source_path)
+            _source_header, source_offsets, _source_footer = build_stream_index(
+                source_path,
+                SUPPORTED_FORMATS
+                | {
+                    "aprilcube_rs_raw_frame_stream_v1",
+                    "aprilcube_raw_frame_stream_v1",
+                },
+            )
             source_first = load_frame(source_path, source_offsets[0])
         except (OSError, ValueError, EOFError, pickle.UnpicklingError):
             continue
-        if (
-            len(source_offsets) == len(offsets)
-            and isinstance(source_first.get("image_bgr"), np.ndarray)
-        ):
+        if not isinstance(source_first.get("image_bgr"), np.ndarray):
+            continue
+        mapped_offsets: list[int] = []
+        for processed_offset in offsets:
+            processed_frame = load_frame(pkl_path, processed_offset)
+            source_offset = processed_frame.get(
+                "source_offset",
+                processed_frame.get("raw_source_offset", None),
+            )
+            if source_offset is None:
+                mapped_offsets = []
+                break
+            try:
+                source_frame = load_frame(source_path, int(source_offset))
+            except (OSError, ValueError, EOFError, pickle.UnpicklingError):
+                mapped_offsets = []
+                break
+            if not isinstance(source_frame.get("image_bgr"), np.ndarray):
+                mapped_offsets = []
+                break
+            mapped_offsets.append(int(source_offset))
+        if len(mapped_offsets) == len(offsets):
+            return source_path, mapped_offsets
+        if len(source_offsets) == len(offsets):
             return source_path, source_offsets
     return None
 

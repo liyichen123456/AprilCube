@@ -168,8 +168,6 @@ while True:
 python src/008_cv2_naive_aprilcube_detect.py
 ```
 
-CV2 脚本可读取 `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml` 这类 YAML 内参文件，字段包含 `image_size`、`K`、`dist`、`fx/fy/cx/cy` 和标定误差。
-
 ## 本次提交建议
 
 建议提交：
@@ -178,7 +176,6 @@ CV2 脚本可读取 `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml` 这类 YAML
 - `src/aprilcube/detect.py`：可视化线宽与 viser object frame / mesh / axes 控制更新。
 - `src/aprilcube_runtime.py`：AprilTag 原生 pose、时序 pose 与 cube pose 融合工具。
 - `src/008_cv2_naive_aprilcube_detect.py`：CV2 多 cube 实验脚本。
-- `assets/intrinsics_DECXIN_3081V1_USB3_0509.yaml`：DECXIN USB3 相机内参。
 - 新增的 `cube_april_*` 与 `aruco_cube_*` 模型目录：打印文件、配置、预览图与 MuJoCo mesh。
 
 不建议直接提交：
