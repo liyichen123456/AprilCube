@@ -3,7 +3,8 @@
 
 The readable pipeline lives at the top of this file:
 
-1. Convert 008 multi-cube raw recordings to 012-style single-cube streams.
+1. Validate a synchronized multi-camera recording and extract one internal
+   image stream for each wrist/index/thumb/middle target.
 2. Estimate strict AprilCube poses.
 3. Estimate DeepTag dense-keypoint poses.
 4. Fuse single-frame candidates using reprojection and edge gates.
@@ -17,8 +18,10 @@ The readable pipeline lives at the top of this file:
     atomically write one ``<raw-stem>_post_progress.pkl`` containing poses,
     raw images, overlays, and all qpos fields.
 
-The long copied helper implementations are kept at the bottom so this file can
-run by itself without launching or importing the old numbered stage scripts.
+The copied stage implementations are private details kept in this file so the
+single supported CLI can run without launching or importing numbered scripts.
+The command-line interface intentionally accepts only raw recordings produced
+by ``scripts/drafts/020_visualize_multi_av_cv2_cameras.py``.
 """
 from __future__ import annotations
 
@@ -87,21 +90,17 @@ except ImportError:
 
 preprocess_tag_image = _preprocess
 
-# Set these paths and the optional 008 cube filter before running. The pipeline
-# intentionally has no command-line options, so the configuration is reproducible.
-# INPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_aprilcube_pose.pkl"
-INPUT_PKL = RECORDINGS_DIR / "008_raw_frames_20260715_000555.pkl"
-OUTPUT_PKL = RECORDINGS_DIR / "012_rs_raw_frames_20260710_214336_with_final_postprocessed_pose.pkl"
-# The recording header also contains a thumb cfg, but this capture only contains
-# the index cube. Set to None to process every cube listed in the 008 header.
-PROCESS_008_CUBE_NAMES: tuple[str, ...] | None = (
+# Retained only by the embedded 008 implementation; the public CLI below does
+# not accept 008 recordings. It remains executable code because several strict
+# pose primitives share its detector implementation.
+_LEGACY_PROCESS_008_CUBE_NAMES: tuple[str, ...] | None = (
     "cube_april_36h11_6_11_1x1x1_15mm",
 )
 
 RAW_008_PKL_FORMAT = "aprilcube_raw_frame_stream_v1"
 RAW_012_PKL_FORMAT = "aprilcube_rs_raw_frame_stream_v1"
 RAW_012_WITH_POSE_PKL_FORMAT = "aprilcube_012_raw_with_pose_stream_v1"
-SUPPORTED_012_INPUT_PKL_FORMATS = {
+_INTERNAL_TARGET_STREAM_FORMATS = {
     RAW_012_PKL_FORMAT,
     RAW_012_WITH_POSE_PKL_FORMAT,
 }
@@ -352,20 +351,6 @@ def load_pkl_header(path: Path) -> dict[str, Any]:
     return header
 
 
-def visualize_008_recording(pkl_path: Path) -> None:
-    print("[STAGE] 008 pose replay and visualization", flush=True)
-    replay_008_main(Replay008ViewerConfig(
-        pkl_path=str(pkl_path),
-        host="0.0.0.0",
-        port=8091,
-        max_width=960,
-        slow=True,
-        no_undistort=False,
-        shared_detect_tags=True,
-        precompute_only=False,
-    ))
-
-
 def estimate_strict_aprilcube_poses(raw_pkl: Path, output_pkl: Path) -> None:
     print("[STAGE] strict AprilCube pose estimation", flush=True)
     strict_aprilcube_main(StrictAprilCubeEstimationConfig(
@@ -560,62 +545,7 @@ def smooth_completed_pose_trajectory(
     ))
 
 
-def visualize_012_pose_stream(pkl_path: Path) -> None:
-    print("[STAGE] Viser pose visualization", flush=True)
-    pose_viewer_main(PoseVisualizationConfig(
-        pkl_path=str(pkl_path),
-        host="0.0.0.0",
-        port=8095,
-        max_width=960,
-    ))
-
-
-def process_008_recording() -> Path:
-    pkl_path = INPUT_PKL.expanduser().resolve()
-    fmt = inspect_pkl_format(pkl_path)
-    if fmt != RAW_008_PKL_FORMAT:
-        raise ValueError(f"Expected 008 raw pkl format, got {fmt}: {pkl_path}")
-
-    work_dir = (RECORDINGS_DIR / "020_work" / f"008_multistage_{pkl_path.stem}").resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    cube_streams = split_008_recording_into_cube_streams(pkl_path, work_dir)
-    final_pose_by_cube: dict[str, Path] = {}
-    for cube_name, cube_raw_pkl in cube_streams:
-        cube_work_dir = work_dir / cube_name
-        cube_output_pkl = cube_work_dir / f"{cube_raw_pkl.stem}_020_final.pkl"
-        final_pose_by_cube[cube_name] = process_012_recording(
-            raw_pkl=cube_raw_pkl,
-            output_pkl=cube_output_pkl,
-            work_dir=cube_work_dir,
-        )
-
-    merge_cube_pose_streams_into_008(
-        raw_008_pkl=pkl_path,
-        final_pose_by_cube=final_pose_by_cube,
-    )
-    summarize_008_pose_cache(pkl_path)
-    shutil.rmtree(work_dir)
-    print(f"[INFO] Removed work dir: {work_dir}")
-    visualize_008_recording(pkl_path)
-    return pkl_path
-
-
-def process_configured_recording() -> Path:
-    work_dir = (RECORDINGS_DIR / "020_work").resolve()
-    output_pkl = process_012_recording(
-        raw_pkl=INPUT_PKL.expanduser().resolve(),
-        output_pkl=OUTPUT_PKL.expanduser().resolve(),
-        work_dir=work_dir,
-    )
-    if work_dir.exists():
-        shutil.rmtree(work_dir)
-        print(f"[INFO] Removed work dir: {work_dir}")
-    visualize_012_pose_stream(output_pkl)
-    return output_pkl
-
-
-def process_012_recording(
+def _process_extracted_target_stream(
     *,
     raw_pkl: Path,
     output_pkl: Path,
@@ -639,10 +569,10 @@ def process_012_recording(
         prefer_deeptag_single_tag = True
         enable_temporal_outline_recovery = False
     fmt = inspect_pkl_format(raw_pkl)
-    if fmt not in SUPPORTED_012_INPUT_PKL_FORMATS:
+    if fmt not in _INTERNAL_TARGET_STREAM_FORMATS:
         raise ValueError(
-            "The 012 pipeline must start from a 012 stream with raw images "
-            f"(format={SUPPORTED_012_INPUT_PKL_FORMATS}), got {fmt}: {raw_pkl}"
+            "The internal target pipeline requires an extracted raw-image stream "
+            f"(format={_INTERNAL_TARGET_STREAM_FORMATS}), got {fmt}: {raw_pkl}"
         )
 
     output_pkl = output_pkl.expanduser().resolve()
@@ -891,8 +821,8 @@ def split_008_recording_into_cube_streams(raw_008_pkl: Path, work_dir: Path) -> 
     cube_paths = [Path(str(v)).expanduser().resolve() for v in metadata.get("cube_paths", []) or []]
     if not cube_paths:
         raise ValueError(f"008 pkl header has no metadata.cube_paths: {raw_008_pkl}")
-    if PROCESS_008_CUBE_NAMES is not None:
-        requested_cube_names = set(PROCESS_008_CUBE_NAMES)
+    if _LEGACY_PROCESS_008_CUBE_NAMES is not None:
+        requested_cube_names = set(_LEGACY_PROCESS_008_CUBE_NAMES)
         cube_path_by_name = {cube_name_from_path(path): path for path in cube_paths}
         missing_cube_names = requested_cube_names - cube_path_by_name.keys()
         if missing_cube_names:
@@ -902,7 +832,7 @@ def split_008_recording_into_cube_streams(raw_008_pkl: Path, work_dir: Path) -> 
             )
         cube_paths = [
             cube_path_by_name[name]
-            for name in PROCESS_008_CUBE_NAMES
+            for name in _LEGACY_PROCESS_008_CUBE_NAMES
         ]
         print(
             "[INFO] 008 cube filter: "
@@ -7483,9 +7413,6 @@ mc_PROJECT_ROOT = APRILCUBE_ROOT.parent.parent
 if str(mc_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(mc_PROJECT_ROOT))
 mc_FINALIZE_020_PATH = mc_PROJECT_ROOT / 'thirdparty' / 'aprilcube' / 'src' / '020_finalize_pose_postprocess.py'
-mc_DEFAULT_INPUT_PKL = mc_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151.pkl'
-mc_DEFAULT_OUTPUT_PKL = mc_PROJECT_ROOT / 'recordings' / 'multi_cam_record_0717_010151_020_pose_sidecar.pkl'
-mc_DEFAULT_TEMP_ROOT = Path('/dev/shm/consensv2lab_020_multi_cam_0717_010151')
 mc_EXPECTED_D435_INTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_d435_color_charuco_1920x1080_0716_130910_offline_filtered.yaml')
 mc_EXPECTED_MIDDLE_INTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_scale0p25_2592x1944_0712_225925.yaml')
 mc_VERIFIED_D435_SDK_SERIAL = '244222070135'
@@ -7860,7 +7787,7 @@ def mc_run(args: argparse.Namespace) -> None:
             work_dir = target_root / '020_work'
             unused_merged_output = target_root / 'unused_020_with_raw.pkl'
             print(f'[INFO] Starting 020 target={target_name} camera={runtime.spec.camera_name}')
-            final_pose_path = finalize020.process_012_recording(raw_pkl=raw_paths[target_name], output_pkl=unused_merged_output, work_dir=work_dir, merge_final_raw=False, single_tag_edge_threshold=runtime.single_tag_edge_threshold, single_tag_max_reproj=runtime.single_tag_max_reproj, preferred_single_tag_id=2 if target_name == 'middle_Q' else None, prefer_deeptag_single_tag=target_name == 'middle_Q', enable_temporal_outline_recovery=target_name == 'wrist_Q', enable_adjacent_rgb_flow_recovery=False, target_name=target_name)
+            final_pose_path = finalize020._process_extracted_target_stream(raw_pkl=raw_paths[target_name], output_pkl=unused_merged_output, work_dir=work_dir, merge_final_raw=False, single_tag_edge_threshold=runtime.single_tag_edge_threshold, single_tag_max_reproj=runtime.single_tag_max_reproj, preferred_single_tag_id=2 if target_name == 'middle_Q' else None, prefer_deeptag_single_tag=target_name == 'middle_Q', enable_temporal_outline_recovery=target_name == 'wrist_Q', enable_adjacent_rgb_flow_recovery=False, target_name=target_name)
             result_path = results_root / f'{target_name}_final_pose.pkl'
             mc_copy_final_pose_stream(final_pose_path, result_path)
             result_paths[target_name] = result_path
@@ -7906,22 +7833,6 @@ def mc_run(args: argparse.Namespace) -> None:
         else:
             shutil.rmtree(temp_root, ignore_errors=True)
             print(f'[INFO] Removed temporary files: {temp_root}')
-
-def mc_build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Postprocess wrist/index/thumb/middle AprilCube poses from a multi-camera PKL.')
-    parser.add_argument('--input', type=Path, default=mc_DEFAULT_INPUT_PKL)
-    parser.add_argument('--output', type=Path, default=mc_DEFAULT_OUTPUT_PKL)
-    parser.add_argument('--temp-root', type=Path, default=mc_DEFAULT_TEMP_ROOT)
-    parser.add_argument('--max-frames', type=int, default=None)
-    parser.add_argument('--targets', nargs='+', choices=[target.name for target in mc_TARGETS], default=[target.name for target in mc_TARGETS], help='Pose targets to process. Partial runs require --merge-existing.')
-    parser.add_argument('--merge-existing', type=Path, default=None, help='Existing combined sidecar whose unselected target results are preserved.')
-    parser.add_argument('--validate-only', action='store_true')
-    parser.add_argument('--keep-temp', action='store_true')
-    parser.add_argument('--final-output', type=Path, default=None, help='Final complete+globally-smoothed sidecar. By default, write <input-stem>_post_progress.pkl next to --output.')
-    parser.add_argument('--final-qa', type=Path, default=None, help='QA JSON for the mandatory final complete-sidecar smoothing stage.')
-    parser.add_argument('--skip-final-global-smoothing', action='store_true', help='Diagnostic escape hatch: write only the intermediate 020 sidecar. Such output is intentionally rejected by retargeting/full-body IK.')
-    return parser
-
 
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
@@ -11193,13 +11104,133 @@ def idx_rotation_delta_deg(first: Any, second: Any) -> float:
     b = Rotation.from_rotvec(np.asarray(second, dtype=np.float64).reshape(3))
     return float(np.degrees((a.inv() * b).magnitude()))
 
-def idx_pose_deltas(poses: list[dict[str, Any]]) -> dict[str, Any]:
-    translation: list[float] = []
-    rotation: list[float] = []
-    for (before, after) in zip(poses, poses[1:]):
-        translation.append(float(np.linalg.norm(np.asarray(after['tvec'], dtype=np.float64).reshape(3) - np.asarray(before['tvec'], dtype=np.float64).reshape(3))))
-        rotation.append(idx_rotation_delta_deg(before['rvec'], after['rvec']))
-    return {'translation_mm_median': float(np.median(translation)), 'translation_mm_p95': float(np.percentile(translation, 95)), 'translation_mm_max': float(np.max(translation)), 'rotation_deg_median': float(np.median(rotation)), 'rotation_deg_p95': float(np.percentile(rotation, 95)), 'rotation_deg_max': float(np.max(rotation))}
+def idx_pose_brief(pose: dict[str, Any]) -> dict[str, Any]:
+    reproj_error = pose.get('reproj_error')
+    try:
+        reproj_error = float(reproj_error)
+    except (TypeError, ValueError):
+        reproj_error = None
+    if reproj_error is not None and not np.isfinite(reproj_error):
+        reproj_error = None
+    return {
+        'pose_source': str(pose.get('pose_source', '')),
+        'strict_original_pose_source': str(pose.get('strict_original_pose_source', '')),
+        'tag_ids': [int(value) for value in pose.get('tag_ids', []) or []],
+        'reproj_error_px': reproj_error,
+        'pose_filled': bool(pose.get('pose_filled', False)),
+        'predicted': bool(pose.get('predicted', False)),
+        'quality_level': str(pose.get('quality_level', '')),
+        'tvec_mm': np.asarray(pose['tvec'], dtype=np.float64).reshape(3).tolist(),
+    }
+
+
+def idx_pose_deltas(
+    poses: list[dict[str, Any]],
+    timestamps: list[float],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if len(poses) < 2:
+        raise ValueError(f'At least two poses are required for step diagnostics, got {len(poses)}')
+    if len(timestamps) != len(poses):
+        raise ValueError(
+            f'Pose/timestamp length mismatch for step diagnostics: '
+            f'{len(poses)} != {len(timestamps)}'
+        )
+    steps: list[dict[str, Any]] = []
+    for before_frame, (before, after) in enumerate(zip(poses, poses[1:])):
+        after_frame = before_frame + 1
+        before_t = np.asarray(before['tvec'], dtype=np.float64).reshape(3)
+        after_t = np.asarray(after['tvec'], dtype=np.float64).reshape(3)
+        translation_delta = after_t - before_t
+        translation_mm = float(np.linalg.norm(translation_delta))
+        rotation_deg = idx_rotation_delta_deg(before['rvec'], after['rvec'])
+        before_timestamp = float(timestamps[before_frame])
+        after_timestamp = float(timestamps[after_frame])
+        dt_s = after_timestamp - before_timestamp
+        steps.append(
+            {
+                'before_frame': int(before_frame),
+                'after_frame': int(after_frame),
+                'before_capture_timestamp': before_timestamp,
+                'after_capture_timestamp': after_timestamp,
+                'dt_s': float(dt_s),
+                'translation_delta_mm_xyz': translation_delta.tolist(),
+                'translation_mm': translation_mm,
+                'translation_speed_mm_s': (
+                    float(translation_mm / dt_s) if dt_s > 0.0 else None
+                ),
+                'rotation_deg': rotation_deg,
+                'rotation_speed_deg_s': (
+                    float(rotation_deg / dt_s) if dt_s > 0.0 else None
+                ),
+                'before_pose': idx_pose_brief(before),
+                'after_pose': idx_pose_brief(after),
+            }
+        )
+    translation = [float(step['translation_mm']) for step in steps]
+    rotation = [float(step['rotation_deg']) for step in steps]
+    summary = {
+        'translation_mm_median': float(np.median(translation)),
+        'translation_mm_p95': float(np.percentile(translation, 95)),
+        'translation_mm_max': float(np.max(translation)),
+        'rotation_deg_median': float(np.median(rotation)),
+        'rotation_deg_p95': float(np.percentile(rotation, 95)),
+        'rotation_deg_max': float(np.max(rotation)),
+        'translation_mm_max_step': max(steps, key=lambda step: float(step['translation_mm'])),
+        'rotation_deg_max_step': max(steps, key=lambda step: float(step['rotation_deg'])),
+        'top_translation_steps': sorted(
+            steps,
+            key=lambda step: float(step['translation_mm']),
+            reverse=True,
+        )[:5],
+        'top_rotation_steps': sorted(
+            steps,
+            key=lambda step: float(step['rotation_deg']),
+            reverse=True,
+        )[:5],
+    }
+    return summary, steps
+
+
+def idx_step_gate_error(
+    *,
+    target_name: str,
+    metric: str,
+    threshold: float,
+    summary: dict[str, Any],
+    steps: list[dict[str, Any]],
+) -> RuntimeError:
+    if metric == 'translation_mm':
+        unit = 'mm'
+        gate_name = 'adjacent_translation'
+    elif metric == 'rotation_deg':
+        unit = 'deg'
+        gate_name = 'adjacent_rotation'
+    else:
+        raise ValueError(f'Unsupported step-gate metric: {metric}')
+    violations = [step for step in steps if float(step[metric]) > float(threshold)]
+    violations.sort(key=lambda step: float(step[metric]), reverse=True)
+    diagnostic = {
+        'target_name': target_name,
+        'gate': gate_name,
+        'metric': metric,
+        'unit': unit,
+        'threshold': float(threshold),
+        'violation_count': len(violations),
+        'worst_value': float(violations[0][metric]) if violations else None,
+        'worst_excess': (
+            float(violations[0][metric]) - float(threshold) if violations else None
+        ),
+        'violating_frame_pairs': violations,
+        'trajectory_summary': summary,
+        'interpretation': (
+            'This is an index pose data-quality gate before Wuji retargeting/xArm IK; '
+            'it is not a robot joint velocity-limit failure.'
+        ),
+    }
+    return RuntimeError(
+        f'{target_name} {gate_name} step gate failed:\n'
+        + json.dumps(diagnostic, indent=2, ensure_ascii=False, default=idx_json_default)
+    )
 
 def idx_fill_short_gaps(poses: list[dict[str, Any]], timestamps: list[float], max_gap_frames: int) -> list[int]:
     filled: list[int] = []
@@ -11214,7 +11245,61 @@ def idx_fill_short_gaps(poses: list[dict[str, Any]], timestamps: list[float], ma
         end = idx - 1
         gap_length = end - start + 1
         if start == 0 or idx >= len(poses) or gap_length > int(max_gap_frames):
-            raise RuntimeError(f'Unfillable strict-pose gap {start}-{end} length={gap_length}')
+            before_index = start - 1 if start > 0 else None
+            after_index = idx if idx < len(poses) else None
+            if before_index is None:
+                reason = 'leading_gap_has_no_left_anchor'
+            elif after_index is None:
+                reason = 'trailing_gap_has_no_right_anchor'
+            else:
+                reason = 'gap_exceeds_local_interpolation_limit'
+            diagnostic = {
+                'target_name': 'index_Q',
+                'gate': 'strict_pose_gap_completion',
+                'reason': reason,
+                'gap_start_frame': int(start),
+                'gap_end_frame': int(end),
+                'gap_length_frames': int(gap_length),
+                'max_gap_frames': int(max_gap_frames),
+                'gap_start_capture_timestamp': float(timestamps[start]),
+                'gap_end_capture_timestamp': float(timestamps[end]),
+                'gap_duration_s': float(timestamps[end] - timestamps[start]),
+                'before_anchor_frame': before_index,
+                'after_anchor_frame': after_index,
+                'anchor_span_s': (
+                    float(timestamps[after_index] - timestamps[before_index])
+                    if before_index is not None and after_index is not None
+                    else None
+                ),
+                'before_anchor_pose': (
+                    idx_pose_brief(poses[before_index]) if before_index is not None else None
+                ),
+                'after_anchor_pose': (
+                    idx_pose_brief(poses[after_index]) if after_index is not None else None
+                ),
+                'failed_pose_sources': [
+                    str((poses[frame_index] or {}).get('pose_source', ''))
+                    for frame_index in range(start, end + 1)
+                ],
+                'failed_reasons': [
+                    str((poses[frame_index] or {}).get('failure_reason', ''))
+                    for frame_index in range(start, end + 1)
+                ],
+                'interpretation': (
+                    'The strict current-frame index observations are incomplete. '
+                    'The pipeline refuses long or unanchored interpolation before '
+                    'Wuji retargeting/xArm IK.'
+                ),
+            }
+            raise RuntimeError(
+                'index_Q strict-pose gap is not locally fillable:\n'
+                + json.dumps(
+                    diagnostic,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=idx_json_default,
+                )
+            )
         before_index = start - 1
         after_index = idx
         for frame_index in range(start, end + 1):
@@ -11307,11 +11392,23 @@ def idx_run(args: argparse.Namespace) -> None:
     filled = idx_fill_short_gaps(poses, timestamps, int(args.max_gap_frames))
     if any((not idx_valid_pose(pose) for pose in poses)):
         raise RuntimeError('Output pose list remains incomplete')
-    deltas = idx_pose_deltas(poses)
+    deltas, step_diagnostics = idx_pose_deltas(poses, timestamps)
     if deltas['translation_mm_max'] > float(args.max_step_translation_mm):
-        raise RuntimeError(f'Translation step gate failed: {deltas}')
+        raise idx_step_gate_error(
+            target_name=target_name,
+            metric='translation_mm',
+            threshold=float(args.max_step_translation_mm),
+            summary=deltas,
+            steps=step_diagnostics,
+        )
     if deltas['rotation_deg_max'] > float(args.max_step_rotation_deg):
-        raise RuntimeError(f'Rotation step gate failed: {deltas}')
+        raise idx_step_gate_error(
+            target_name=target_name,
+            metric='rotation_deg',
+            threshold=float(args.max_step_rotation_deg),
+            summary=deltas,
+            steps=step_diagnostics,
+        )
     (config, _face_sets) = finalize020.aprilcube.load_cube_config(str(Path(strict_header['metadata']['cube_cfg']) / 'config.json'))
     camera_matrix = np.asarray(strict_header['metadata']['detection_camera_matrix'], dtype=np.float64).reshape(3, 3)
     dist_coeffs = np.asarray(strict_header['metadata']['detector_dist_coeffs'], dtype=np.float64).reshape(-1)
@@ -12536,41 +12633,32 @@ def run_monolithic_qpos_pipeline(
 def build_main_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Standalone AprilCube offline pipeline. Multi-camera inputs are mapped "
-            "to wrist/index/thumb/middle targets and written as one post_progress PKL."
+            "Process one synchronized raw multi-camera recording into exactly one "
+            "post_progress PKL containing raw images, four cube poses, Wuji-left "
+            "qpos, and xArm7 qpos."
         )
     )
-    parser.add_argument("--input", type=Path, default=INPUT_PKL)
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help=(
+            "Raw PKL recorded by scripts/drafts/"
+            "020_visualize_multi_av_cv2_cameras.py."
+        ),
+    )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
         help="Default: <input-stem>_post_progress.pkl beside the input.",
     )
-    parser.add_argument("--temp-root", type=Path, default=None)
-    parser.add_argument("--max-frames", type=int, default=None)
-    parser.add_argument("--validate-only", action="store_true")
-    parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate the raw recording schema and required calibration files only.",
+    )
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument(
-        "--pose-only",
-        action="store_true",
-        help="Stop after the complete stage13 pose sidecar; skip Wuji/xArm qpos.",
-    )
-    parser.add_argument(
-        "--reuse-complete-pose-sidecar",
-        type=Path,
-        default=None,
-        help=(
-            "Regression/debug option: skip image pose processing and run embedded "
-            "retargeting+IK from an existing complete stage13 sidecar."
-        ),
-    )
-    parser.add_argument(
-        "--skip-final-global-smoothing",
-        action="store_true",
-        help="Diagnostic only; the resulting pose sidecar is not valid for IK.",
-    )
     return parser
 
 
@@ -12579,77 +12667,58 @@ def main() -> None:
     input_path = args.input.expanduser().resolve()
     fmt = inspect_pkl_format(input_path)
     print(f"[INFO] Auto detected input format: {fmt}")
-    if fmt == RAW_008_PKL_FORMAT:
-        if input_path != INPUT_PKL.expanduser().resolve():
-            raise ValueError(
-                "The legacy 008 path still uses the reproducible constants at the top "
-                "of this file; set INPUT_PKL for an 008 recording."
-            )
-        output = process_008_recording()
-    elif fmt in SUPPORTED_012_INPUT_PKL_FORMATS:
-        if input_path != INPUT_PKL.expanduser().resolve():
-            raise ValueError(
-                "The legacy 012 path still uses the reproducible constants at the top "
-                "of this file; set INPUT_PKL for a 012 recording."
-            )
-        output = process_configured_recording()
-    elif fmt == "consens_multi_camera_sync_stream":
-        output_path = (
-            args.output.expanduser().resolve()
-            if args.output is not None
-            else input_path.with_name(f"{input_path.stem}_post_progress.pkl")
+    if fmt != mcstream_MULTI_CAMERA_STREAM_FORMAT:
+        recorder_path = (
+            PROJECT_ROOT
+            / "scripts/drafts/020_visualize_multi_av_cv2_cameras.py"
         )
-        if output_path.exists() and not args.overwrite and not args.validate_only:
-            raise FileExistsError(f"Output already exists: {output_path}; pass --overwrite")
-        pose_temp_root = (
-            args.temp_root.expanduser().resolve()
-            if args.temp_root is not None
-            else Path("/dev/shm") / f"consensv2lab_020_{input_path.stem}"
+        raise ValueError(
+            f"Unsupported input PKL format {fmt!r}. This CLI only accepts "
+            f"{mcstream_MULTI_CAMERA_STREAM_FORMAT!r} raw recordings produced by "
+            f"{recorder_path}."
         )
-        if args.skip_final_global_smoothing and not args.pose_only:
-            raise ValueError("--skip-final-global-smoothing requires --pose-only")
-        if args.reuse_complete_pose_sidecar is None:
-            intermediate = (
-                pose_temp_root / f"{input_path.stem}_pose_sidecar_intermediate.pkl"
-            )
-            mc_run(
-                argparse.Namespace(
-                    input=input_path,
-                    output=intermediate,
-                    temp_root=pose_temp_root,
-                    max_frames=args.max_frames,
-                    targets=[target.name for target in mc_TARGETS],
-                    merge_existing=None,
-                    validate_only=bool(args.validate_only),
-                    keep_temp=bool(args.keep_temp),
-                    final_output=output_path,
-                    final_qa=None,
-                    skip_final_global_smoothing=bool(args.skip_final_global_smoothing),
-                )
-            )
-            pose_sidecar = (
-                output_path if not args.skip_final_global_smoothing else intermediate
-            )
-        else:
-            pose_sidecar = args.reuse_complete_pose_sidecar.expanduser().resolve()
-            if not pose_sidecar.is_file():
-                raise FileNotFoundError(pose_sidecar)
-            if args.validate_only:
-                stage13_load_sidecar(pose_sidecar)
-        if not args.validate_only and not args.pose_only:
-            qpos_temp_root = pose_temp_root.with_name(pose_temp_root.name + "_qpos")
-            run_monolithic_qpos_pipeline(
-                raw_path=input_path,
-                pose_sidecar=pose_sidecar,
-                output_path=output_path,
-                temp_root=qpos_temp_root,
-                overwrite=bool(args.overwrite),
-                keep_temp=bool(args.keep_temp),
-            )
-        output = pose_sidecar if args.pose_only else output_path
-    else:
-        raise ValueError(f"Unsupported input pkl format: {fmt}")
-    print(f"[INFO] Done: {output}")
+
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else input_path.with_name(f"{input_path.stem}_post_progress.pkl")
+    )
+    if output_path == input_path:
+        raise ValueError("--output must not overwrite the raw input PKL")
+    if output_path.exists() and not args.overwrite and not args.validate_only:
+        raise FileExistsError(f"Output already exists: {output_path}; pass --overwrite")
+
+    pose_temp_root = Path("/dev/shm") / f"consensv2lab_020_{input_path.stem}"
+    intermediate = pose_temp_root / f"{input_path.stem}_pose_sidecar_intermediate.pkl"
+    mc_run(
+        argparse.Namespace(
+            input=input_path,
+            output=intermediate,
+            temp_root=pose_temp_root,
+            max_frames=None,
+            targets=[target.name for target in mc_TARGETS],
+            merge_existing=None,
+            validate_only=bool(args.validate_only),
+            keep_temp=False,
+            final_output=output_path,
+            final_qa=None,
+            skip_final_global_smoothing=False,
+        )
+    )
+    if args.validate_only:
+        print(f"[INFO] Validation passed: {input_path}")
+        return
+
+    qpos_temp_root = pose_temp_root.with_name(pose_temp_root.name + "_qpos")
+    run_monolithic_qpos_pipeline(
+        raw_path=input_path,
+        pose_sidecar=output_path,
+        output_path=output_path,
+        temp_root=qpos_temp_root,
+        overwrite=bool(args.overwrite),
+        keep_temp=False,
+    )
+    print(f"[INFO] Done: {output_path}")
 
 
 if __name__ == "__main__":
