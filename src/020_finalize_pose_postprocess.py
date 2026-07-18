@@ -5410,16 +5410,19 @@ def pose_recovery_cube_corners(config: Any) -> np.ndarray:
     return np.array([[-x, -y, -z], [x, -y, -z], [x, y, -z], [-x, y, -z], [-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z]], dtype=np.float64)
 POSE_RECOVERY_CUBE_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
 
-def pose_recovery_edge_alignment_score(gray: np.ndarray, pose: dict[str, Any], *, config: Any, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> float:
+def pose_recovery_prepare_edge_distance_map(gray: np.ndarray) -> np.ndarray:
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 50, 140)
+    return cv2.distanceTransform(255 - edges, cv2.DIST_L2, 3)
+
+def pose_recovery_edge_alignment_score_from_distance_map(dist: np.ndarray, pose: dict[str, Any], *, config: Any, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> float:
     if not pose.get('success', False):
         return 0.0
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 50, 140)
-    dist = cv2.distanceTransform(255 - edges, cv2.DIST_L2, 3)
+    dist = np.asarray(dist, dtype=np.float32)
     rvec = np.asarray(pose['rvec'], dtype=np.float64).reshape(3, 1)
     tvec = np.asarray(pose['tvec'], dtype=np.float64).reshape(3, 1)
     corners_2d, _ = cv2.projectPoints(pose_recovery_cube_corners(config), rvec, tvec, camera_matrix, dist_coeffs)
     corners_2d = corners_2d.reshape(-1, 2)
-    h, w = gray.shape[:2]
+    h, w = dist.shape[:2]
     hits = 0
     total = 0
     for a, b in POSE_RECOVERY_CUBE_EDGES:
@@ -5434,6 +5437,11 @@ def pose_recovery_edge_alignment_score(gray: np.ndarray, pose: dict[str, Any], *
                 if float(dist[y, x]) <= 2.5:
                     hits += 1
     return float(hits / max(total, 1))
+
+def pose_recovery_edge_alignment_score(gray: np.ndarray, pose: dict[str, Any], *, config: Any, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> float:
+    if not pose.get('success', False):
+        return 0.0
+    return pose_recovery_edge_alignment_score_from_distance_map(pose_recovery_prepare_edge_distance_map(gray), pose, config=config, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
 
 def pose_recovery_pkl_pose_candidate(frame: dict[str, Any], method: str, frame_index: int, min_tags: int, max_reproj: float) -> RecoveryPoseCandidate:
     pose = frame.get('pose', {})
@@ -7870,7 +7878,8 @@ import yaml
 from scipy.spatial.transform import Rotation
 rtbase_DEFAULT_PKL_PATH = rtbase_REPO_ROOT / 'thirdparty/aprilcube/recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl'
 rtbase_DEFAULT_URDF_PATH = rtbase_REPO_ROOT / 'thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf'
-rtbase_DEFAULT_CONTACT_CONFIG = rtbase_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints.yaml'
+rtbase_DEFAULT_FINGERTIP_GEOMETRY_URDF_PATH = rtbase_REPO_ROOT / 'thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye_v2.urdf'
+rtbase_DEFAULT_CONTACT_CONFIG = rtbase_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints_v2.yaml'
 rtbase_DEFAULT_OUTPUT_DIR = rtbase_REPO_ROOT / 'outputs/retargeting/index_middle_cube_calibration_021'
 rtbase_DEFAULT_INDEX_ONLY_RESULT = rtbase_REPO_ROOT / 'outputs/retargeting/index_cube_calibration_021/optimized_unconstrained_four_point_se3_from_bounded.npz'
 rtbase_EXPECTED_PKL_FORMAT = 'aprilcube_hand_back_software_synced_raw_v1'
@@ -7890,7 +7899,7 @@ class rtbase_FingerSpec:
     robot_link_name: str
     robot_joint_prefix: str
     obj_mesh_name: str
-rtbase_FINGER_SPECS = (rtbase_FingerSpec('index', 'left_finger2_link4', 'left_finger2_', 'index.obj'), rtbase_FingerSpec('middle', 'left_finger3_link4', 'left_finger3_', 'middle.obj'))
+rtbase_FINGER_SPECS = (rtbase_FingerSpec('index', 'left_finger2_link4', 'left_finger2_', 'index_v2.obj'), rtbase_FingerSpec('middle', 'left_finger3_link4', 'left_finger3_', 'middle_v2.obj'))
 rtbase_ACTIVE_JOINT_NAMES = tuple((f'left_finger{finger_index}_joint{joint_index}' for finger_index in (2, 3) for joint_index in range(1, 5)))
 
 @dataclass
@@ -8199,6 +8208,7 @@ def rtbase_parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Optimize index+middle contact surfaces and one global cube SE(3).')
     parser.add_argument('pkl_path', nargs='?', type=Path, default=rtbase_DEFAULT_PKL_PATH)
     parser.add_argument('--urdf', type=Path, default=rtbase_DEFAULT_URDF_PATH)
+    parser.add_argument('--fingertip-geometry-urdf', type=Path, default=rtbase_DEFAULT_FINGERTIP_GEOMETRY_URDF_PATH, help='URDF whose visual origins define the v2 fingertip OBJ frames.')
     parser.add_argument('--contact-keypoints', type=Path, default=rtbase_DEFAULT_CONTACT_CONFIG)
     parser.add_argument('--output-dir', type=Path, default=rtbase_DEFAULT_OUTPUT_DIR)
     parser.add_argument('--index-only-result', type=Path, default=rtbase_DEFAULT_INDEX_ONLY_RESULT)
@@ -8213,10 +8223,11 @@ def rtbase_main() -> None:
     args = rtbase_parse_args()
     pkl_path = args.pkl_path.expanduser().resolve()
     urdf_path = args.urdf.expanduser().resolve()
+    geometry_urdf_path = args.fingertip_geometry_urdf.expanduser().resolve()
     contact_path = args.contact_keypoints.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     index_only_path = args.index_only_result.expanduser().resolve()
-    for path in (pkl_path, urdf_path, contact_path):
+    for path in (pkl_path, urdf_path, geometry_urdf_path, contact_path):
         if not path.is_file():
             raise FileNotFoundError(path)
     if args.max_frames is not None and args.max_frames <= 0:
@@ -8225,7 +8236,7 @@ def rtbase_main() -> None:
         raise ValueError('Iteration counts must be positive')
     output_dir.mkdir(parents=True, exist_ok=True)
     keypoints_obj = rtbase_load_contact_keypoints(contact_path)
-    link_from_obj = rtbase_load_link_from_obj_transforms(urdf_path)
+    link_from_obj = rtbase_load_link_from_obj_transforms(geometry_urdf_path)
     cache_path = output_dir / 'source_index_middle_poses.npz'
     if cache_path.is_file() and args.max_frames is None:
         with np.load(cache_path, allow_pickle=False) as archive:
@@ -8273,7 +8284,7 @@ def rtbase_main() -> None:
         results[result_name] = summary
         result_paths[result_name] = str(result_path)
     best_name = min(results, key=lambda name: results[name]['all_keypoint_error']['mean_mm'])
-    report = {'schema': 'consens.left_wuji_index_middle_cube_experiments.v1', 'source_pkl': str(pkl_path), 'urdf': str(urdf_path), 'contact_keypoints': str(contact_path), 'scope': 'index+middle; 8 points; 8 active joints; one constant unconstrained cube SE(3)', 'best_result': best_name, 'result_npz': result_paths, 'experiments': results}
+    report = {'schema': 'consens.left_wuji_index_middle_cube_experiments.v1', 'source_pkl': str(pkl_path), 'urdf': str(urdf_path), 'fingertip_geometry_urdf': str(geometry_urdf_path), 'contact_keypoints': str(contact_path), 'scope': 'index+middle; 8 points; 8 active joints; one constant unconstrained cube SE(3)', 'best_result': best_name, 'result_npz': result_paths, 'experiments': results}
     report_path = output_dir / 'experiment_summary.json'
     with report_path.open('w', encoding='utf-8') as stream:
         json.dump(report, stream, indent=2, ensure_ascii=False)
@@ -8327,7 +8338,8 @@ rt_FILE_PATH = Path(__file__).resolve()
 rt_REPO_ROOT = APRILCUBE_ROOT.parent.parent
 rt_DEFAULT_PKL_PATH = rt_REPO_ROOT / 'thirdparty/aprilcube/recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl'
 rt_DEFAULT_URDF_PATH = rt_REPO_ROOT / 'thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf'
-rt_DEFAULT_CONTACT_CONFIG = rt_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints.yaml'
+rt_DEFAULT_FINGERTIP_GEOMETRY_URDF_PATH = rt_REPO_ROOT / 'thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye_v2.urdf'
+rt_DEFAULT_CONTACT_CONFIG = rt_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints_v2.yaml'
 rt_DEFAULT_OUTPUT_DIR = rt_REPO_ROOT / 'outputs/retargeting/021_new_intrinsics_recovered/three_finger'
 rt_EXPECTED_MIDDLE_INTRINSICS = '/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_scale0p25_2592x1944_0712_225925.yaml'
 rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/extrinsics_wrist_Q_thumb_web_cam_middle_finger_cam_apriltag_grid_offline_2samples_0712_030212_0712_031300.yaml')
@@ -8348,7 +8360,7 @@ rt_DEFAULT_JOINT_OPTIMIZATION_ITERATIONS = 800
 rt_DEFAULT_JOINT_MAX_STEP_DEG = 2.1
 rt_DEFAULT_JOINT_MAX_STEP_WEIGHT = 165.0
 rt_Mode = Literal['fixed', 'translation', 'rotation', 'se3']
-rt_FINGER_SPECS = (base.FingerSpec('thumb', 'left_finger1_link4', 'left_finger1_', 'thumb.obj'), base.FingerSpec('index', 'left_finger2_link4', 'left_finger2_', 'index.obj'), base.FingerSpec('middle', 'left_finger3_link4', 'left_finger3_', 'middle.obj'))
+rt_FINGER_SPECS = (base.FingerSpec('thumb', 'left_finger1_link4', 'left_finger1_', 'thumb.obj'), base.FingerSpec('index', 'left_finger2_link4', 'left_finger2_', 'index_v2.obj'), base.FingerSpec('middle', 'left_finger3_link4', 'left_finger3_', 'middle_v2.obj'))
 rt_ACTIVE_JOINT_NAMES = tuple((f'left_finger{finger_index}_joint{joint_index}' for finger_index in (1, 2, 3) for joint_index in range(1, 5)))
 base.FINGER_SPECS = rt_FINGER_SPECS
 base.ACTIVE_JOINT_NAMES = rt_ACTIVE_JOINT_NAMES
@@ -9028,6 +9040,7 @@ def rt_parse_args() -> argparse.Namespace:
     parser.add_argument('--pose-sidecar', type=Path, help='Aligned consensv2_multi_cam_020_pose_sidecar_v1 input. When set, pkl_path is the original multi-camera raw stream.')
     parser.add_argument('--wrist-extrinsics', type=Path, help='Optional Q_T_camera YAML override. Its AprilCube model must match the sidecar wrist_Q cube model.')
     parser.add_argument('--urdf', type=Path, default=rt_DEFAULT_URDF_PATH)
+    parser.add_argument('--fingertip-geometry-urdf', type=Path, default=rt_DEFAULT_FINGERTIP_GEOMETRY_URDF_PATH, help='URDF whose visual origins define the v2 fingertip OBJ frames.')
     parser.add_argument('--contact-keypoints', type=Path, default=rt_DEFAULT_CONTACT_CONFIG)
     parser.add_argument('--output-dir', type=Path, default=rt_DEFAULT_OUTPUT_DIR)
     parser.add_argument('--modes', nargs='+', choices=('fixed', 'translation', 'rotation', 'se3'), default=('fixed', 'translation', 'rotation', 'se3'))
@@ -9051,10 +9064,11 @@ def rt_main() -> None:
     args = rt_parse_args()
     pkl_path = args.pkl_path.expanduser().resolve()
     urdf_path = args.urdf.expanduser().resolve()
+    geometry_urdf_path = args.fingertip_geometry_urdf.expanduser().resolve()
     contact_path = args.contact_keypoints.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     pose_sidecar_path = args.pose_sidecar.expanduser().resolve() if args.pose_sidecar is not None else None
-    required_paths = [pkl_path, urdf_path, contact_path]
+    required_paths = [pkl_path, urdf_path, geometry_urdf_path, contact_path]
     if pose_sidecar_path is not None:
         required_paths.append(pose_sidecar_path)
     for path in required_paths:
@@ -9074,7 +9088,7 @@ def rt_main() -> None:
         raise ValueError('--joint-optimization-iterations must be positive')
     output_dir.mkdir(parents=True, exist_ok=True)
     keypoints_obj = base.load_contact_keypoints(contact_path)
-    link_from_obj = base.load_link_from_obj_transforms(urdf_path)
+    link_from_obj = base.load_link_from_obj_transforms(geometry_urdf_path)
     if pose_sidecar_path is None:
         source_validation = rt_validate_source_pkl(pkl_path)
         (cube_from_obj, timestamps, source_indices) = base.load_source_poses(pkl_path, args.max_frames)
@@ -9105,7 +9119,7 @@ def rt_main() -> None:
     requested_modes = list(dict.fromkeys(args.modes))
     results: dict[str, dict[str, Any]] = {}
     selected: dict[str, tuple[np.ndarray, base.SequenceSolution]] = {}
-    run_config = {'schema': 'consens.left_wuji_three_finger_experiment_config.v1', 'source_pkl': str(pkl_path), 'source_validation': source_validation, 'urdf': str(urdf_path), 'contact_keypoints': str(contact_path), 'fingers': [spec.name for spec in rt_FINGER_SPECS], 'frame_count': int(len(cube_from_obj)), 'point_count_per_frame': 12, 'active_joint_names': list(rt_ACTIVE_JOINT_NAMES), 'T_left_palm_link_hand_back_cube_initial': base.T_PALM_CUBE_INITIAL.tolist(), 'requested_modes': requested_modes, 'solver_iterations': int(args.solver_iterations), 'alternating_iterations': int(args.alternating_iterations), 'objective': 'equal-weight squared 3D distance over 3 fingers x 4 points', 'active_joint_regularization': 0.0, 'active_temporal_regularization': float(args.temporal_branch_weight), 'active_temporal_seed_weight': float(args.temporal_seed_weight), 'joint_temporal_optimize': bool(args.joint_temporal_optimize), 'joint_velocity_weight': float(args.joint_velocity_weight), 'joint_acceleration_weight': float(args.joint_acceleration_weight), 'joint_jerk_weight': float(args.joint_jerk_weight), 'joint_optimization_iterations': int(args.joint_optimization_iterations), 'joint_max_step_deg': float(args.joint_max_step_deg), 'joint_max_step_weight': float(args.joint_max_step_weight), 'joint_limits_from_urdf': True, 'ignored_observations': ignored_observations}
+    run_config = {'schema': 'consens.left_wuji_three_finger_experiment_config.v1', 'source_pkl': str(pkl_path), 'source_validation': source_validation, 'urdf': str(urdf_path), 'fingertip_geometry_urdf': str(geometry_urdf_path), 'contact_keypoints': str(contact_path), 'fingers': [spec.name for spec in rt_FINGER_SPECS], 'frame_count': int(len(cube_from_obj)), 'point_count_per_frame': 12, 'active_joint_names': list(rt_ACTIVE_JOINT_NAMES), 'T_left_palm_link_hand_back_cube_initial': base.T_PALM_CUBE_INITIAL.tolist(), 'requested_modes': requested_modes, 'solver_iterations': int(args.solver_iterations), 'alternating_iterations': int(args.alternating_iterations), 'objective': 'equal-weight squared 3D distance over 3 fingers x 4 points', 'active_joint_regularization': 0.0, 'active_temporal_regularization': float(args.temporal_branch_weight), 'active_temporal_seed_weight': float(args.temporal_seed_weight), 'joint_temporal_optimize': bool(args.joint_temporal_optimize), 'joint_velocity_weight': float(args.joint_velocity_weight), 'joint_acceleration_weight': float(args.joint_acceleration_weight), 'joint_jerk_weight': float(args.joint_jerk_weight), 'joint_optimization_iterations': int(args.joint_optimization_iterations), 'joint_max_step_deg': float(args.joint_max_step_deg), 'joint_max_step_weight': float(args.joint_max_step_weight), 'joint_limits_from_urdf': True, 'ignored_observations': ignored_observations}
     (output_dir / 'run_config.json').write_text(json.dumps(run_config, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     if args.temporal_refine_only:
         if not args.overwrite:
@@ -9245,7 +9259,7 @@ fb_FILE_PATH = Path(__file__).resolve()
 fb_REPO_ROOT = APRILCUBE_ROOT.parent.parent
 fb_DEFAULT_HAND_PKL = fb_REPO_ROOT / 'thirdparty/aprilcube/recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl'
 fb_DEFAULT_RS_PKL = fb_REPO_ROOT / 'thirdparty/aprilcube/recordings/012_rs_raw_frames_20260715_192635_with_current_020_postprocessed_pose.pkl'
-fb_DEFAULT_URDF = fb_REPO_ROOT / 'thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye.urdf'
+fb_DEFAULT_URDF = fb_REPO_ROOT / 'thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye_v2.urdf'
 fb_LEGACY_HAND_URDF = fb_REPO_ROOT / 'thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf'
 fb_DEFAULT_OUTPUT_DIR = fb_REPO_ROOT / 'outputs/retargeting/rs_xarm7_wuji'
 fb_DEFAULT_MERGED_PKL = fb_DEFAULT_OUTPUT_DIR / 'rs_hand_three_finger_merged.pkl'
@@ -12362,11 +12376,11 @@ DEFAULT_WUJI_LEFT_URDF = (
     / "thirdparty/wuji-description/hand/body-with-soft/urdf/left_simplified_w_fingereye.urdf"
 )
 DEFAULT_WUJI_CONTACT_KEYPOINTS = (
-    PROJECT_ROOT / "configs/retarget/left_wuji_fingertip_contact_keypoints.yaml"
+    PROJECT_ROOT / "configs/retarget/left_wuji_fingertip_contact_keypoints_v2.yaml"
 )
 DEFAULT_XARM7_WUJI_LEFT_URDF = (
     PROJECT_ROOT
-    / "thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye.urdf"
+    / "thirdparty/xarm7_wuji_left_description/xarm7_wuji_left_w_fingereye_v2.urdf"
 )
 
 
@@ -12582,6 +12596,8 @@ def run_monolithic_qpos_pipeline(
                 rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS,
                 "--urdf",
                 DEFAULT_WUJI_LEFT_URDF,
+                "--fingertip-geometry-urdf",
+                DEFAULT_XARM7_WUJI_LEFT_URDF,
                 "--contact-keypoints",
                 DEFAULT_WUJI_CONTACT_KEYPOINTS,
                 "--output-dir",
