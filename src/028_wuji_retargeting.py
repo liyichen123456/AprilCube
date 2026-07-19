@@ -29,6 +29,9 @@ from viser.extras import ViserUrdf
 
 
 APRILCUBE_ROOT = Path(__file__).resolve().parent.parent
+FINGEREYE_MESH_ROOT = (
+    APRILCUBE_ROOT.parent / "xarm7_wuji_left_description/fingereye_mesh"
+)
 DEFAULT_PKL_PATH = (
     APRILCUBE_ROOT
     / "recordings/021_hand_back_sync_raw_frames_20260712_233831.pkl"
@@ -130,7 +133,7 @@ OBJECT_SPECS = (
         source_camera="thumb_web_cam",
         robot_link="left_finger1_link4",
         robot_tip_link="left_finger1_tip_link",
-        mesh_path=APRILCUBE_ROOT / "assets/thumb.obj",
+        mesh_path=FINGEREYE_MESH_ROOT / "thumb.obj",
         color=(255, 170, 55),
         contact_line_axis=(1.0, 0.0, 0.0),
     ),
@@ -140,7 +143,7 @@ OBJECT_SPECS = (
         source_camera="thumb_web_cam",
         robot_link="left_finger2_link4",
         robot_tip_link="left_finger2_tip_link",
-        mesh_path=APRILCUBE_ROOT / "assets/index.obj",
+        mesh_path=FINGEREYE_MESH_ROOT / "index.obj",
         color=(70, 180, 255),
         contact_line_axis=(0.0, 1.0, 0.0),
     ),
@@ -150,7 +153,7 @@ OBJECT_SPECS = (
         source_camera="middle_finger_cam",
         robot_link="left_finger3_link4",
         robot_tip_link="left_finger3_tip_link",
-        mesh_path=APRILCUBE_ROOT / "assets/middle.obj",
+        mesh_path=FINGEREYE_MESH_ROOT / "middle.obj",
         color=(110, 215, 120),
         contact_line_axis=(0.0, 1.0, 0.0),
     ),

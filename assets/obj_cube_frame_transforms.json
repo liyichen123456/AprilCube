@@ -4,8 +4,8 @@
   "cube_edge_mm": 18.75,
   "models": {
     "index": {
-      "source_obj": "assets/index.obj",
-      "cube_frame_obj": "assets/index_cube_frame.obj",
+      "source_obj": "../xarm7_wuji_left_description/fingereye_mesh/index.obj",
+      "cube_frame_obj": "../xarm7_wuji_left_description/fingereye_mesh/index_v2.obj",
       "old_cube_center_mm": [
         932.258728,
         1014.566314,
@@ -62,8 +62,8 @@
       }
     },
     "middle": {
-      "source_obj": "assets/middle.obj",
-      "cube_frame_obj": "assets/middle_cube_frame.obj",
+      "source_obj": "../xarm7_wuji_left_description/fingereye_mesh/middle.obj",
+      "cube_frame_obj": "../xarm7_wuji_left_description/fingereye_mesh/middle_v2.obj",
       "old_cube_center_mm": [
         967.613708,
         950.116303,
@@ -104,8 +104,8 @@
       ]
     },
     "thumb": {
-      "source_obj": "assets/thumb.obj",
-      "cube_frame_obj": "assets/thumb_cube_frame.obj",
+      "source_obj": "../xarm7_wuji_left_description/fingereye_mesh/thumb.obj",
+      "cube_frame_obj": "../xarm7_wuji_left_description/fingereye_mesh/thumb.obj",
       "old_cube_center_mm": [
         976.488739,
         1007.066254,
