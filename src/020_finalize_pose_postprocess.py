@@ -8342,7 +8342,14 @@ rt_DEFAULT_FINGERTIP_GEOMETRY_URDF_PATH = rt_REPO_ROOT / 'thirdparty/xarm7_wuji_
 rt_DEFAULT_CONTACT_CONFIG = rt_REPO_ROOT / 'configs/retarget/left_wuji_fingertip_contact_keypoints_v2.yaml'
 rt_DEFAULT_OUTPUT_DIR = rt_REPO_ROOT / 'outputs/retargeting/021_new_intrinsics_recovered/three_finger'
 rt_EXPECTED_MIDDLE_INTRINSICS = '/home/ps/RobotCamCalib1/outputs/intrinsics_charuco_scale0p25_2592x1944_0712_225925.yaml'
-rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS = Path('/home/ps/RobotCamCalib1/outputs/extrinsics_wrist_Q_thumb_web_cam_middle_finger_cam_apriltag_grid_offline_2samples_0712_030212_0712_031300.yaml')
+rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS_BY_CAMERA = {
+    'thumb_web_cam': Path('/home/ps/RobotCamCalib1/outputs/extrinsics_cv2_cube_d435_grid_pruned34_39_from_0712_234742.yaml'),
+    'middle_finger_cam': Path('/home/ps/RobotCamCalib1/outputs/extrinsics_middle_finger_cam_cube_d435_charuco_multisession_joint_0713_012814_022818.yaml'),
+}
+rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS_KEY_BY_CAMERA = {
+    'thumb_web_cam': 'solution.T_cube_cv2',
+    'middle_finger_cam': 'solution.T_cube_middle_finger_cam',
+}
 rt_MULTI_CAM_RAW_FORMAT = 'consens_multi_camera_sync_stream'
 rt_MULTI_CAM_SIDECAR_FORMAT = 'consensv2_multi_cam_020_pose_sidecar_v1'
 rt_MULTI_CAM_TARGET_MAPPING = {'thumb': {'sidecar_target': 'thumb_Q', 'camera': 'thumb_web_cam', 'cube_dir': 'cube_april_36h11_12_17_1x1x1_15mm'}, 'index': {'sidecar_target': 'index_Q', 'camera': 'thumb_web_cam', 'cube_dir': 'cube_april_36h11_6_11_1x1x1_15mm'}, 'middle': {'sidecar_target': 'middle_Q', 'camera': 'middle_finger_cam', 'cube_dir': 'cube_april_36h11_0_5_1x1x1_15mm'}}
@@ -8909,33 +8916,93 @@ def rt_load_multi_cam_sidecar_poses(raw_path: Path, sidecar_path: Path, max_fram
     if not bool(final_smoothing.get('complete', False)) or not bool(final_smoothing.get('completion_barrier_passed', False)) or int(final_smoothing.get('frame_count', -1)) != raw_frame_count or (set(final_smoothing.get('targets', [])) != required_targets) or any((int(applied_counts.get(name, -1)) != raw_frame_count for name in required_targets)):
         raise ValueError('Retargeting requires a complete stage13 sidecar: all wrist/index/thumb/middle poses must exist before final global smoothing. Run this 020 pipeline from the multi-camera raw PKL first.')
     expected_wrist_cube_dir = Path(str(wrist_target_metadata.get('cube_cfg', ''))).name
-    raw_extrinsics_value = raw_header.get('metadata', {}).get('wrist_extrinsics_yaml')
-    candidates: list[Path] = []
-    if wrist_extrinsics_override is not None:
-        candidates.append(wrist_extrinsics_override.expanduser().resolve())
-    else:
-        if raw_extrinsics_value:
-            candidates.append(Path(str(raw_extrinsics_value)).expanduser().resolve())
-        candidates.append(rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS.expanduser().resolve())
-    wrist_extrinsics_path: Path | None = None
-    wrist_payload: dict[str, Any] | None = None
+    raw_metadata = raw_header.get('metadata', {})
+    raw_wrist_cube_dir = Path(str(raw_metadata.get('wrist_cube_cfg', ''))).name
+    if raw_wrist_cube_dir and raw_wrist_cube_dir != expected_wrist_cube_dir:
+        raise ValueError(f'Raw/sidecar wrist cube mismatch: {raw_wrist_cube_dir!r} != {expected_wrist_cube_dir!r}')
+
+    def load_yaml_transform(path: Path, key_path: str) -> np.ndarray:
+        resolved = path.expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f'Missing wrist camera extrinsics: {resolved}')
+        with resolved.open('r', encoding='utf-8') as stream:
+            value: Any = yaml.safe_load(stream)
+        for key in key_path.split('.'):
+            if not isinstance(value, dict) or key not in value:
+                raise KeyError(f'Missing transform {key_path!r} in {resolved}')
+            value = value[key]
+        if isinstance(value, dict):
+            value = value.get('matrix')
+        return base.validate_transform(np.asarray(value, dtype=np.float64), f'{resolved}:{key_path}')
+
+    camera_names = ('thumb_web_cam', 'middle_finger_cam')
     rejected_extrinsics: list[dict[str, str]] = []
-    for candidate in dict.fromkeys(candidates):
-        if not candidate.is_file():
-            rejected_extrinsics.append({'path': str(candidate), 'reason': 'file_not_found'})
-            continue
-        with candidate.open('r', encoding='utf-8') as stream:
+    world_from_camera: dict[str, np.ndarray] = {}
+    wrist_extrinsics_summary: dict[str, Any]
+    if wrist_extrinsics_override is not None:
+        override = wrist_extrinsics_override.expanduser().resolve()
+        if not override.is_file():
+            raise FileNotFoundError(f'Missing wrist extrinsics override: {override}')
+        with override.open('r', encoding='utf-8') as stream:
             payload = yaml.safe_load(stream)
         actual_wrist_cube_dir = Path(str(payload.get('inputs', {}).get('aprilcube_cfg_dir', ''))).name
         if actual_wrist_cube_dir != expected_wrist_cube_dir:
-            rejected_extrinsics.append({'path': str(candidate), 'reason': f'cube_cfg_mismatch:{actual_wrist_cube_dir!r}!={expected_wrist_cube_dir!r}'})
-            continue
-        wrist_extrinsics_path = candidate
-        wrist_payload = payload
-        break
-    if wrist_extrinsics_path is None or wrist_payload is None:
-        raise ValueError(f'No wrist extrinsics use the same Q cube model as wrist_Q: expected={expected_wrist_cube_dir!r}, rejected={rejected_extrinsics}')
-    world_from_camera = {camera: base.validate_transform(np.asarray(wrist_payload[f'Q_T_{camera}'], dtype=np.float64), f'{wrist_extrinsics_path}:Q_T_{camera}') for camera in ('thumb_web_cam', 'middle_finger_cam')}
+            raise ValueError(f'Wrist extrinsics override cube mismatch: {actual_wrist_cube_dir!r} != {expected_wrist_cube_dir!r}')
+        world_from_camera = {
+            camera: base.validate_transform(
+                np.asarray(payload[f'Q_T_{camera}'], dtype=np.float64),
+                f'{override}:Q_T_{camera}',
+            )
+            for camera in camera_names
+        }
+        wrist_extrinsics_summary = {
+            'kind': 'legacy_single_yaml_override',
+            'path': str(override),
+        }
+    else:
+        inline_transforms = raw_metadata.get('wrist_q_t_cameras')
+        raw_paths = raw_metadata.get('wrist_extrinsics_yaml_by_camera')
+        raw_keys = raw_metadata.get('wrist_extrinsics_matrix_key_by_camera')
+        if isinstance(inline_transforms, dict) and all(camera in inline_transforms for camera in camera_names):
+            world_from_camera = {
+                camera: base.validate_transform(
+                    np.asarray(inline_transforms[camera], dtype=np.float64),
+                    f'raw_metadata:wrist_q_t_cameras.{camera}',
+                )
+                for camera in camera_names
+            }
+            wrist_extrinsics_summary = {
+                'kind': 'raw_metadata_inline_v2',
+                'schema': raw_metadata.get('wrist_extrinsics_schema'),
+                'yaml_by_camera': raw_paths,
+                'matrix_key_by_camera': raw_keys,
+            }
+        else:
+            legacy_path = raw_metadata.get('wrist_extrinsics_yaml')
+            if legacy_path:
+                rejected_extrinsics.append({
+                    'path': str(legacy_path),
+                    'reason': 'legacy_joint_extrinsics_ignored_in_favor_of_latest_independent_calibrations',
+                })
+            paths_by_camera = (
+                {camera: Path(str(raw_paths[camera])) for camera in camera_names}
+                if isinstance(raw_paths, dict) and all(camera in raw_paths for camera in camera_names)
+                else rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS_BY_CAMERA
+            )
+            keys_by_camera = (
+                {camera: str(raw_keys[camera]) for camera in camera_names}
+                if isinstance(raw_keys, dict) and all(camera in raw_keys for camera in camera_names)
+                else rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS_KEY_BY_CAMERA
+            )
+            world_from_camera = {
+                camera: load_yaml_transform(paths_by_camera[camera], keys_by_camera[camera])
+                for camera in camera_names
+            }
+            wrist_extrinsics_summary = {
+                'kind': 'independent_yaml_by_camera',
+                'yaml_by_camera': {camera: str(paths_by_camera[camera].expanduser().resolve()) for camera in camera_names},
+                'matrix_key_by_camera': dict(keys_by_camera),
+            }
     poses: list[np.ndarray] = []
     pose_quality_rows: list[list[dict[str, Any]]] = []
     pose_source_counts: dict[str, dict[str, int]] = {spec.name: {} for spec in rt_FINGER_SPECS}
@@ -9018,7 +9085,7 @@ def rt_load_multi_cam_sidecar_poses(raw_path: Path, sidecar_path: Path, max_fram
     poses_array = np.asarray(poses, dtype=np.float64)
     timestamps_array = np.asarray(timestamps, dtype=np.float64)
     (observation_confidences, confidence_calibration) = rt_calibrate_observation_confidences(pose_quality_rows, poses_array, timestamps_array)
-    validation = {'source_kind': 'multi_camera_020_pose_sidecar', 'raw_format': rt_MULTI_CAM_RAW_FORMAT, 'pose_sidecar': str(sidecar_path), 'pose_sidecar_format': rt_MULTI_CAM_SIDECAR_FORMAT, 'wrist_extrinsics': str(wrist_extrinsics_path), 'wrist_cube_cfg': expected_wrist_cube_dir, 'rejected_wrist_extrinsics': rejected_extrinsics, 'frame_count': int(len(poses)), 'finger_mapping_by_physical_cube_id': mapping_summary, 'observation_confidence_calibration': confidence_calibration, 'pose_source_counts': pose_source_counts, 'final_global_smoothing': final_smoothing}
+    validation = {'source_kind': 'multi_camera_020_pose_sidecar', 'raw_format': rt_MULTI_CAM_RAW_FORMAT, 'pose_sidecar': str(sidecar_path), 'pose_sidecar_format': rt_MULTI_CAM_SIDECAR_FORMAT, 'wrist_extrinsics': wrist_extrinsics_summary, 'wrist_cube_cfg': expected_wrist_cube_dir, 'rejected_wrist_extrinsics': rejected_extrinsics, 'frame_count': int(len(poses)), 'finger_mapping_by_physical_cube_id': mapping_summary, 'observation_confidence_calibration': confidence_calibration, 'pose_source_counts': pose_source_counts, 'final_global_smoothing': final_smoothing}
     return (validation, poses_array, timestamps_array, np.asarray(source_indices, dtype=np.int32), observation_confidences)
 
 def rt_validate_source_pkl(path: Path) -> dict[str, Any]:
@@ -12592,8 +12659,6 @@ def run_monolithic_qpos_pipeline(
                 raw_path,
                 "--pose-sidecar",
                 pose_sidecar,
-                "--wrist-extrinsics",
-                rt_DEFAULT_MULTI_CAM_WRIST_EXTRINSICS,
                 "--urdf",
                 DEFAULT_WUJI_LEFT_URDF,
                 "--fingertip-geometry-urdf",
